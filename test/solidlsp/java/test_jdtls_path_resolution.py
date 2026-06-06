@@ -10,6 +10,7 @@ mocked.
 from __future__ import annotations
 
 import platform
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from solidlsp.language_servers.eclipse_jdtls import (
     JDTLS_CONFIG_DIR_BY_PLATFORM,
     JDTLS_MIN_JDK_VERSION,
     EclipseJDTLS,
+    RuntimeDependencyPaths,
 )
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.settings import SolidLSPSettings
@@ -52,6 +54,33 @@ def _make_fake_jdtls_install(
         for config_name in set(JDTLS_CONFIG_DIR_BY_PLATFORM.values()):
             (root / config_name).mkdir(exist_ok=True)
     return root
+
+
+def _make_jdtls_for_initialize_params(tmp_path: Path, custom_settings: dict[str, object] | None = None) -> EclipseJDTLS:
+    """
+    Create a minimally initialized EclipseJDTLS instance for testing initialize params.
+
+    This deliberately avoids starting JDTLS or downloading dependencies.
+    """
+    jre_path = tmp_path / "jre"
+    jre_home_path = jre_path / "home"
+    gradle_path = tmp_path / "gradle"
+    for path in (jre_home_path, gradle_path):
+        path.mkdir(parents=True)
+
+    ls = EclipseJDTLS.__new__(EclipseJDTLS)
+    ls._custom_settings = SolidLSPSettings.CustomLSSettings(custom_settings or {})
+    ls.runtime_dependency_paths = RuntimeDependencyPaths(
+        jre_path=str(jre_path),
+        jre_home_path=str(jre_home_path),
+        jdtls_launcher_jar_path=str(tmp_path / "launcher.jar"),
+        jdtls_readonly_config_path=str(tmp_path / "config"),
+        lombok_jar_path=str(tmp_path / "lombok.jar"),
+        gradle_path=str(gradle_path),
+        intellicode_jar_path=None,
+        intellisense_members_path=None,
+    )
+    return ls
 
 
 # ----------------------------------------------------------------------------
@@ -451,3 +480,86 @@ class TestComputeWorkspaceHash:
         h1 = EclipseJDTLS.DependencyProvider._compute_workspace_hash("/a/repo", self.DEFAULT_LAUNCHER, empty_settings)
         h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash("/b/repo", self.DEFAULT_LAUNCHER, empty_settings)
         assert h1 != h2
+
+
+# ----------------------------------------------------------------------------
+# _get_initialize_params
+# ----------------------------------------------------------------------------
+
+
+class TestInitializeParams:
+    def test_gradle_annotation_processing_sync_enabled_by_default(self, tmp_path: Path) -> None:
+        """Default preserves JDTLS/Buildship behavior; concurrency is handled by startup locking."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path)
+
+        params = ls._get_initialize_params(str(repo))
+
+        gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
+        assert gradle_settings["annotationProcessing"]["enabled"] is True
+
+    def test_gradle_annotation_processing_sync_can_be_disabled(self, tmp_path: Path) -> None:
+        """Users retain an escape hatch for Gradle/AP sync combinations that are incompatible."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path, {"gradle_annotation_processing_enabled": False})
+
+        params = ls._get_initialize_params(str(repo))
+
+        gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
+        assert gradle_settings["annotationProcessing"]["enabled"] is False
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+
+
+def _create_git_repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    main_root = tmp_path / "main"
+    worktree_root = tmp_path / "agent-worktree"
+    main_root.mkdir()
+    _git(main_root, "init")
+    _git(main_root, "config", "user.email", "test@example.com")
+    _git(main_root, "config", "user.name", "Test User")
+    (main_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(main_root, "add", "README.md")
+    _git(main_root, "commit", "-m", "initial")
+    _git(main_root, "worktree", "add", str(worktree_root), "-b", "agent-branch")
+    return main_root, worktree_root
+
+
+class TestJdtlsGradleImportLockPath:
+    def test_same_git_repository_worktrees_share_import_lock(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SERENA_HOME", str(tmp_path / "serena-home"))
+        main_root, worktree_root = _create_git_repo_with_worktree(tmp_path)
+
+        main_lock = EclipseJDTLS._jdtls_gradle_import_lock_path(main_root)
+        worktree_lock = EclipseJDTLS._jdtls_gradle_import_lock_path(worktree_root)
+
+        assert main_lock == worktree_lock
+        assert main_lock.parent == tmp_path / "serena-home" / "locks"
+        assert main_lock.name.startswith("jdtls-gradle-import-")
+        assert main_lock.suffix == ".lock"
+
+    def test_unrelated_git_repositories_get_separate_import_locks(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SERENA_HOME", str(tmp_path / "serena-home"))
+        repo_a = tmp_path / "repo-a"
+        repo_b = tmp_path / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        _git(repo_a, "init")
+        _git(repo_b, "init")
+
+        assert EclipseJDTLS._jdtls_gradle_import_lock_path(repo_a) != EclipseJDTLS._jdtls_gradle_import_lock_path(repo_b)
+
+    def test_non_git_repository_lock_uses_repository_path_identity(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SERENA_HOME", str(tmp_path / "serena-home"))
+        repo = tmp_path / "not-git"
+        repo.mkdir()
+
+        lock_path = EclipseJDTLS._jdtls_gradle_import_lock_path(repo)
+
+        assert lock_path == EclipseJDTLS._jdtls_gradle_import_lock_path(repo)
+        assert lock_path.parent == tmp_path / "serena-home" / "locks"
+        assert lock_path.name.startswith("jdtls-gradle-import-")

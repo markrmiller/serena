@@ -178,7 +178,14 @@ class SerenaAgentContext(ToolInclusionDefinition, ToStringMixin):
     when Serena is started).
     If set to true and a project is provided at startup, the set of tools is limited to those required by the project's
     concrete configuration, and other tools are excluded completely, allowing the set of tools to be minimal.
-    The `activate_project` tool will, therefore, be disabled in this case, as project switching is not allowed.
+    The `activate_project` tool will, therefore, be disabled in this case, unless `allow_project_activation` is true or
+    the MCP server was started with --enable-project-activation.
+    """
+
+    allow_project_activation: bool = False
+    """
+    whether to keep `activate_project` available in a single-project context.
+    SerenaAgent still restricts such activation to the same git repository/worktree family when a startup git project is known.
     """
 
     def _tostring_includes(self) -> list[str]:

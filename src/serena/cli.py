@@ -95,6 +95,44 @@ def find_project_root(root: str | Path | None = None) -> str | None:
     return None
 
 
+def _is_claude_code_context(context: str) -> bool:
+    """
+    Return whether a context name/path refers to the built-in Claude Code context.
+
+    :param context: built-in context name or path to a context YAML
+    :return: whether the context is Claude Code
+    """
+    return context == "claude-code" or Path(context).stem == "claude-code"
+
+
+def _resolve_claude_code_project(project: str | None, project_file_arg: str | None, project_from_cwd: bool | None) -> str | None:
+    """
+    Resolve the startup project root for Claude Code MCP stdio sessions.
+
+    Claude Code exposes ``CLAUDE_PROJECT_DIR`` as the stable project root for
+    MCP servers. The process CWD may be different, so the environment variable
+    must take precedence over CWD-based fallback.
+
+    :param project: explicit project from ``--project`` or deprecated ``--project-file``
+    :param project_file_arg: explicit positional project argument
+    :param project_from_cwd: whether CWD fallback was requested
+    :return: the resolved project root/path, or None if no startup project should be activated
+    """
+    if project:
+        return project
+    if project_file_arg:
+        return project_file_arg
+
+    claude_project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if claude_project_dir:
+        return claude_project_dir
+
+    if project_from_cwd:
+        return os.getcwd()
+
+    return None
+
+
 def _open_in_editor(path: str) -> None:
     """Open the given file in the system's default editor or viewer."""
     editor = os.environ.get("EDITOR")
@@ -309,10 +347,20 @@ class TopLevelCommands(AutoRegisteringGroup):
         default=False,
         help="Auto-detect project from current working directory (searches for .serena/project.yml or .git, falls back to CWD). Intended for CLI-based agents like Claude Code, Gemini and Codex.",
     )
+    @click.option(
+        "--enable-project-activation",
+        is_flag=True,
+        default=False,
+        help=(
+            "Keep activate_project available even when a startup project is set. "
+            "In single-project git sessions Serena restricts activation to worktrees of the startup repository."
+        ),
+    )
     def start_mcp_server(
         project: str | None,
         project_file_arg: str | None,
         project_from_cwd: bool | None,
+        enable_project_activation: bool,
         context: str,
         default_modes: Sequence[str],
         added_modes: Sequence[str],
@@ -349,8 +397,14 @@ class TopLevelCommands(AutoRegisteringGroup):
         log.info("Initializing Serena MCP server")
         log.info("Storing logs in %s", log_path)
 
+        if _is_claude_code_context(context):
+            project_file = _resolve_claude_code_project(project, project_file_arg, project_from_cwd)
+            if project_file is not None:
+                log.info("Resolved Claude Code startup project root: %s", project_file)
+            else:
+                log.warning("No Claude Code startup project root resolved; not activating any project")
         # Handle --project-from-cwd flag
-        if project_from_cwd:
+        elif project_from_cwd:
             if project is not None or project_file_arg is not None:
                 raise click.UsageError("--project-from-cwd cannot be used with --project or positional project argument")
             project = find_project_root()
@@ -358,8 +412,9 @@ class TopLevelCommands(AutoRegisteringGroup):
                 log.info("Auto-detected project root: %s", project)
             else:
                 log.warning("No project root found from %s; not activating any project", os.getcwd())
-
-        project_file = project_file_arg or project
+            project_file = project_file_arg or project
+        else:
+            project_file = project_file_arg or project
 
         mode_selection_def: ModeSelectionDefinition | None = None
         if default_modes or added_modes:
@@ -377,6 +432,7 @@ class TopLevelCommands(AutoRegisteringGroup):
             log_level=log_level,
             trace_lsp_communication=trace_lsp_communication,
             tool_timeout=tool_timeout,
+            enable_project_activation=enable_project_activation,
         )
         if project_file_arg:
             log.warning(

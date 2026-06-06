@@ -12,6 +12,8 @@ import re
 import shutil
 import subprocess
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePath
 from time import sleep
 from typing import cast
@@ -113,6 +115,85 @@ INITIAL_INTELLICODE_SHA256 = "7f61a7f96d101cdf230f96821be3fddd8f890ebfefb3695d18
 DEFAULT_INTELLICODE_VERSION = "1.2.30"
 DEFAULT_INTELLICODE_SHA256 = "7f61a7f96d101cdf230f96821be3fddd8f890ebfefb3695d18beee43004ae251"
 
+
+def _run_git(cwd: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _git_abs_path(cwd: Path, rev_parse_arg: str) -> Path | None:
+    output = _run_git(cwd, "rev-parse", "--path-format=absolute", rev_parse_arg)
+    if output is None:
+        output = _run_git(cwd, "rev-parse", rev_parse_arg)
+    if output is None:
+        return None
+
+    path = Path(output)
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve()
+
+
+def _git_common_dir_for_lock(path: str | Path) -> Path | None:
+    cwd = Path(path).resolve()
+    if cwd.is_file():
+        cwd = cwd.parent
+    if not cwd.exists():
+        return None
+    return _git_abs_path(cwd, "--git-common-dir")
+
+
+def _serena_locks_dir() -> Path:
+    serena_home = os.environ.get("SERENA_HOME")
+    if serena_home:
+        return Path(serena_home).expanduser().resolve() / "locks"
+    return Path.home() / ".serena" / "locks"
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            locking = getattr(msvcrt, "locking")
+            lk_lock = getattr(msvcrt, "LK_LOCK")
+            lk_unlck = getattr(msvcrt, "LK_UNLCK")
+
+            lock_file.seek(0)
+            locking(lock_file.fileno(), lk_lock, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                locking(lock_file.fileno(), lk_unlck, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 # Mapping from Serena's platform identifiers to upstream JDTLS config_<platform> directory names
 JDTLS_CONFIG_DIR_BY_PLATFORM = {
     "osx-arm64": "config_mac_arm",
@@ -180,6 +261,9 @@ class EclipseJDTLS(SolidLanguageServer):
         - gradle_user_home: Path to Gradle user home directory (default: ~/.gradle)
         - gradle_wrapper_enabled: Whether to use the project's Gradle wrapper (default: false)
         - gradle_java_home: Path to JDK for Gradle (default: null, uses bundled JRE)
+        - gradle_annotation_processing_enabled: Whether JDTLS should synchronize Gradle annotation processing
+              configuration (default: true). Set false only if Buildship's annotation-processor model
+              import is incompatible with the project's Gradle version.
         - use_system_java_home: Whether to use the system's JAVA_HOME for JDTLS itself (default: false)
         - jdtls_xmx: Maximum heap size for the JDTLS server JVM (default: "3G")
         - jdtls_xms: Initial heap size for the JDTLS server JVM (default: "100m")
@@ -215,6 +299,7 @@ class EclipseJDTLS(SolidLanguageServer):
         gradle_user_home: "/home/user/.gradle"  # Unix/Linux/Mac
         # gradle_user_home: 'C:\\Users\\YourName\\.gradle'  # Windows (use single quotes!)
         gradle_wrapper_enabled: true  # set to true for projects with custom plugins/repositories
+        # gradle_annotation_processing_enabled: false  # optional escape hatch for incompatible Gradle/AP sync setups
         gradle_java_home: "/path/to/jdk"  # set to override Gradle's JDK
         use_system_java_home: true  # set to true to use system JAVA_HOME for JDTLS
         jdtls_xmx: "3G"  # maximum heap size for the JDTLS server JVM
@@ -961,6 +1046,15 @@ class EclipseJDTLS(SolidLanguageServer):
             f"Gradle wrapper {'enabled' if gradle_wrapper_enabled else 'disabled'} (configurable via ls_specific_settings -> java -> gradle_wrapper_enabled)"
         )
 
+        # Gradle annotation-processing sync: default to True to preserve JDTLS/Buildship behavior.
+        # A per-project escape hatch remains for Gradle/AP combinations that reject Buildship's
+        # annotation-processor model import.
+        gradle_annotation_processing_enabled = self._custom_settings.get("gradle_annotation_processing_enabled", True)
+        log.info(
+            "Gradle annotation processing sync %s (configurable via ls_specific_settings -> java -> gradle_annotation_processing_enabled)",
+            "enabled" if gradle_annotation_processing_enabled else "disabled",
+        )
+
         # Gradle Java home: default to None, which means the bundled JRE is used
         gradle_java_home = self._custom_settings.get("gradle_java_home")
         if gradle_java_home is not None:
@@ -1189,7 +1283,7 @@ class EclipseJDTLS(SolidLanguageServer):
                                 "arguments": None,
                                 "jvmArguments": None,
                                 "user": {"home": gradle_user_home},
-                                "annotationProcessing": {"enabled": True},
+                                "annotationProcessing": {"enabled": gradle_annotation_processing_enabled},
                             },
                             "exclusions": [
                                 "**/node_modules/**",
@@ -1357,6 +1451,21 @@ class EclipseJDTLS(SolidLanguageServer):
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_notification("language/actionableNotification", do_nothing)
 
+        lock_path = self._jdtls_gradle_import_lock_path(self.repository_root_path)
+        log.info("Waiting for EclipseJDTLS Gradle import lock: %s", lock_path)
+        with _exclusive_file_lock(lock_path):
+            log.info("Acquired EclipseJDTLS Gradle import lock: %s", lock_path)
+            self._start_server_with_gradle_import_lock()
+
+    @staticmethod
+    def _jdtls_gradle_import_lock_path(repository_root_path: str | Path) -> Path:
+        identity = _git_common_dir_for_lock(repository_root_path)
+        if identity is None:
+            identity = Path(repository_root_path).resolve()
+        digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+        return _serena_locks_dir() / f"jdtls-gradle-import-{digest}.lock"
+
+    def _start_server_with_gradle_import_lock(self) -> None:
         log.info("Starting EclipseJDTLS server process")
         self.server.start()
         initialize_params = self._get_initialize_params(self.repository_root_path)

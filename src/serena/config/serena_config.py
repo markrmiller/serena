@@ -3,6 +3,7 @@ The Serena Model Context Protocol (MCP) Server
 """
 
 import dataclasses
+import hashlib
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ from serena.constants import (
     SERENA_FILE_ENCODING,
     SERENA_MANAGED_DIR_NAME,
 )
+from serena.util.file_system import get_git_repository_info, iter_git_shared_project_roots
 from serena.util.inspection import determine_programming_language_composition
 from serena.util.yaml import YamlCommentNormalisation, load_yaml, normalise_yaml_comments, save_yaml, transfer_yaml_comments
 from solidlsp.ls_config import Language
@@ -993,6 +995,55 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     def project_names(self) -> list[str]:
         return sorted(project.project_config.project_name for project in self.projects)
 
+    @staticmethod
+    def resolve_project_root(project_root: str | Path) -> Path:
+        """
+        Resolve a user-supplied path to the root Serena should operate on.
+
+        :param project_root: the supplied path
+        :return: the actual git worktree checkout root for git paths, otherwise the resolved path
+        """
+        path = Path(project_root).resolve()
+        git_info = get_git_repository_info(path)
+        if git_info is not None:
+            return git_info.worktree_root
+        return path
+
+    def _project_yml_location_for_root(self, project_root: str | Path) -> str:
+        """
+        Return the local project.yml location for a root without shared-worktree fallback.
+
+        :param project_root: the project root
+        :return: local project.yml path
+        """
+        serena_folder = self.get_project_serena_folder(project_root)
+        return os.path.join(serena_folder, ProjectConfig.SERENA_PROJECT_FILE)
+
+    def find_existing_project_yml_location(self, project_root: str | Path) -> str | None:
+        """
+        Find an existing Serena project.yml for a root, including shared git worktree locations.
+
+        :param project_root: the project root or path inside it
+        :return: an existing project.yml path, or None if none exists
+        """
+        resolved_root = self.resolve_project_root(project_root)
+
+        candidate_roots = [resolved_root]
+        candidate_roots.extend(iter_git_shared_project_roots(resolved_root))
+
+        seen: set[Path] = set()
+        for candidate_root in candidate_roots:
+            candidate_root = Path(candidate_root).resolve()
+            if candidate_root in seen:
+                continue
+            seen.add(candidate_root)
+
+            yml_path = self._project_yml_location_for_root(candidate_root)
+            if os.path.isfile(yml_path):
+                return yml_path
+
+        return None
+
     def get_registered_project(self, project_root_or_name: str, autoregister: bool = False) -> Optional[RegisteredProject]:
         """
         :param project_root_or_name: path to the project root or the name of the project
@@ -1013,21 +1064,32 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
             )
         # no project found by name; check if it's a path
         if os.path.isdir(project_root_or_name):
+            project_root = self.resolve_project_root(project_root_or_name)
             for project in self.projects:
-                if project.matches_root_path(project_root_or_name):
+                if project.matches_root_path(project_root):
                     return project
-        # no registered project found; auto-register if project configuration exists
-        if autoregister:
-            config_path = self.get_project_yml_location(project_root_or_name)
-            if os.path.isfile(config_path):
-                registered_project = RegisteredProject.from_project_root(project_root_or_name, serena_config=self)
-                self.add_registered_project(registered_project)
-                return registered_project
+
+            # no registered project found; auto-register if project configuration exists
+            if autoregister:
+                config_path = self.find_existing_project_yml_location(project_root)
+                if config_path is not None:
+                    registered_project = RegisteredProject.from_project_root(project_root, serena_config=self)
+                    local_config_path = self._project_yml_location_for_root(project_root)
+                    uses_local_config = Path(config_path).resolve() == Path(local_config_path).resolve()
+                    if uses_local_config:
+                        self.add_registered_project(registered_project)
+                    else:
+                        log.info(
+                            "Using shared Serena project config %s for transient worktree %s; not adding the worktree to global projects.",
+                            config_path,
+                            project_root,
+                        )
+                    return registered_project
         # nothing found
         return None
 
-    def get_project(self, project_root_or_name: str) -> Optional["Project"]:
-        registered_project = self.get_registered_project(project_root_or_name)
+    def get_project(self, project_root_or_name: str, autoregister: bool = False) -> Optional["Project"]:
+        registered_project = self.get_registered_project(project_root_or_name, autoregister=autoregister)
         if registered_project is None:
             return None
         else:
@@ -1051,7 +1113,7 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         """
         from ..project import Project
 
-        project_root = Path(project_root).resolve()
+        project_root = self.resolve_project_root(project_root)
         if not project_root.exists():
             raise FileNotFoundError(f"Error: Path does not exist: {project_root}")
         if not project_root.is_dir():
@@ -1062,6 +1124,17 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
                 raise FileExistsError(
                     f"Project with path {project_root} was already added with name '{already_registered_project.project_name}'."
                 )
+
+        git_info = get_git_repository_info(project_root)
+        if git_info is not None and git_info.is_linked_worktree:
+            log.info("Creating transient Serena project for linked git worktree %s", project_root)
+            project_config = ProjectConfig.autogenerate(project_root, serena_config=self, save_to_disk=False)
+            return Project(
+                project_root=str(project_root),
+                project_config=project_config,
+                is_newly_created=True,
+                serena_config=self,
+            )
 
         project_config = ProjectConfig.load(project_root, serena_config=self, autogenerate=True)
 
@@ -1188,8 +1261,41 @@ class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
         :param project_root: the absolute path to the project root directory
         :return: the resolved absolute path to the project's project.yml file
         """
-        serena_folder = self.get_project_serena_folder(project_root)
-        return os.path.join(serena_folder, ProjectConfig.SERENA_PROJECT_FILE)
+        existing_yml = self.find_existing_project_yml_location(project_root)
+        if existing_yml is not None:
+            return existing_yml
+        return self._project_yml_location_for_root(project_root)
+
+    def get_project_memory_serena_folder(self, project_root: str | Path) -> str:
+        """
+        Return the Serena folder used for project configuration and memories.
+
+        :param project_root: the project root
+        :return: the memory/config Serena folder, shared across worktrees when a shared config exists
+        """
+        existing_yml = self.find_existing_project_yml_location(project_root)
+        if existing_yml is not None:
+            return os.path.dirname(existing_yml)
+        return self.get_project_serena_folder(project_root)
+
+    def get_project_runtime_serena_folder(self, project_root: str | Path) -> str:
+        """
+        Return the Serena folder used for runtime data such as LSP caches.
+
+        :param project_root: the project root
+        :return: the runtime Serena folder, isolated per git worktree when memories are shared
+        """
+        local_folder = Path(self.get_project_serena_folder(project_root)).resolve()
+        memory_folder = Path(self.get_project_memory_serena_folder(project_root)).resolve()
+        if local_folder == memory_folder:
+            return str(local_folder)
+
+        git_info = get_git_repository_info(project_root)
+        if git_info is None:
+            return str(local_folder)
+
+        digest = hashlib.sha256(f"{git_info.common_dir}\0{git_info.worktree_root}".encode()).hexdigest()[:16]
+        return os.path.join(SerenaPaths().serena_user_home_dir, "worktrees", digest, SERENA_MANAGED_DIR_NAME)
 
     def propagate_settings(self) -> None:
         """

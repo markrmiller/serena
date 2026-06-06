@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logging import Logger
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import requests
@@ -58,6 +59,7 @@ from serena.tools import (
     ToolMarker,
     ToolRegistry,
 )
+from serena.util.file_system import get_git_repository_info
 from serena.util.gui import system_has_usable_display
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
@@ -528,6 +530,7 @@ class SerenaAgent:
         context: SerenaAgentContext | None = None,
         modes: ModeSelectionDefinition | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
+        enable_project_activation: bool = False,
     ):
         """
         :param project: the project to load immediately or None to not load any project; may be a path to the project or a name of
@@ -539,8 +542,11 @@ class SerenaAgent:
         :param modes: mode selection definition to apply for this session
         :param memory_log_handler: a MemoryLogHandler instance from which to read log messages; if None, a new one will be created
             if necessary.
+        :param enable_project_activation: whether to expose runtime project activation in single-project contexts.
         """
         self._active_project: Project | None = None
+        self._enable_project_activation = enable_project_activation
+        self._startup_project_git_common_dir: Path | None = None
         self._project_activation_callback = project_activation_callback
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
         self._dashboard_manager: DashboardManager | None = None
@@ -602,6 +608,11 @@ class SerenaAgent:
             context = SerenaAgentContext.load_default()
         self._context = context
 
+        if registered_project_to_activate is not None:
+            git_info = get_git_repository_info(registered_project_to_activate.project_root)
+            if git_info is not None:
+                self._startup_project_git_common_dir = git_info.common_dir
+
         # instantiate all tool classes
         self._all_tools: dict[type[Tool], Tool] = {tool_class: tool_class(self) for tool_class in ToolRegistry().get_all_tool_classes()}
         tool_names = [tool.get_name_from_cls() for tool in self._all_tools.values()]
@@ -654,7 +665,12 @@ class SerenaAgent:
 
         # determine the base toolset defining the set of exposed tools (which e.g. the MCP shall see),
         self._base_toolset = self._create_base_toolset(
-            self.serena_config, self._language_backend, self._context, self._active_modes, self._active_project
+            self.serena_config,
+            self._language_backend,
+            self._context,
+            self._active_modes,
+            self._active_project,
+            enable_project_activation=self._enable_project_activation,
         )
         self._exposed_tools = self._base_toolset.to_available_tools(self._all_tools)
         log.info(f"Number of exposed tools: {len(self._exposed_tools)}. Exposed tools: {self._exposed_tools.tool_names}")
@@ -723,6 +739,7 @@ class SerenaAgent:
         context: SerenaAgentContext,
         modes: ActiveModes,
         project: Project | None,
+        enable_project_activation: bool = False,
     ) -> ToolSet:
         """
         Determines the base toolset defining the set of exposed tools (which e.g. the MCP shall see).
@@ -780,10 +797,15 @@ class SerenaAgent:
                 "Applying tool inclusion/exclusion definitions for single-project context based on project '%s'",
                 project.project_name,
             )
+            allow_project_activation = enable_project_activation or context.allow_project_activation
+            single_project_excluded_tools = [GetCurrentConfigTool.get_name_from_cls()]
+            if not allow_project_activation:
+                single_project_excluded_tools.append(ActivateProjectTool.get_name_from_cls())
+
             tool_inclusion_definitions.append(
                 NamedToolInclusionDefinition(
                     name="SingleProjectExclusions",
-                    excluded_tools=[ActivateProjectTool.get_name_from_cls(), GetCurrentConfigTool.get_name_from_cls()],
+                    excluded_tools=single_project_excluded_tools,
                 )
             )
             tool_inclusion_definitions.append(project.project_config)
@@ -910,7 +932,46 @@ class SerenaAgent:
         project = self.get_active_project()
         if project is None:
             raise ValueError("No active project. Please activate a project first.")
+        if not Path(project.project_root).is_dir():
+            old_root = project.project_root
+            log.warning("Active project root disappeared; shutting it down: %s", old_root)
+            project.shutdown()
+            self._active_project = None
+            self._update_active_tools()
+            raise ValueError(
+                "The active project root no longer exists. "
+                f"It was probably an ephemeral agent worktree that has been removed: {old_root}. "
+                "Activate the current worktree path before using LSP or editing tools."
+            )
         return project
+
+    def _runtime_project_activation_allowed(self) -> bool:
+        """
+        :return: whether runtime project activation is enabled for this agent.
+        """
+        return self._enable_project_activation or self._context.allow_project_activation
+
+    def _validate_runtime_project_activation_target(self, project_root: str | Path) -> None:
+        """
+        Validate a runtime project activation target in single-project contexts.
+
+        :param project_root: the requested project root
+        :raises ValueError: if activation targets a different git repository family
+        """
+        if not self._context.single_project:
+            return
+        if not self._runtime_project_activation_allowed():
+            return
+        if self._startup_project_git_common_dir is None:
+            return
+
+        target_info = get_git_repository_info(project_root)
+        if target_info is None or target_info.common_dir != self._startup_project_git_common_dir:
+            raise ValueError(
+                "Project activation is restricted to worktrees of the startup git repository in this context. "
+                f"Startup git common dir: {self._startup_project_git_common_dir}. "
+                f"Rejected target: {project_root}."
+            )
 
     def get_active_modes(self) -> list[SerenaAgentMode]:
         """
@@ -1206,10 +1267,12 @@ class SerenaAgent:
 
         :return: True if the project was newly activated, False if it was already active
         """
-        project_instance: Project | None = self.serena_config.get_project(project_root_or_name)
+        project_instance: Project | None = self.serena_config.get_project(project_root_or_name, autoregister=True)
         if project_instance is not None:
+            self._validate_runtime_project_activation_target(project_instance.project_root)
             log.info(f"Found registered project '{project_instance.project_name}' at path {project_instance.project_root}")
         elif os.path.isdir(project_root_or_name):
+            self._validate_runtime_project_activation_target(project_root_or_name)
             project_instance = self.serena_config.add_project_from_path(project_root_or_name)
             log.info(f"Added new project {project_instance.project_name} for path {project_instance.project_root}")
 

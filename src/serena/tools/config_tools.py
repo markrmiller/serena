@@ -22,6 +22,9 @@ class OpenDashboardTool(Tool, ToolMarkerOptional, ToolMarkerDoesNotRequireActive
 class ActivateProjectTool(Tool, ToolMarkerDoesNotRequireActiveProject):
     """
     Activates a project based on the project name or path.
+
+    In CLI-agent contexts such as Claude Code, pass the actual git worktree path when the agent is operating in a dynamically created
+    worktree. Serena will use that worktree as the LSP/file root while reusing shared project config and memories when available.
     """
 
     # noinspection PyIncorrectDocstring

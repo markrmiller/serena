@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +11,143 @@ from pathspec import PathSpec
 from sensai.util.logging import LogTime
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GitRepositoryInfo:
+    """
+    Git repository identity for a path inside a working tree.
+
+    :ivar worktree_root: the actual checkout root that tools and LSP operate on.
+    :ivar common_dir: the repository identity shared by all linked worktrees.
+    """
+
+    worktree_root: Path
+    common_dir: Path
+
+    @property
+    def is_linked_worktree(self) -> bool:
+        """
+        :return: whether the checkout is a linked git worktree.
+        """
+        return (self.worktree_root / ".git").is_file()
+
+
+def _run_git(cwd: Path, *args: str) -> str | None:
+    """
+    Run a git command and return stripped stdout on success.
+
+    :param cwd: the working directory for git's ``-C`` option
+    :param args: git command arguments
+    :return: stripped stdout, or None if git failed or produced no output
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _git_abs_path(cwd: Path, rev_parse_arg: str) -> Path | None:
+    """
+    Resolve a git path-producing ``rev-parse`` argument to an absolute path.
+
+    :param cwd: the working directory for git's ``-C`` option
+    :param rev_parse_arg: the git ``rev-parse`` argument to resolve
+    :return: the resolved absolute path, or None if unavailable
+    """
+    output = _run_git(cwd, "rev-parse", "--path-format=absolute", rev_parse_arg)
+    if output is None:
+        output = _run_git(cwd, "rev-parse", rev_parse_arg)
+    if output is None:
+        return None
+
+    path = Path(output)
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve()
+
+
+def get_git_repository_info(path: str | Path) -> GitRepositoryInfo | None:
+    """
+    Return git repository/worktree information for a path.
+
+    :param path: a path inside or at a working tree
+    :return: git repository information, or None if the path is not in a git working tree
+    """
+    cwd = Path(path).resolve()
+    if cwd.is_file():
+        cwd = cwd.parent
+    if not cwd.exists():
+        return None
+
+    worktree_root = _git_abs_path(cwd, "--show-toplevel")
+    common_dir = _git_abs_path(cwd, "--git-common-dir")
+    if worktree_root is None or common_dir is None:
+        return None
+
+    return GitRepositoryInfo(worktree_root=worktree_root, common_dir=common_dir)
+
+
+def iter_git_worktree_roots(path: str | Path) -> Iterator[Path]:
+    """
+    Yield worktree roots known to git for the repository containing a path.
+
+    :param path: a path inside or at a git working tree
+    :return: iterator over worktree roots reported by git
+    """
+    cwd = Path(path).resolve()
+    if cwd.is_file():
+        cwd = cwd.parent
+
+    output = _run_git(cwd, "worktree", "list", "--porcelain")
+    if output is None:
+        return
+
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            yield Path(line.removeprefix("worktree ")).resolve()
+
+
+def iter_git_shared_project_roots(path: str | Path) -> Iterator[Path]:
+    """
+    Yield likely locations containing shared ``.serena/project.yml`` for a git worktree setup.
+
+    :param path: a path inside or at a git working tree
+    :return: iterator over candidate roots for shared Serena project configuration
+    """
+    info = get_git_repository_info(path)
+    if info is None:
+        return
+
+    seen: set[Path] = set()
+
+    def emit(candidate: Path) -> Iterator[Path]:
+        candidate = candidate.resolve()
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+    yield from emit(info.worktree_root)
+
+    if info.common_dir.name == ".git":
+        yield from emit(info.common_dir.parent)
+    else:
+        yield from emit(info.common_dir)
+        yield from emit(info.common_dir.parent)
+
+    for worktree_root in iter_git_worktree_roots(info.worktree_root):
+        yield from emit(worktree_root)
 
 
 class ScanResult(NamedTuple):

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from serena.cli import ProjectCommands, TopLevelCommands, find_project_root
+from serena.cli import ProjectCommands, TopLevelCommands, _is_claude_code_context, _resolve_claude_code_project, find_project_root
 from serena.config.serena_config import ProjectConfig
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
@@ -340,6 +340,88 @@ class TestProjectFromCwdMutualExclusivity:
         )
         assert result.exit_code != 0
         assert "cannot be used with" in result.output
+
+
+class TestClaudeCodeProjectResolution:
+    """Tests for Claude Code startup project root resolution."""
+
+    def test_detects_built_in_and_path_contexts(self, tmp_path):
+        """Test that built-in and YAML path forms both count as Claude Code context."""
+        assert _is_claude_code_context("claude-code")
+        assert _is_claude_code_context(str(tmp_path / "claude-code.yml"))
+        assert not _is_claude_code_context("codex")
+
+    def test_explicit_project_wins_over_claude_project_dir(self, monkeypatch):
+        """Test that explicit --project wins over CLAUDE_PROJECT_DIR."""
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/stable/claude/root")
+
+        assert _resolve_claude_code_project("/explicit/project", None, True) == "/explicit/project"
+
+    def test_positional_project_wins_over_claude_project_dir(self, monkeypatch):
+        """Test that an explicit positional project wins over CLAUDE_PROJECT_DIR."""
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/stable/claude/root")
+
+        assert _resolve_claude_code_project(None, "/positional/project", True) == "/positional/project"
+
+    def test_claude_project_dir_wins_over_cwd(self, monkeypatch, tmp_path):
+        """Test that CLAUDE_PROJECT_DIR is preferred over process CWD for Claude Code."""
+        cwd = tmp_path / "cwd"
+        claude_project_dir = tmp_path / "claude-root"
+        cwd.mkdir()
+        claude_project_dir.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(claude_project_dir))
+
+        assert _resolve_claude_code_project(None, None, True) == str(claude_project_dir)
+
+    def test_cwd_is_fallback_when_requested(self, monkeypatch, tmp_path):
+        """Test that CWD is used as the fallback when project-from-cwd is requested."""
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        assert _resolve_claude_code_project(None, None, True) == str(tmp_path)
+
+    def test_no_project_when_no_source_available(self, monkeypatch):
+        """Test that no project is resolved without explicit/env/CWD fallback."""
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+
+        assert _resolve_claude_code_project(None, None, False) is None
+
+    def test_start_mcp_server_uses_claude_project_dir_for_factory_project(self, monkeypatch, cli_runner, tmp_path):
+        """Test the real CLI command passes CLAUDE_PROJECT_DIR to the MCP factory."""
+        cwd = tmp_path / "cwd"
+        claude_project_dir = tmp_path / "claude-root"
+        cwd.mkdir()
+        claude_project_dir.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(claude_project_dir))
+
+        captured: dict[str, object] = {}
+
+        class FakeServer:
+            def run(self, transport: str) -> None:
+                captured["run_transport"] = transport
+
+        class FakeFactory:
+            def __init__(self, transport: str, context: str, project: str | None, memory_log_handler: object | None = None) -> None:
+                captured["transport"] = transport
+                captured["context"] = context
+                captured["project"] = project
+                captured["memory_log_handler"] = memory_log_handler
+
+            def create_mcp_server(self, **kwargs: object) -> FakeServer:
+                captured["create_kwargs"] = kwargs
+                return FakeServer()
+
+        monkeypatch.setattr("serena.mcp.SerenaMCPFactory", FakeFactory)
+
+        result = cli_runner.invoke(TopLevelCommands.start_mcp_server, ["--context=claude-code", "--project-from-cwd"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["transport"] == "stdio"
+        assert captured["context"] == "claude-code"
+        assert captured["project"] == str(claude_project_dir)
+        assert captured["run_transport"] == "stdio"
 
 
 if __name__ == "__main__":

@@ -39,8 +39,10 @@ class Project(ToStringMixin):
         self.project_root = project_root
         self.project_config = project_config
         self.serena_config = serena_config
-        self._serena_data_folder = serena_config.get_project_serena_folder(self.project_root)
-        log.info("Serena project data folder: %s", self._serena_data_folder)
+        self._serena_data_folder = serena_config.get_project_memory_serena_folder(self.project_root)
+        self._runtime_serena_data_folder = serena_config.get_project_runtime_serena_folder(self.project_root)
+        log.info("Serena project config/memory folder: %s", self._serena_data_folder)
+        log.info("Serena project runtime folder: %s", self._runtime_serena_data_folder)
 
         read_only_memory_patterns = serena_config.read_only_memory_patterns + project_config.read_only_memory_patterns
         ignored_memory_patterns = serena_config.ignored_memory_patterns + project_config.ignored_memory_patterns
@@ -59,7 +61,7 @@ class Project(ToStringMixin):
         self._agent: Optional["SerenaAgent"] = None
 
         # create .gitignore file in the project's Serena data folder if not yet present
-        serena_data_gitignore_path = os.path.join(self._serena_data_folder, ".gitignore")
+        serena_data_gitignore_path = os.path.join(self._runtime_serena_data_folder, ".gitignore")
         if not os.path.exists(serena_data_gitignore_path):
             os.makedirs(os.path.dirname(serena_data_gitignore_path), exist_ok=True)
             log.info(f"Creating .gitignore file in {serena_data_gitignore_path}")
@@ -142,6 +144,9 @@ class Project(ToStringMixin):
 
     def path_to_serena_data_folder(self) -> str:
         return self._serena_data_folder
+
+    def path_to_runtime_serena_data_folder(self) -> str:
+        return self._runtime_serena_data_folder
 
     def path_to_project_yml(self) -> str:
         return self.serena_config.get_project_yml_location(self.project_root)
@@ -299,7 +304,48 @@ class Project(ToStringMixin):
 
         if require_not_ignored:
             if self.is_ignored_path(relative_path):
+                nested_worktree_root = self._find_containing_nested_git_worktree(relative_path)
+                if nested_worktree_root is not None:
+                    raise ValueError(
+                        f"This path is inside a Claude Code worktree, but Serena is active on the main checkout "
+                        f"{self.project_root}: {relative_path}. The worktree root appears to be {nested_worktree_root}. "
+                        "Use the Serena instance running in that worktree, or activate the worktree root. "
+                        "Do not edit worktree files through .claude/worktrees/... from the main project."
+                    )
                 raise ValueError(f"Path {relative_path} is ignored; cannot access for safety reasons")
+
+    def _find_containing_nested_git_worktree(self, relative_path: str | Path) -> Path | None:
+        """
+        If a relative path appears to point into a nested git worktree, return that worktree root.
+
+        This is primarily for Claude Code agent-team layouts such as
+        ``.claude/worktrees/<agent>/<repo>/...`` where the correct fix is to
+        activate the worktree root, not to edit it through the main checkout.
+
+        :param relative_path: the path to inspect, relative to the project root
+        :return: the nested git worktree root, or None if none is found
+        """
+        candidate = (Path(self.project_root) / relative_path).resolve()
+        if candidate.is_file():
+            candidate = candidate.parent
+
+        project_root = Path(self.project_root).resolve()
+
+        for path in [candidate, *candidate.parents]:
+            if path == project_root:
+                return None
+            git_file = path / ".git"
+            if git_file.is_file():
+                try:
+                    content = git_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return None
+                if content.startswith("gitdir:"):
+                    return path
+            if path.parent == path:
+                return None
+
+        return None
 
     def gather_source_files(self, relative_path: str = "") -> list[str]:
         """Retrieves relative paths of all source files, optionally limited to the given path
@@ -422,7 +468,7 @@ class Project(ToStringMixin):
             ls_specific_settings = {**self.serena_config.ls_specific_settings, **self.project_config.ls_specific_settings}
             factory = LanguageServerFactory(
                 project_root=self.project_root,
-                project_data_path=self._serena_data_folder,
+                project_data_path=self._runtime_serena_data_folder,
                 encoding=self.project_config.encoding,
                 ignored_patterns=self._ignored_patterns,
                 ls_timeout=ls_timeout,
