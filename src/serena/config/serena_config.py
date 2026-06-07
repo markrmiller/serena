@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self, TypeVar
 
 import yaml
 from ruamel.yaml.comments import CommentedMap
@@ -250,6 +250,120 @@ class LineEnding(Enum):
 
 
 @dataclass
+class JavaRefactorConfig:
+    """Optional Java-only compiler-backed refactoring configuration."""
+
+    enabled: bool = False
+    preview_default: bool = True
+    build_tool_mode: str = "auto"
+    java_home: str | None = None
+    # Annotation-processing mode for sidecar analysis. One of: "none" (disable processing), "classpath" (discover
+    # processors on the compile classpath, javac default), or "project" (run only the project's declared processors).
+    annotation_processing: str = "none"
+    allow_incomplete_analysis: bool = False
+    # When build-model extraction (real Maven/Gradle) fails, fail closed by default (surfaced as a project-model error).
+    # Setting this true degrades to conventional source-layout discovery with a warning instead.
+    allow_conventional_fallback: bool = False
+    # Forces offline build-model extraction (Gradle --offline / Maven -o); used so accidental network access fails loudly.
+    offline: bool = False
+    route_generic_rename: bool = False
+    route_generic_safe_delete: bool = False
+    use_lsp_symbol_resolution: bool = True
+    include_javadocs: bool = False
+    include_comments: bool = False
+    max_files: int = 10000
+    max_heap: str = "2G"
+    # Controls ONLY the staged pre-commit javac validation step on apply: when true (default), the post-edit sources
+    # are validated in memory and the apply refuses without writing if that validation fails; when false, that
+    # pre-commit step is skipped. Post-commit validation with rollback ALWAYS runs on apply regardless of this flag,
+    # so a compiler-breaking edit is still rolled back — disabling this only trades an early (nothing-written) refusal
+    # for a commit-then-rollback.
+    validate_before_apply: bool = True
+    # Real preview-validation knob (design key `validate_after_preview`): when true, a preview runs the staged in-memory
+    # javac validation path (no files written) and reports the result distinctly from apply-time validation. It governs
+    # PREVIEW reporting only.
+    validate_after_preview: bool = True
+    use_jdtls_settings: bool = True
+    # Explicit project-model overrides surfaced to the sidecar's javac session. These let projects with
+    # non-conventional layouts, external dependencies, or modular builds be analyzed correctly without a
+    # full Gradle/Maven model extraction. Paths are project-root-relative or absolute.
+    source_roots: list[str] = field(default_factory=list)
+    classpath: list[str] = field(default_factory=list)
+    module_path: list[str] = field(default_factory=list)
+    release: str | None = None
+    source: str | None = None
+    target: str | None = None
+    encoding: str | None = None
+    # Patterns pruned while discovering Java sources/build files. Sent to the sidecar as the initialize contract's
+    # ``ignoredPatterns`` and replaces the sidecar's former hard-coded exclusion list. A bare directory name (e.g.
+    # ``build``) keeps directory-segment semantics (pruned anywhere); an entry with a path separator or glob
+    # metacharacter (e.g. ``target/**``, ``build/**``) is matched as a glob over the project-relative POSIX path. The
+    # default mirrors the historical built-in set; configuring it (e.g. adding ``node_modules`` or removing ``out``) is
+    # real behavior.
+    ignored_patterns: list[str] = field(default_factory=lambda: [".git", ".gradle", ".serena", "build", "target", "out"])
+
+    # Maps design-contract (refactor-feature-plan.md) config keys to the implementation field names.
+    # Both spellings are accepted on input; the design key wins if both are provided with the same value.
+    _DESIGN_ALIASES: ClassVar[dict[str, str]] = {
+        "build_tool_model": "build_tool_mode",
+        "include_javadocs_default": "include_javadocs",
+        "include_comments_default": "include_comments",
+    }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "JavaRefactorConfig":
+        """Creates a Java refactor config from project YAML data.
+
+        Accepts both the design-contract key names (e.g. ``build_tool_model``,
+        ``include_javadocs_default``, ``include_comments_default``) and the implementation field
+        names as compatibility aliases. ``validate_after_apply`` has been removed (post-apply validation always
+        runs) and is rejected with a dedicated error. Truly unknown keys are rejected with a clear error rather
+        than blindly merged into the dataclass constructor.
+        """
+        if data is None:
+            return cls()
+        if "validate_after_apply" in data:
+            # Removed from the V1 config surface: post-apply javac validation with rollback is part of the
+            # non-bypassable apply safety gate and always runs. Reject explicitly instead of silently ignoring a
+            # disable-looking knob.
+            raise ValueError(
+                "The java_refactor config key 'validate_after_apply' has been removed: post-apply validation with "
+                "rollback always runs on apply and cannot be configured off. Remove the key from the project config."
+            )
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        normalized: dict[str, Any] = {}
+        unknown: list[str] = []
+        for key, value in data.items():
+            canonical = cls._DESIGN_ALIASES.get(key, key)
+            if canonical not in field_names:
+                unknown.append(key)
+                continue
+            if canonical in normalized and normalized[canonical] != value:
+                raise ValueError(
+                    f"Conflicting java_refactor config values for {canonical!r}: "
+                    f"design key and implementation key disagree ({normalized[canonical]!r} vs {value!r})."
+                )
+            normalized[canonical] = value
+        if unknown:
+            accepted = sorted(field_names | set(cls._DESIGN_ALIASES))
+            raise ValueError(f"Unknown java_refactor config key(s): {sorted(unknown)}; expected one of {accepted}.")
+        config = cls(**normalized)
+        valid_modes = {"none", "classpath", "project"}
+        if config.annotation_processing not in valid_modes:
+            raise ValueError(f"Invalid annotation_processing value {config.annotation_processing!r}; expected one of {sorted(valid_modes)}")
+        if not isinstance(config.max_files, int) or config.max_files <= 0:
+            raise ValueError(f"Invalid max_files value {config.max_files!r}; expected a positive integer.")
+        if not isinstance(config.ignored_patterns, list) or not all(isinstance(p, str) for p in config.ignored_patterns):
+            raise ValueError(
+                f"Invalid ignored_patterns value {config.ignored_patterns!r}; expected a list of pattern strings "
+                f"(bare directory names or globs such as 'target/**')."
+            )
+        if not re.fullmatch(r"\d+[kKmMgG]?", config.max_heap.strip()):
+            raise ValueError(f"Invalid max_heap value {config.max_heap!r}; expected a JVM heap size such as '512m', '2G', or '1024'.")
+        return config
+
+
+@dataclass
 class SharedConfig(ToolInclusionDefinition, ToStringMixin):
     """Shared between SerenaConfig and ProjectConfig, the latter used to override values in the form
     (same as in ModeSelectionDefinition).
@@ -286,6 +400,7 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
     ignore_all_files_in_gitignore: bool = True
     initial_prompt: str = ""
     encoding: str = DEFAULT_SOURCE_FILE_ENCODING
+    java_refactor: JavaRefactorConfig = field(default_factory=JavaRefactorConfig)
 
     # internal fields which are not mapped to/from the configuration file (must start with "_")
     _local_override_keys: list[str] = field(default_factory=list)
@@ -432,6 +547,11 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
                 if key not in data:
                     was_complete = False
                     default_value = get_dataclass_default(cls, key)
+                    # Nested dataclass defaults (e.g. ``java_refactor``) must be stored as plain
+                    # dicts so the returned map stays YAML-serializable and downstream ``_from_dict``
+                    # parsing (which calls ``JavaRefactorConfig.from_dict`` expecting a dict) works.
+                    if dataclasses.is_dataclass(default_value) and not isinstance(default_value, type):
+                        default_value = dataclasses.asdict(default_value)
                     data.setdefault(key, default_value)
 
         # backward compatibility
@@ -518,6 +638,7 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
             default_modes=data["default_modes"],
             symbol_info_budget=symbol_info_budget,
             ls_specific_settings=data.get("ls_specific_settings", {}),
+            java_refactor=JavaRefactorConfig.from_dict(data.get("java_refactor")),
             _local_override_keys=local_override_keys,
         )
 

@@ -36,6 +36,7 @@ from serena.config.serena_config import (
     ModeSelectionDefinitionWithAddedModes,
     ModeSelectionDefinitionWithBaseModes,
     NamedToolInclusionDefinition,
+    ProjectConfig,
     RegisteredProject,
     SerenaConfig,
     SerenaPaths,
@@ -810,6 +811,20 @@ class SerenaAgent:
                 )
             )
             tool_inclusion_definitions.append(project.project_config)
+            tool_inclusion_definitions.append(cls._java_refactor_tool_inclusion(project.project_config))
+        else:
+            # In a multi-project (or no-startup-project) context, the project that will be worked on is not fixed:
+            # a Java project with java_refactor.enabled may be activated later. The exposed (client-visible) toolset is
+            # a schema SUPERSET fixed at session start for MCP clients, so the optional Java refactoring tools must be
+            # present here or they could never surface; availability is gated separately: _update_active_tools()
+            # excludes them whenever there is no active project or the active project does not set
+            # java_refactor.enabled, and calling a non-active tool is refused. So config still gates availability in
+            # every startup mode; only the static schema advertises the superset.
+            from serena.tools.java_refactor_tools import java_refactor_tool_names
+
+            tool_inclusion_definitions.append(
+                NamedToolInclusionDefinition(name="JavaRefactorExposed", included_optional_tools=java_refactor_tool_names())
+            )
 
         # enabled the internal 'jetbrains' mode for the JetBrains backend
         if language_backend == LanguageBackend.JETBRAINS:
@@ -1143,6 +1158,24 @@ class SerenaAgent:
             active_mode_names = self._active_modes.get_mode_names()
             log.info(f"Active modes ({len(active_mode_names)}): {', '.join(active_mode_names)}")
 
+    @staticmethod
+    def _java_refactor_tool_inclusion(project_config: "ProjectConfig | None") -> "NamedToolInclusionDefinition":
+        """A tool-inclusion definition that makes the optional Java refactoring tools available only when the active
+        project's ``java_refactor.enabled`` flag is set, and excludes them otherwise — including when there is no
+        active project at all (``None``), since without a project there is no opt-in. Config thereby gates
+        availability, not just execution.
+        """
+        from serena.tools.java_refactor_tools import java_refactor_tool_names
+
+        names = java_refactor_tool_names()
+        if (
+            project_config is not None
+            and getattr(project_config, "java_refactor", None) is not None
+            and project_config.java_refactor.enabled
+        ):
+            return NamedToolInclusionDefinition(name="JavaRefactorEnabled", included_optional_tools=names)
+        return NamedToolInclusionDefinition(name="JavaRefactorDisabled", excluded_tools=names)
+
     def _update_active_tools(self) -> None:
         """
         Updates the active tools based on the active modes and the active project.
@@ -1155,8 +1188,17 @@ class SerenaAgent:
         # apply active project configuration (if any)
         if self._active_project is not None:
             tool_set = tool_set.apply(self._active_project.project_config)
+            # Gate the optional Java compiler-backed refactoring tools on the project's java_refactor.enabled flag, so
+            # they are available only for projects that opt in (rather than always-present and refusing at execution).
+            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(self._active_project.project_config))
             if self._active_project.project_config.read_only:
                 tool_set = tool_set.without_editing_tools()
+        else:
+            # No active project means no java_refactor opt-in: the optional Java refactoring tools must not be active
+            # in a multi-project/no-startup-project session before an enabled project is activated. (They may still be
+            # present in the exposed schema superset, which is fixed at startup for MCP clients; availability is what
+            # this gates — calling them in this state is refused as an inactive tool.)
+            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(None))
 
         self._active_tools = tool_set.to_available_tools(self._all_tools)
         log.info(f"Active tools ({len(self._active_tools)}): {', '.join(self._active_tools.tool_names)}")

@@ -1,0 +1,142 @@
+import groovy.json.JsonOutput
+
+// Serena build-model extraction init script. Registers a `dumpSerenaModel` task on every project that, when run,
+// writes a normalized JSON description of each Java source set (roots, generated roots, resolved compile classpath,
+// and compiler settings) to a PER-PROJECT file under the base directory named by the `serena.model.outDir` system
+// property. Each project writes its OWN file (derived from its project path), so a multi-project build where several
+// subprojects have Java sources does not have later projects overwrite earlier ones. The Java side then globs and
+// merges these per-project files. It adds no dependencies to the user's build and never mutates it; it is injected only
+// for the duration of the extraction invocation.
+allprojects { p ->
+    p.tasks.register("dumpSerenaModel") {
+        doLast {
+            def modules = []
+            p.plugins.withId("java") {
+                p.extensions.getByName("sourceSets").each { ss ->
+                    def compileTask = p.tasks.findByName(ss.compileJavaTaskName)
+                    def existingSrcDirs = ss.java.srcDirs.findAll { it.exists() }
+                    def generatedRootSet = new LinkedHashSet<String>()
+                    // Heuristic: any source dir under a conventional /generated/ path is a generated root.
+                    existingSrcDirs.findAll { it.path.replace('\\', '/').contains('/generated/') }.each {
+                        generatedRootSet.add(it.absolutePath)
+                    }
+                    // Authoritative: the compile task's annotation-processor generated-sources output directory (a real
+                    // generated output that may live OUTSIDE a /generated/ path and may not be registered as a srcDir).
+                    try {
+                        def genOut = compileTask?.options?.generatedSourceOutputDirectory?.getOrNull()?.asFile
+                        if (genOut != null && genOut.exists()) {
+                            generatedRootSet.add(genOut.absolutePath)
+                        }
+                    } catch (Exception ignored) {
+                        // Older Gradle without generatedSourceOutputDirectory: the /generated/ heuristic still applies.
+                    }
+                    def generatedRoots = generatedRootSet as List
+                    // A generated root is reported ONLY in generatedRoots, never also in srcDirs, so the Java side (which
+                    // appends both lists) does not add the same root twice and make javac see it doubly.
+                    def srcDirs = existingSrcDirs*.absolutePath.findAll { !generatedRoots.contains(it) }
+                    def classpath = []
+                    try {
+                        classpath = ss.compileClasspath.files*.absolutePath
+                    } catch (Exception ignored) {
+                        // An unresolvable compile classpath (e.g. offline with a missing dependency) is surfaced as an
+                        // empty classpath; downstream javac validation reports the resulting errors.
+                    }
+                    def annotationProcessorPath = []
+                    try {
+                        annotationProcessorPath = p.configurations.findByName(ss.annotationProcessorConfigurationName)?.files*.absolutePath ?: []
+                    } catch (Exception ignored) {
+                        // An unresolvable annotation-processor configuration is surfaced as an empty processor path;
+                        // the "project" annotation-processing mode then degrades to no processors (-proc:none).
+                    }
+                    // The compiled-class output directory (typically build/classes/java/<sourceSet>). Reported so the
+                    // Java side can expose per-source-set outputDirs in the project model.
+                    def outputDirs = []
+                    try {
+                        outputDirs = ss.output.classesDirs.files*.absolutePath
+                    } catch (Exception ignored) {
+                        // An unresolvable output is surfaced as no output dirs; this is informational only.
+                    }
+                    // For a modular source set (one whose sources include a module-info.java), javac must receive the
+                    // compile dependencies on the --module-path rather than the classpath. Gradle resolves the same
+                    // files for both, so reuse the resolved compile classpath as the module path when modular.
+                    def modular = existingSrcDirs.any { new File(it, 'module-info.java').exists() }
+                    def modulePath = modular ? classpath : []
+                    // The real, effective extra compiler arguments configured on the compile task. These carry flags the
+                    // reconstructed javacOptions would otherwise miss (--enable-preview, --add-exports, --add-opens,
+                    // -parameters, -Akey=value processor options, custom -Xlint settings, etc.). Captured verbatim so the
+                    // Java side can merge them into javacOptions and pass them to javac exactly as the build would.
+                    def compilerArgs = []
+                    try {
+                        compilerArgs = (compileTask?.options?.compilerArgs ?: []).collect { it.toString() }
+                    } catch (Exception ignored) {
+                        // An unreadable compilerArgs list is surfaced as none; the reconstructed base options still apply.
+                    }
+                    // The -parameters flag is exposed as a typed boolean property on CompileOptions rather than as a raw
+                    // compiler arg, so capture it separately and synthesize the flag the build would effectively pass.
+                    try {
+                        if (compileTask?.options?.parameters?.getOrNull()) {
+                            if (!compilerArgs.contains('-parameters')) {
+                                compilerArgs = compilerArgs + ['-parameters']
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        // Older Gradle without options.parameters: rely on whatever appears in compilerArgs.
+                    }
+                    // A Java toolchain selects WHICH javac binary runs; it does NOT imply `--release N`. Gradle already
+                    // derives sourceCompatibility/targetCompatibility from the toolchain, so those flow through as
+                    // source/target. `release` is reported ONLY when the build explicitly set `options.release`, because
+                    // synthesizing `--release` from the toolchain would (a) diverge from what the real build passes and
+                    // (b) make legal builds illegal — e.g. `--add-exports jdk.compiler/...` is rejected under `--release`.
+                    // Project-to-project dependency edges: the paths of the sibling Gradle projects this source set's
+                    // compile classpath depends on (`implementation project(':a')`, etc.). The Java side maps each to the
+                    // depended project's `main` source set so its source roots feed this set's -sourcepath, letting a
+                    // dependent project resolve a depended project's symbols from SOURCE even when it has not been built.
+                    def dependsOnProjects = new LinkedHashSet<String>()
+                    try {
+                        def cfg = p.configurations.findByName(ss.compileClasspathConfigurationName)
+                        if (cfg != null) {
+                            cfg.allDependencies.withType(org.gradle.api.artifacts.ProjectDependency).each { pd ->
+                                try {
+                                    dependsOnProjects.add(pd.dependencyProject.path)
+                                } catch (Throwable ignoredDep) {
+                                    // Gradle 9 removed ProjectDependency.dependencyProject; the project path is on pd.path.
+                                    try { dependsOnProjects.add(pd.path) } catch (Throwable ignoredPath) {}
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        // An unresolvable configuration yields no project edges; cross-module symbols then fall back to
+                        // whatever the resolved classpath provides (e.g. a prebuilt jar), exactly as before.
+                    }
+                    modules << [
+                            project                : p.path,
+                            sourceSet              : ss.name,
+                            srcDirs                : srcDirs,
+                            generatedRoots         : generatedRoots,
+                            outputDirs             : outputDirs,
+                            classpath              : classpath,
+                            modulePath             : modulePath,
+                            annotationProcessorPath: annotationProcessorPath,
+                            dependsOnProjects      : dependsOnProjects as List,
+                            compilerArgs           : compilerArgs,
+                            release       : compileTask?.options?.release?.orNull?.toString(),
+                            source        : compileTask?.sourceCompatibility,
+                            target        : compileTask?.targetCompatibility,
+                            encoding      : compileTask?.options?.encoding
+                    ]
+                }
+            }
+            // Write one file per project so subprojects never clobber each other's source sets. The project path is the
+            // unique key (':' for the root, ':a', ':a:b', ...); ':' is not a legal file-name char on all platforms, so
+            // it is replaced with '_'. The Java side merges every file in this directory.
+            def base = new File(System.getProperty("serena.model.outDir"))
+            base.mkdirs()
+            def safeName = p.path.replace(':', '_')
+            if (safeName.isEmpty()) {
+                safeName = '_'
+            }
+            def out = new File(base, safeName + ".json")
+            out.text = JsonOutput.toJson([modules: modules])
+        }
+    }
+}

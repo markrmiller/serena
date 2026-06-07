@@ -1,0 +1,96 @@
+name: Java Refactor Engine
+
+# Dedicated CI path for the compiler-backed Java refactoring engine (the Java sidecar + Python manager/client).
+# These tests build the sidecar jar with Gradle and drive it over JSON stdio; some also shell out to Maven/Gradle to
+# extract real build models. They are split into their own job so the toolchain they need (a JDK plus Gradle and Maven
+# on PATH) is provisioned explicitly rather than relying on whatever the default runner image happens to ship.
+
+# Path filters below cover every file that affects Java-refactoring behavior or packaging: the sidecar + Python
+# manager/client, the tests and helpers, the config/tool/routing/agent integration files, the project template, and the
+# packaging hook + project metadata. This dedicated workflow is the explicit-toolchain (JDK + Gradle + Maven) matrix for
+# the engine; it is NOT the sole protection — the general `Tests` workflow (.github/workflows/pytest.yml) runs on EVERY
+# pull request with no path filter and executes the same `test/serena/test_java_refactor*.py` suite, so a change to a
+# file not listed here is still covered there.
+on:
+  pull_request:
+    paths:
+      - "java-refactor/**"
+      - "src/serena/java_refactor/**"
+      - "src/serena/config/serena_config.py"
+      - "src/serena/tools/java_refactor_tools.py"
+      - "src/serena/tools/symbol_tools.py"
+      - "src/serena/agent.py"
+      - "src/serena/resources/project.template.yml"
+      - "hatch_build.py"
+      - "pyproject.toml"
+      - "test/serena/test_java_refactor*.py"
+      - "test/serena/_java_refactor_sidecar_helpers.py"
+      - "test/serena/test_workspace_edit.py"
+      - "test/solidlsp/java/test_java_refactor_jdtls_integration.py"
+      - ".github/workflows/java-refactor.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "java-refactor/**"
+      - "src/serena/java_refactor/**"
+      - "src/serena/config/serena_config.py"
+      - "src/serena/tools/java_refactor_tools.py"
+      - "src/serena/tools/symbol_tools.py"
+      - "src/serena/agent.py"
+      - "src/serena/resources/project.template.yml"
+      - "hatch_build.py"
+      - "pyproject.toml"
+      - "test/serena/test_java_refactor*.py"
+      - "test/serena/_java_refactor_sidecar_helpers.py"
+      - "test/serena/test_workspace_edit.py"
+      - "test/solidlsp/java/test_java_refactor_jdtls_integration.py"
+      - ".github/workflows/java-refactor.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-java-refactor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  java-refactor:
+    name: Java refactor tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Verify build toolchain
+        run: |
+          java -version
+          gradle --version
+          mvn --version
+      - name: Build the sidecar jar
+        run: gradle -p java-refactor jar
+      - name: Run Java sidecar unit tests
+        # JVM-side unit tests (e.g. XML-parser XXE hardening) that are not driven through the Python protocol.
+        run: gradle -p java-refactor test
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Create virtual environment
+        run: uv venv
+      - name: Install Python environment
+        run: uv sync --extra dev --locked
+      - name: Run Java refactor test matrix
+        # The blocking acceptance tests live in test_java_refactor*.py (which includes the executable acceptance-matrix
+        # manifest, test_java_refactor_acceptance_matrix.py) and in test_workspace_edit.py (the transactional applier);
+        # assertions check exact refusals or exact workspace edits, not just that the project still compiles. The
+        # manifest test fails this job if any mapped acceptance test file is dropped from this command.
+        run: uv run pytest test/serena/test_java_refactor*.py test/serena/test_workspace_edit.py -q --tb=short
+      - name: Run JDTLS integration seam test
+        # The remaining blocking acceptance test lives OUTSIDE the glob above: the real-JDTLS post-edit coherence test
+        # (plan section 15, "JDTLS caches/diagnostics still work after edits"). It downloads a pinned vscode-java/JDTLS
+        # bundle on first use, so it gets its own step for clear attribution of runtime and failures.
+        run: uv run pytest test/solidlsp/java/test_java_refactor_jdtls_integration.py -q --tb=short

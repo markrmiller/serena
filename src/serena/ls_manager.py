@@ -253,3 +253,20 @@ class LanguageServerManager:
 
     def has_suitable_ls_for_file(self, relative_file_path: str) -> bool:
         return self._get_suitable_language_server(relative_file_path) is not None
+
+    def notify_open_file_changed_on_disk(self, relative_file_path: str) -> bool:
+        """Re-syncs an open document with its on-disk content after an out-of-band (non-LSP) disk edit.
+
+        Routes to the language server suitable for the file (if any) and asks it to push the current disk content for the
+        file if that document is currently open. This keeps language-server state coherent after edits applied outside
+        the editor path (e.g. the Java refactoring sidecar writing directly to disk). A file that is not open, or has no
+        suitable/running language server, is a no-op.
+
+        :param relative_file_path: the project-relative path of the file that changed on disk
+        :return: ``True`` if an open document was re-synced, ``False`` otherwise
+        """
+        ls = self._get_suitable_language_server(relative_file_path)
+        if ls is None:
+            return False
+        ls = self._ensure_functional_ls(ls)
+        return ls.notify_open_file_changed_on_disk(relative_file_path)

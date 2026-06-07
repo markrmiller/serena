@@ -26,6 +26,7 @@ from solidlsp.ls_exceptions import SolidLSPException
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
     from serena.code_editor import CodeEditor, LanguageServerCodeEditor
+    from serena.java_refactor.manager import JavaRefactorManager
     from serena.symbol import LanguageServerSymbolRetriever
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,24 @@ class Component(ABC):
         if not self.agent.is_using_language_server():
             raise Exception("Cannot create LanguageServerCodeEditor; agent is not in language server mode.")
         return LanguageServerCodeEditor(self.create_language_server_symbol_retriever())
+
+    def create_java_refactor_client(self) -> "JavaRefactorManager":
+        """Returns the project-bound Java refactoring sidecar manager.
+
+        The sidecar itself is compiler-backed and can operate without LSP when callers pass explicit line/column
+        coordinates. LSP mode is required only when ``java_refactor.use_lsp_symbol_resolution`` is true, because
+        ``name_path`` targeting then depends on Serena's language-server symbol tree.
+        """
+        from serena.java_refactor.manager import get_or_create_java_refactor_manager
+
+        backend = self.agent.get_language_backend()
+        java_refactor = self.project.project_config.java_refactor
+        if java_refactor.use_lsp_symbol_resolution and not backend.is_lsp():
+            raise Exception(
+                "Cannot create the Java refactor client with name_path/LSP symbol resolution enabled; use Serena's LSP "
+                "backend or set java_refactor.use_lsp_symbol_resolution: false and pass explicit line/column."
+            )
+        return get_or_create_java_refactor_manager(self.project, backend)
 
 
 class ToolMarker:
@@ -289,10 +308,8 @@ class Tool(Component):
             str | None,
             Field(
                 default=None,
-                description="The absolute path of your current working directory. Always pass it when you are working "
-                "in a git worktree checkout (e.g. an ephemeral agent worktree): if it lies in a different worktree of "
-                "the active project's repository, Serena automatically re-roots onto it, ensuring all tools operate "
-                "on your checkout. May also be injected automatically by the agent harness.",
+                description="Absolute path of your working directory; pass it only when working in a git worktree "
+                "checkout so Serena re-roots onto it. Usually injected automatically by the agent harness.",
             ),
         )
         arg_model = create_model(

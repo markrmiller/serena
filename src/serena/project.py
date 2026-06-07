@@ -22,6 +22,7 @@ from solidlsp.ls_utils import FileUtils
 
 if TYPE_CHECKING:
     from serena.agent import SerenaAgent
+    from serena.java_refactor.manager import JavaRefactorManager
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ class Project(ToStringMixin):
         self.line_ending = project_config.line_ending or serena_config.line_ending
 
         self.language_server_manager: LanguageServerManager | None = None
+        self.java_refactor_manager: Optional["JavaRefactorManager"] = None
         self._language_server_manager_init_error: Exception | None = None
         self.is_newly_created = is_newly_created
         self._agent: Optional["SerenaAgent"] = None
@@ -549,6 +551,9 @@ class Project(ToStringMixin):
             self.language_server_manager.remove_language_server(language)
 
     def shutdown(self, timeout: float = 2.0) -> None:
+        if self.java_refactor_manager is not None:
+            self.java_refactor_manager.shutdown(timeout=timeout)
+            self.java_refactor_manager = None
         if self.language_server_manager is not None:
             self.language_server_manager.stop_all(save_cache=True, timeout=timeout)
             self.language_server_manager = None

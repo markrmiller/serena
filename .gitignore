@@ -276,3 +276,6 @@ zz-misc/
 vue-implementation/
 
 news/news.json
+
+# oh-my-claudecode local state
+.omc/

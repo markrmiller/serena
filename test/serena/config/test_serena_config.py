@@ -9,6 +9,7 @@ import pytest
 from serena.agent import SerenaAgent
 from serena.config.serena_config import (
     DEFAULT_PROJECT_SERENA_FOLDER_LOCATION,
+    JavaRefactorConfig,
     LanguageBackend,
     ProjectConfig,
     RegisteredProject,
@@ -143,6 +144,29 @@ class TestProjectConfig:
     def test_template_is_complete(self):
         _, is_complete = ProjectConfig._load_yaml_dict(PROJECT_TEMPLATE_FILE)
         assert is_complete, "Project template YAML is incomplete; all fields must be present (with descriptions)."
+
+    def test_load_yaml_defaults_nested_dataclass_as_dict(self, tmp_path):
+        """Regression: a project.yml lacking ``java_refactor`` must default to a plain dict.
+
+        Previously the default was applied as a ``JavaRefactorConfig`` instance, which made the
+        loaded map non-YAML-serializable and crashed ``_from_dict`` (``'JavaRefactorConfig' object
+        has no attribute 'items'``). This affected every pre-existing project.yml written before the
+        java_refactor feature existed.
+        """
+        yml_path = tmp_path / "project.yml"
+        yml_path.write_text("project_name: demo\nlanguages:\n  - python\n")
+        data, was_complete = ProjectConfig._load_yaml_dict(str(yml_path))
+        assert not was_complete
+        assert isinstance(data["java_refactor"], dict)
+
+    def test_from_dict_parses_when_java_refactor_missing_from_yaml(self, tmp_path):
+        """Regression: the full load path succeeds for a project.yml without ``java_refactor``."""
+        yml_path = tmp_path / "project.yml"
+        yml_path.write_text("project_name: demo\nlanguages:\n  - python\n")
+        data, _ = ProjectConfig._load_yaml_dict(str(yml_path))
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+        assert isinstance(config.java_refactor, JavaRefactorConfig)
+        assert config.java_refactor == JavaRefactorConfig()
 
 
 class TestProjectConfigLanguageBackend:

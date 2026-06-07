@@ -2,6 +2,11 @@
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
+[tool.hatch.build.targets.wheel.hooks.custom]
+# Rebuilds the Java sidecar jar from source at wheel-build time (when a JDK + Gradle are available), so the wheel
+# never ships bytecode that is stale relative to the committed Java source. See hatch_build.py.
+path = "hatch_build.py"
+
 [project]
 name = "serena-agent"
 version = "1.5.4.dev0"
@@ -104,6 +109,10 @@ Homepage = "https://github.com/oraios/serena"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/serena", "src/interprompt", "src/solidlsp"]
+
+# Ensure the compiled Java refactoring sidecar jar is always bundled in the wheel, even if broader excludes are added.
+[tool.hatch.build.targets.wheel.force-include]
+"src/serena/resources/java-refactor/serena-java-refactor.jar" = "serena/resources/java-refactor/serena-java-refactor.jar"
 
 [tool.doc8]
 max-line-length = 1000

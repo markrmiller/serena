@@ -173,18 +173,11 @@ class ReplaceContentTool(EditingToolWithDiagnostics):
         allow_multiple_occurrences: bool = False,
     ) -> str:
         r"""
-        Replaces one or more occurrences of a given pattern in a file with new content.
+        Replaces one or more occurrences of a pattern in a file. Preferred when symbol-level tools don't fit.
 
-        This is the preferred way to replace content in a file whenever the symbol-level
-        tools are not appropriate.
-
-        VERY IMPORTANT: The "regex" mode allows very large sections of code to be replaced without fully quoting them!
-        Use a regex of the form "beginning.*?end-of-text-to-be-replaced" to be faster and more economical!
-        ALWAYS try to use wildcards to avoid specifying the exact content to be replaced,
-        especially if it spans several lines. Note that you cannot make mistakes, because if the regex should match
-        multiple occurrences while you disabled `allow_multiple_occurrences`, an error will be returned, and you can retry
-        with a revised regex.
-        Therefore, using regex mode with suitable wildcards is usually the best choice!
+        In "regex" mode you can replace large spans without quoting them fully: use a pattern like
+        "beginning.*?end" with wildcards. If it matches multiple occurrences while `allow_multiple_occurrences`
+        is false you get an error and can retry, so regex with wildcards is usually the best choice.
 
         :param relative_path: the relative path to the file
         :param needle: the string or regex pattern to search for.

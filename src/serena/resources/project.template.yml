@@ -58,6 +58,91 @@ ignore_all_files_in_gitignore: true
 # No documentation on options means no options are available.
 ls_specific_settings: {}
 
+# optional Java-only compiler-backed refactoring sidecar.
+# Disabled by default; Java-specific tools should be included explicitly and generic routing is opt-in.
+java_refactor:
+  # whether compiler-backed Java refactoring tools are enabled for this project. When false, the status tool may
+  # still report "disabled", but semantic/mutating Java refactor operations refuse with code "java_refactor_disabled".
+  enabled: false
+  # whether generic routed tools (rename_symbol / safe_delete_symbol) preview by default instead of applying.
+  preview_default: true
+  # path to the JDK used to launch the sidecar (must be a JDK, not a JRE). Empty uses the "java" on PATH.
+  java_home:
+  # annotation processing mode for sidecar analysis. One of:
+  #   "none"      - disable annotation processing entirely (javac -proc:none).
+  #   "classpath" - discover annotation processors on the regular compile classpath (javac default).
+  #   "project"   - run only the project's declared annotation processors via a dedicated processor path
+  #                 (falls back to no processors if the project declares none).
+  annotation_processing: "none"
+  # incomplete-analysis (unresolved compiler diagnostics, e.g. broken/partial classpath) behavior:
+  # PREVIEW is always available with an explicit warning; APPLY is refused unless this is true. With the opt-in,
+  # apply tolerates only the PRE-EXISTING diagnostics — an edit that introduces NEW compiler errors is still refused.
+  allow_incomplete_analysis: false
+  # opt-in routing from the generic rename_symbol / safe_delete_symbol tools to the sidecar for .java files.
+  # NOTE the contract change vs. the generic LSP tools: with preview_default true (the default), a routed call returns
+  # a PREVIEW (structured JSON, no files written) instead of mutating immediately; a hard engine refusal is surfaced
+  # verbatim and does NOT fall through to the LSP path. The LSP path remains the fallback only when the engine is
+  # unavailable (disabled, missing jar, sidecar failure) or the file is not Java.
+  route_generic_rename: false
+  route_generic_safe_delete: false
+  # whether Java-specific refactor tools may resolve name_path through Serena's language-server symbol tree. When false,
+  # pass explicit one-based line/column to the Java tools; name_path requests refuse with a configuration error instead
+  # of silently depending on LSP symbol identity.
+  use_lsp_symbol_resolution: true
+  # maximum number of Java source files the sidecar will index before refusing.
+  max_files: 10000
+  # JVM max-heap for the sidecar process (e.g. "2G", "512m").
+  max_heap: "2G"
+  # whether a PREVIEW runs the staged (in-memory) javac validation path without writing any files, reporting the result
+  # under `previewValidation` (distinct from apply-time validation). This is real preview validation, not an alias.
+  validate_after_preview: true
+  # whether an APPLY first re-runs javac against the staged (post-edit) sources in memory and refuses without writing
+  # if that validation fails. Setting this false skips only that pre-commit step; post-apply validation with rollback
+  # always runs and cannot be configured off, so a compiler-breaking edit is still rolled back.
+  validate_before_apply: true
+
+  # build-model discovery mode. Selects how the sidecar resolves source roots, classpaths, and compiler settings:
+  #   "auto"     - detect the build tool from project files (Gradle settings/build files or pom.xml), else plain javac.
+  #   "explicit" - ignore build tools; use the source_roots/classpath/module_path configured below.
+  #   "maven"    - force real Maven extraction (help:effective-pom + dependency:build-classpath).
+  #   "gradle"   - force real Gradle extraction (via a bundled init script).
+  #   "plain"    - force conventional source-layout discovery (src/main/java, src/test/java, ...) with no classpath.
+  # (the implementation alias `build_tool_mode` is also accepted.)
+  build_tool_model: "auto"
+  # whether semantic rename also rewrites Javadoc {@link}/references to the renamed element (compiler-located DocTree
+  # edits). Default for the rename tools' include_javadocs parameter when the caller leaves it unset.
+  # (the implementation alias `include_javadocs` is also accepted.)
+  include_javadocs_default: false
+  # whether semantic rename also rewrites plain-comment and string-literal occurrences of the old name (best-effort
+  # textual matches, surfaced with a warning). Default for the rename tools' include_comments parameter when unset.
+  # (the implementation alias `include_comments` is also accepted.)
+  include_comments_default: false
+  # whether build-model discovery reuses Serena's Java language-server settings from ls_specific_settings["java"]
+  # (maven_user_settings, gradle_user_home, gradle_java_home, gradle_wrapper_enabled) so the sidecar resolves
+  # dependencies the same way the language server does. Set false to ignore those settings during extraction.
+  use_jdtls_settings: true
+
+  # Explicit project-model overrides forwarded to the sidecar's javac session. These let projects with
+  # non-conventional layouts, external dependencies, or modular builds be analyzed without a full Gradle/Maven
+  # model extraction (most relevant when build_tool_model is "explicit"). Paths may be project-root-relative or absolute.
+  # additional source roots to compile/index beyond those discovered from the build model.
+  source_roots: []
+  # compile/analysis classpath entries (jars or class directories).
+  classpath: []
+  # module path entries for modular (JPMS) projects.
+  module_path: []
+  # javac --release target (e.g. "17"). Mutually preferred over source/target when set.
+  release:
+  # javac -source level (e.g. "17"); used when release is unset.
+  source:
+  # javac -target level (e.g. "17"); used when release is unset.
+  target:
+  # source-file encoding for reading/writing edits. Defaults to the Serena project encoding when unset.
+  encoding:
+  # directory names pruned while discovering Java sources (sent to the sidecar as the initialize contract's
+  # ignoredPatterns). An explicit list fully replaces the default below; an explicit empty list ([]) prunes nothing.
+  ignored_patterns: [".git", ".gradle", ".serena", "build", "target", "out"]
+
 # list of additional workspace folder paths for cross-package reference support (e.g. in monorepos).
 # Paths can be absolute or relative to the project root.
 # Each folder is registered as an LSP workspace folder, enabling language servers to discover

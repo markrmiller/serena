@@ -3,11 +3,14 @@ Language server-related tools
 """
 
 import copy
+import json
+import logging
 import os
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from typing import Any
 
+from serena.java_refactor.manager import JavaRefactorRuntimeError, target_hints_from_lsp_symbol
 from serena.symbol import LanguageServerSymbol, LanguageServerSymbolDictGrouper
 from serena.tools import (
     SUCCESS_RESULT,
@@ -20,6 +23,8 @@ from serena.tools.tools_base import ToolMarkerOptional
 from serena.util.ls_diagnostics import GroupedDiagnostics
 from serena.util.text_utils import find_text_coordinates
 from solidlsp.ls_types import SymbolKind
+
+log = logging.getLogger(__name__)
 
 
 class RestartLanguageServerTool(Tool, ToolMarkerOptional):
@@ -147,40 +152,25 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         max_answer_chars: int = -1,
     ) -> str:
         """
-        Retrieves information on all symbols/code entities (classes, methods, etc.) based on the given name path pattern.
-        The returned symbol information can be used for edits or further queries.
-        Specify `depth > 0` to also retrieve children/descendants (e.g., methods of a class).
+        Retrieves symbols/code entities (classes, methods, etc.) matching a name path pattern.
+        Use `depth > 0` to also retrieve descendants (e.g. methods of a class).
 
-        A name path is a path in the symbol tree *within a source file*.
-        For example, the method `my_method` defined in class `MyClass` would have the name path `MyClass/my_method`.
-        If a symbol is overloaded (e.g., in Java), a 0-based index is appended (e.g. "MyClass/my_method[0]") to
-        uniquely identify it.
-
-        To search for a symbol, you provide a name path pattern that is used to match against name paths.
-        It can be
-         * a simple name (e.g. "method"), which will match any symbol with that name
-         * a relative path like "class/method", which will match any symbol with that name path suffix
-         * an absolute name path "/class/method" (absolute name path), which requires an exact match of the full name path within the source file.
-        Append an index `[i]` to match a specific overload only, e.g. "MyClass/my_method[1]".
+        A name path is a path in a file's symbol tree, e.g. method `my_method` in class `MyClass` has
+        name path `MyClass/my_method`; overloads get a 0-based index, e.g. `MyClass/my_method[0]`.
+        Pattern matching: a simple name ("method") matches any symbol with that name; a relative path
+        ("class/method") matches any name-path suffix; an absolute path ("/class/method") requires an
+        exact full-path match. Append `[i]` to match a specific overload.
 
         :param name_path_pattern: the name path matching pattern (see above)
-        :param depth: depth up to which descendants shall be retrieved (e.g. use 1 to also retrieve immediate children;
-            for the case where the symbol is a class, this will return its methods).
-            Ignored if `include_body=True`. Default 0.
-        :param relative_path: (optional) restrict search to this file or directory. If None, searches entire codebase.
-            If a directory is passed, the search will be restricted to the files in that directory.
-            If a file is passed, the search will be restricted to that file.
+        :param depth: depth of descendants to retrieve (1 = immediate children). Ignored if include_body=True.
+        :param relative_path: (optional) restrict search to this file or directory; if empty, search whole codebase.
         :param include_body: whether to include the symbol's source code. Use judiciously.
-        :param include_info: whether to include additional info (hover-like, typically including docstring and signature),
-            about the symbol (ignored if include_body is True). Info is never included for child symbols.
-            Note: Depending on the language, this can be slow (e.g., C/C++).
-        :param include_kinds: (optional) limits results to the given LSP symbol kinds (integers)
-        :param exclude_kinds: (optional) list of LSP symbol kinds (integers) to exclude.
-        :param substring_matching: If True, use substring matching for the last element of the pattern, such that
-            "Foo/get" would match "Foo/getValue" and "Foo/getData".
-        :param max_matches: maximum number of permitted matches. If exceeded, a shortened result is returned
-             which allows refining the search. -1 (default) means no limit. Set to 1 if you search for a single symbol.
-        :param max_answer_chars: max result length; -1 for default
+        :param include_info: include hover-like info (docstring/signature); ignored if include_body. Can be slow in some languages.
+        :param include_kinds: (optional) limit results to these LSP symbol kinds (integers).
+        :param exclude_kinds: (optional) LSP symbol kinds (integers) to exclude.
+        :param substring_matching: if True, substring-match the last pattern element ("Foo/get" matches "Foo/getValue").
+        :param max_matches: max matches; if exceeded a shortened result is returned. -1 (default) = no limit. Use 1 for a single symbol.
+        :param max_answer_chars: max result length; -1 for default.
         :return: symbols (with locations) matching the name.
         """
         if include_body:
@@ -665,6 +655,35 @@ class RenameSymbolTool(Tool, ToolMarkerSymbolicEdit):
         :param new_name: the new name for the symbol
         :return: result summary indicating success or failure
         """
+        java_refactor = self.project.project_config.java_refactor
+        if relative_path.endswith(".java") and java_refactor.enabled and java_refactor.route_generic_rename:
+            try:
+                symbol = self.create_language_server_symbol_retriever().find_unique(
+                    name_path, substring_matching=False, within_relative_path=relative_path
+                )
+                if symbol.line is not None and symbol.column is not None:
+                    manager = self.create_java_refactor_client()
+                    # LSP symbol positions are zero-based; the Java sidecar's LineMap API expects one-based line/column.
+                    # The symbol's identity hints make the sidecar refuse if that position resolves to a different
+                    # element than the symbol Serena selected (target_mismatch).
+                    result = manager.semantic_rename(
+                        relative_path,
+                        symbol.line + 1,
+                        symbol.column + 1,
+                        new_name,
+                        apply=not java_refactor.preview_default,
+                        target_hints=target_hints_from_lsp_symbol(symbol),
+                    )
+                    if result.get("accepted") or result.get("refusal"):
+                        # The engine analyzed the edit and produced a definitive verdict (success or a
+                        # hard safety refusal). A safety refusal must NOT silently fall through to the LSP
+                        # path, which would bypass the refusal; surface the engine's result verbatim.
+                        return json.dumps(result, ensure_ascii=False, indent=2)
+            except (JavaRefactorRuntimeError, RuntimeError, FileNotFoundError) as e:
+                # The engine is unavailable (disabled, sidecar crash/startup failure, or missing jar).
+                # Per the V1 contract the existing LSP rename remains the fallback, so fall through
+                # rather than refusing the operation.
+                log.warning("Java refactor engine unavailable for rename of %r; falling back to LSP: %s", name_path, e)
         code_editor = self.create_ls_code_editor()
         status_message = code_editor.rename_symbol(name_path, relative_path=relative_path, new_name=new_name)
         return status_message
@@ -683,6 +702,7 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
         :param name_path_pattern: name path of the symbol to delete
         :param relative_path: the relative path to the file containing the symbol to delete
         """
+        java_refactor = self.project.project_config.java_refactor
         ls_symbol_retriever = self.create_language_server_symbol_retriever()
         symbol = ls_symbol_retriever.find_unique(name_path_pattern, substring_matching=False, within_relative_path=relative_path)
         symbol_rel_path = symbol.relative_path
@@ -695,6 +715,32 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
         assert symbol_line is not None and symbol_col is not None, (
             f"Symbol {name_path_pattern} has no identifier position, this is likely a bug."
         )
+        if relative_path.endswith(".java") and java_refactor.enabled and java_refactor.route_generic_safe_delete:
+            try:
+                manager = self.create_java_refactor_client()
+                # LSP symbol positions are zero-based; the Java sidecar's LineMap API expects one-based line/column.
+                # The symbol's identity hints make the sidecar refuse if that position resolves to a different
+                # element than the symbol Serena selected (target_mismatch).
+                result = manager.safe_delete(
+                    relative_path,
+                    symbol_line + 1,
+                    symbol_col + 1,
+                    apply=not java_refactor.preview_default,
+                    target_hints=target_hints_from_lsp_symbol(symbol),
+                )
+                if result.get("accepted") or result.get("refusal"):
+                    # The engine analyzed the deletion and produced a definitive verdict (success or a
+                    # hard safety refusal). A safety refusal must NOT silently fall through to the LSP
+                    # safe-delete path, which would bypass the refusal; surface the engine's result.
+                    return json.dumps(result, ensure_ascii=False, indent=2)
+            except (JavaRefactorRuntimeError, RuntimeError, FileNotFoundError) as e:
+                # The engine is unavailable (disabled, sidecar crash/startup failure, or missing jar).
+                # Per the V1 contract the existing LSP safe-delete remains the fallback, so fall through.
+                log.warning(
+                    "Java refactor engine unavailable for safe delete of %r; falling back to LSP: %s",
+                    name_path_pattern,
+                    e,
+                )
         lang_server = ls_symbol_retriever.get_language_server(symbol_rel_path)
         references_locations = lang_server.request_references(symbol_rel_path, symbol_line, symbol_col)
         file_to_lines: dict[str, list[int]] = defaultdict(list)

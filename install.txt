@@ -1,0 +1,32 @@
+  cd /home/markmiller/serena
+
+  # Optional but good: ensure the modified tree is installable
+  uv run poe type-check
+  uv run pytest test/serena/config/test_git_worktree_projects.py -q
+
+  # Replace your existing `serena` tool with this local checkout
+  uv tool install --force -p 3.13 --editable /home/markmiller/serena
+
+  Verify your MCP-visible executable is now the local build:
+
+  which serena
+  serena --help
+  serena start-mcp-server --help | grep enable-project-activation
+
+  Then update your MCP args to enable the new single-project activation override:
+
+  "args": [
+    "start-mcp-server",
+    "--context=claude-code",
+    "--project-from-cwd",
+    "--enable-project-activation"
+  ]
+
+  Because claude-code.yml in this modified build also sets allow_project_activation: true, the flag is partly redundant for Claude Code, but I’d include it so the config intent is explicit.
+
+  If you do not want editable mode, install a snapshot wheel-style local build instead:
+
+  uv tool install --force -p 3.13 /home/markmiller/serena
+
+  Editable mode means future source edits in /home/markmiller/serena are reflected without reinstalling.
+

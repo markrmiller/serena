@@ -1431,6 +1431,44 @@ class SolidLanguageServer(ABC):
         )
         return deleted_text
 
+    def notify_open_file_changed_on_disk(self, relative_file_path: str) -> bool:
+        """Re-syncs a currently-open document with its on-disk content via a full-document ``didChange``.
+
+        When a file is edited on disk OUTSIDE the language-server editor path (e.g. the Java refactoring sidecar writes
+        directly to disk), a document the language server still has open keeps a stale in-memory copy, because no
+        ``didChange``/``didClose`` was sent. This pushes the current disk content to the language server so its document
+        symbols, references, and diagnostics stay coherent with the file on disk.
+
+        Files that are not currently open in this language server are left untouched (the next ``didOpen`` will carry the
+        fresh content). A file that no longer exists on disk (e.g. a rename source) is also skipped.
+
+        :param relative_file_path: the project-relative path of the file that changed on disk
+        :return: ``True`` if an open document was re-synced, ``False`` if the file was not open (or no longer exists)
+        """
+        if not self.server_started:
+            return False
+        uri = self._resolve_file_uri(relative_file_path)
+        file_buffer = self.open_file_buffers.get(uri)
+        if file_buffer is None or not file_buffer._is_open_in_ls:
+            return False
+        if not file_buffer.abs_path.exists():
+            return False
+        # Reading `contents` invalidates the cached copy when the file's mtime advanced, so this is the fresh disk text.
+        new_contents = FileUtils.read_file(str(file_buffer.abs_path), file_buffer.encoding)
+        file_buffer.contents = new_contents
+        file_buffer.version += 1
+        # A content change with no `range` is a full-document replacement in the LSP text-sync protocol.
+        self.server.notify.did_change_text_document(
+            {
+                LSPConstants.TEXT_DOCUMENT: {  # type: ignore
+                    LSPConstants.VERSION: file_buffer.version,
+                    LSPConstants.URI: file_buffer.uri,
+                },
+                LSPConstants.CONTENT_CHANGES: [{"text": new_contents}],
+            }
+        )
+        return True
+
     def _send_definition_request(self, definition_params: DefinitionParams) -> Definition | list[LocationLink] | None:
         return self.server.send.definition(definition_params)
 
