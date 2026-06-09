@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, Self, TypeVar, cast
 from mcp import Implementation
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.utilities.func_metadata import FuncMetadata, func_metadata
+from pydantic import Field, create_model
 from sensai.util import logging
 from sensai.util.string import dict_string
 
@@ -138,6 +139,8 @@ class Tool(Component):
     # and to validate the tool call arguments.
 
     SESSION_ID_PARAM_NAME = "session_id"
+    CALLER_CWD_PARAM_NAME = "caller_cwd"
+    """name of the optional tool-call parameter through which an agent harness can convey the caller's working directory"""
     """
     parameter name to use in apply method for the client session ID.
     This parameter will be ignored by the MCP interface but will be populated with the session ID of the current client session 
@@ -251,7 +254,42 @@ class Tool(Component):
             if apply_fn is None:
                 raise AttributeError(f"apply method not defined in {cls}. Did you forget to implement it?")
 
-        return func_metadata(apply_fn, skip_names=["self", "cls", cls.SESSION_ID_PARAM_NAME])
+        metadata = func_metadata(apply_fn, skip_names=["self", "cls", cls.SESSION_ID_PARAM_NAME])
+        return cls._add_caller_cwd_param(metadata)
+
+    @classmethod
+    def _add_caller_cwd_param(cls, metadata: FuncMetadata) -> FuncMetadata:
+        """
+        Extends tool argument metadata with the optional caller working directory parameter.
+
+        Agent harnesses (e.g. Claude Code via a PreToolUse hook) can inject this parameter into every
+        tool call; when it points into a different git worktree of the active project's repository,
+        Serena re-roots onto the caller's worktree automatically
+        (see :meth:`serena.agent.SerenaAgent.adjust_active_project_to_caller_cwd`).
+
+        :param metadata: the original argument metadata
+        :return: metadata whose argument model additionally accepts the caller working directory
+        """
+        if cls.CALLER_CWD_PARAM_NAME in metadata.arg_model.model_fields:
+            return metadata
+
+        # extend the argument model with the optional parameter, keeping the original model as base
+        field_definition = (
+            str | None,
+            Field(
+                default=None,
+                description="The absolute path of your current working directory. Always pass it when you are working "
+                "in a git worktree checkout (e.g. an ephemeral agent worktree): if it lies in a different worktree of "
+                "the active project's repository, Serena automatically re-roots onto it, ensuring all tools operate "
+                "on your checkout. May also be injected automatically by the agent harness.",
+            ),
+        )
+        arg_model = create_model(
+            metadata.arg_model.__name__,
+            __base__=metadata.arg_model,
+            **{cls.CALLER_CWD_PARAM_NAME: field_definition},  # type: ignore[call-overload]
+        )
+        return metadata.model_copy(update={"arg_model": arg_model})
 
     def _log_tool_application(self, frame: Any, session_id: str) -> None:
         params = {}
@@ -306,10 +344,40 @@ class Tool(Component):
     def is_symbolic(self) -> bool:
         return issubclass(self.__class__, ToolMarkerSymbolicRead) or issubclass(self.__class__, ToolMarkerSymbolicEdit)
 
+    def _attach_linked_worktree_notice(self, result: str) -> str:
+        """
+        Attaches a notice naming the active project root to the given tool result if the active
+        project is a linked git worktree. A single Serena process can be shared by multiple agents,
+        each operating in its own worktree, and relative paths always resolve against the active root;
+        the notice makes a mismatch between the caller's checkout and the active root immediately visible.
+
+        :param result: the tool result
+        :return: the result with the notice attached, or the unchanged result if no notice applies
+        """
+        if isinstance(self, ToolMarkerDoesNotRequireActiveProject):
+            return result
+
+        # determine whether the active project is a linked git worktree
+        try:
+            project = self.agent.get_active_project()
+            if project is None or not project.is_linked_git_worktree():
+                return result
+        except Exception:
+            return result
+
+        return (
+            f"{result}\n\n[serena] The active project root is the linked git worktree {project.project_root}; "
+            "relative paths in this result were resolved against it. If you are working in a different checkout, "
+            "call activate_project with your worktree path and retry."
+        )
+
     def apply_ex(self, log_call: bool = True, catch_exceptions: bool = True, mcp_ctx: Context | None = None, **kwargs) -> str:  # type: ignore
         """
         Applies the tool with logging and exception handling, using the given keyword arguments
         """
+        # extract the caller's working directory, which agent harnesses may inject into any tool call
+        caller_cwd = kwargs.pop(self.CALLER_CWD_PARAM_NAME, None)
+
         session_id = "global"
         if mcp_ctx is not None:
             try:
@@ -335,6 +403,7 @@ class Tool(Component):
 
             if log_call:
                 self._log_tool_application(inspect.currentframe(), session_id)
+            rerooted_root: str | None = None
             try:
                 # check whether the tool requires an active project and language server
                 if not isinstance(self, ToolMarkerDoesNotRequireActiveProject):
@@ -343,6 +412,11 @@ class Tool(Component):
                             "Error: No active project. Ask the user to provide the project path or to select a project from this list of known projects: "
                             + f"{self.agent.serena_config.project_names}"
                         )
+
+                    # re-root onto the caller's git worktree if the caller works in a sibling worktree
+                    # of the same repository as the active project
+                    if caller_cwd:
+                        rerooted_root = self.agent.adjust_active_project_to_caller_cwd(caller_cwd)
 
                 # construct apply kwargs, adding session_id if the tool is session-aware
                 apply_kwargs = dict(kwargs)
@@ -378,6 +452,14 @@ class Tool(Component):
                 msg = f"Error executing tool: {e.__class__.__name__} - {e}"
                 log.error(f"Error executing tool: {e}", exc_info=e)
                 result = msg
+
+            # surface automatic re-rooting, so the caller knows the active root changed on its behalf
+            if rerooted_root is not None:
+                result = f"[serena] Auto-activated the caller's git worktree as the active project root: {rerooted_root}\n\n{result}"
+
+            # make the active root visible when it is a linked git worktree, since multiple agents
+            # in sibling worktrees may share this Serena process and silently operate on the wrong checkout
+            result = self._attach_linked_worktree_notice(result)
 
             if log_call:
                 log.info(f"Result: {result}")

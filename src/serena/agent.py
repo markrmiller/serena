@@ -59,7 +59,7 @@ from serena.tools import (
     ToolMarker,
     ToolRegistry,
 )
-from serena.util.file_system import get_git_repository_info
+from serena.util.file_system import GitRepositoryInfo, get_git_repository_info
 from serena.util.gui import system_has_usable_display
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
@@ -547,6 +547,7 @@ class SerenaAgent:
         self._active_project: Project | None = None
         self._enable_project_activation = enable_project_activation
         self._startup_project_git_common_dir: Path | None = None
+        self._git_repository_info_cache: dict[str, GitRepositoryInfo | None] = {}
         self._project_activation_callback = project_activation_callback
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
         self._dashboard_manager: DashboardManager | None = None
@@ -972,6 +973,50 @@ class SerenaAgent:
                 f"Startup git common dir: {self._startup_project_git_common_dir}. "
                 f"Rejected target: {project_root}."
             )
+
+    def _get_git_repository_info_cached(self, path: str) -> "GitRepositoryInfo | None":
+        """
+        :param path: the path for which to obtain git repository information
+        :return: the (cached) git repository information, or None if the path is not inside a git working tree
+        """
+        cached = self._git_repository_info_cache.get(path)
+        if cached is not None and cached.worktree_root.is_dir():
+            return cached
+
+        info = get_git_repository_info(path)
+        self._git_repository_info_cache[path] = info
+        return info
+
+    def adjust_active_project_to_caller_cwd(self, caller_cwd: str) -> str | None:
+        """
+        Re-roots the active project onto the caller's git worktree if the caller's working directory
+        lies in a different worktree of the same git repository as the active project. This enables
+        agent harnesses that inject the caller's working directory into tool calls to share a single
+        Serena process across multiple worktree checkouts without explicit project activation.
+
+        :param caller_cwd: the calling agent's current working directory
+        :return: the new project root if the active project was re-rooted, None otherwise
+        """
+        # resolve the caller's git identity (cached, as this runs on every tool call)
+        caller_info = self._get_git_repository_info_cached(caller_cwd)
+        if caller_info is None:
+            return None
+
+        # determine whether the caller works in a different worktree of the same repository
+        project = self.get_active_project()
+        if project is None:
+            return None
+        active_root = Path(project.project_root).resolve()
+        if caller_info.worktree_root == active_root:
+            return None
+        active_info = self._get_git_repository_info_cached(str(active_root))
+        if active_info is None or active_info.common_dir != caller_info.common_dir:
+            return None
+
+        # activate the caller's worktree as the new project root
+        log.info("Re-rooting active project from %s onto the caller's git worktree %s", active_root, caller_info.worktree_root)
+        self.activate_project_from_path_or_name(str(caller_info.worktree_root))
+        return str(caller_info.worktree_root)
 
     def get_active_modes(self) -> list[SerenaAgentMode]:
         """

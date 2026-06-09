@@ -148,6 +148,14 @@ class Project(ToStringMixin):
     def path_to_runtime_serena_data_folder(self) -> str:
         return self._runtime_serena_data_folder
 
+    def is_linked_git_worktree(self) -> bool:
+        """
+        :return: whether the project root is a linked git worktree, i.e. an additional checkout
+            (such as an ephemeral agent worktree) whose ``.git`` entry is a file pointing to the
+            main repository rather than a directory
+        """
+        return (Path(self.project_root) / ".git").is_file()
+
     def path_to_project_yml(self) -> str:
         return self.serena_config.get_project_yml_location(self.project_root)
 
