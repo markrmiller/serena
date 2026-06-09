@@ -297,11 +297,6 @@ class EclipseJDTLS(SolidLanguageServer):
               are not supported in default VSIX mode (the resource paths inside the archive change between
               releases); use upstream-jdtls mode for arbitrary versions.
         - intellicode_version: Override the pinned IntelliCode VSIX version downloaded by Serena
-        - lazy_start: Defer starting this language server (and its Gradle/Maven project import) until the
-              first symbolic operation touches the project, instead of starting eagerly on activation
-              (default: false). Useful when many processes share a project (e.g. git worktrees) and
-              eager, simultaneous imports contend during the Gradle import. Handled by the language
-              server manager, so it applies to any language, not just Java.
 
     Example configuration for upstream JDTLS mode (no downloads, suitable for offline/corporate):
     ```yaml
@@ -339,7 +334,6 @@ class EclipseJDTLS(SolidLanguageServer):
         gradle_version: "8.14.2"
         vscode_java_version: "1.54.0-923"  # also accepts pinned legacy "1.42.0-561"
         intellicode_version: "1.2.30"
-        lazy_start: true  # defer JDTLS startup + Gradle import until first use (helps with concurrent worktree imports)
     ```
     """
 
