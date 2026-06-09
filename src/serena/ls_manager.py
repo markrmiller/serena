@@ -70,16 +70,23 @@ class LanguageServerManager:
         self,
         language_servers: dict[Language, SolidLanguageServer],
         language_server_factory: LanguageServerFactory | None = None,
+        pending_lazy_languages: set[Language] | None = None,
     ) -> None:
         """
-        :param language_servers: a mapping from language to language server; the servers are assumed to be already started.
+        :param language_servers: a mapping from language to language server. The servers are assumed to be already
+            started, except for languages listed in `pending_lazy_languages`, which have been created but not yet
+            started (lazy start) and are started on first use.
             The first server in the iteration order is used as the default server.
             All servers are assumed to serve the same project root.
         :param language_server_factory: factory for language server creation; if None, dynamic (re)creation of language servers
             is not supported
+        :param pending_lazy_languages: languages whose servers have been created but not started yet (lazy start);
+            they are started on first access via `get_language_server` / `iter_language_servers`.
         """
         self._language_servers = language_servers
         self._language_server_factory = language_server_factory
+        self._pending_lazy_languages = set(pending_lazy_languages or set())
+        self._lazy_start_lock = threading.Lock()
 
     @property
     def _default_language_server(self) -> SolidLanguageServer:
@@ -91,12 +98,17 @@ class LanguageServerManager:
     def from_languages(languages: list[Language], factory: LanguageServerFactory) -> "LanguageServerManager":
         """
         Creates a manager with language servers for the given languages using the given factory.
-        The language servers are started in parallel threads.
+        Non-lazy language servers are started in parallel threads; languages configured with
+        ``lazy_start: true`` (in ls_specific_settings) are created but not started until first use.
 
         :param languages: the languages for which to spawn language servers
         :param factory: the factory for language server creation
         :return: the instance
         """
+        ls_specific_settings = factory.ls_specific_settings or {}
+
+        def is_lazy_start(language: Language) -> bool:
+            return bool(ls_specific_settings.get(language.value, {}).get("lazy_start", False))
 
         class StartLSThread(threading.Thread):
             def __init__(self, language: Language):
@@ -116,9 +128,11 @@ class LanguageServerManager:
                     log.error(f"Error starting language server for language {self.language.value}: {e}", exc_info=e)
                     self.exception = e
 
-        # start language servers in parallel threads
+        # start non-lazy language servers eagerly in parallel threads
         threads = []
         for language in languages:
+            if is_lazy_start(language):
+                continue
             thread = StartLSThread(language)
             thread.start()
             threads.append(thread)
@@ -144,13 +158,53 @@ class LanguageServerManager:
             failure_messages = "\n".join([f"{lang.value}: {e}" for lang, e in exceptions.items()])
             raise LanguageServerManagerInitialisationError(f"Failed to start {len(exceptions)} language server(s):\n{failure_messages}")
 
-        return LanguageServerManager(language_servers, factory)
+        # Create (but do not start) language servers configured for lazy start. Deferring startup avoids paying the
+        # (potentially expensive) project import/indexing cost at activation time, and staggers concurrent imports
+        # across processes that share a project (e.g. git worktrees), which can otherwise contend during import.
+        pending_lazy_languages: set[Language] = set()
+        for language in languages:
+            if not is_lazy_start(language):
+                continue
+            log.info(f"Lazy start enabled for language {language.value}; deferring language server startup until first use")
+            language_servers[language] = factory.create_language_server(language)
+            pending_lazy_languages.add(language)
+
+        # preserve the originally specified language order (the first becomes the default server)
+        ordered_language_servers = {lang: language_servers[lang] for lang in languages if lang in language_servers}
+        return LanguageServerManager(ordered_language_servers, factory, pending_lazy_languages=pending_lazy_languages)
 
     def _ensure_functional_ls(self, ls: SolidLanguageServer) -> SolidLanguageServer:
         if not ls.is_running():
             log.warning(f"Language server for language {ls.language} is not running; restarting ...")
             ls = self.restart_language_server(ls.language)
         return ls
+
+    def _start_if_pending(self, ls: SolidLanguageServer) -> None:
+        """
+        Starts a language server that was configured for lazy start and has not been started yet.
+        Idempotent and thread-safe; a no-op for servers that are not pending lazy start.
+        """
+        if ls.language not in self._pending_lazy_languages:
+            return
+        with self._lazy_start_lock:
+            if ls.language not in self._pending_lazy_languages:
+                return
+            with LogTime(f"Lazy language server startup (language={ls.language.value})"):
+                ls.start()
+                if not ls.is_running():
+                    raise RuntimeError(f"Failed to start the language server for language {ls.language.value}")
+            self._pending_lazy_languages.discard(ls.language)
+
+    def _iter_started_language_servers(self) -> Iterator[SolidLanguageServer]:
+        """
+        Yields the managed servers that have been started, skipping lazy servers that were never started
+        (so there is nothing to stop/save for them). Unlike :meth:`iter_language_servers`, this does NOT
+        trigger lazy startup; it is intended for lifecycle operations such as stopping and cache saving.
+        """
+        for language, ls in self._language_servers.items():
+            if language in self._pending_lazy_languages:
+                continue
+            yield self._ensure_functional_ls(ls)
 
     def _get_suitable_language_server(self, relative_path: str) -> SolidLanguageServer | None:
         """:param relative_path: relative path to a file"""
@@ -168,6 +222,7 @@ class LanguageServerManager:
             ls = self._get_suitable_language_server(relative_path)
         if ls is None:
             ls = self._default_language_server
+        self._start_if_pending(ls)
         return self._ensure_functional_ls(ls)
 
     def _create_and_start_language_server(self, language: Language) -> SolidLanguageServer:
@@ -231,23 +286,24 @@ class LanguageServerManager:
 
     def iter_language_servers(self) -> Iterator[SolidLanguageServer]:
         for ls in self._language_servers.values():
+            self._start_if_pending(ls)
             yield self._ensure_functional_ls(ls)
 
     def stop_all(self, save_cache: bool = False, timeout: float = 2.0) -> None:
         """
-        Stops all managed language servers.
+        Stops all managed language servers. Lazy servers that were never started are skipped.
 
         :param save_cache: whether to save the cache before stopping
         :param timeout: timeout for shutdown of each language server
         """
-        for ls in self.iter_language_servers():
+        for ls in self._iter_started_language_servers():
             self._stop_language_server(ls, save_cache=save_cache, timeout=timeout)
 
     def save_all_caches(self) -> None:
         """
-        Saves the caches of all managed language servers.
+        Saves the caches of all managed language servers. Lazy servers that were never started are skipped.
         """
-        for ls in self.iter_language_servers():
+        for ls in self._iter_started_language_servers():
             if ls.is_running():
                 ls.save_cache()
 
