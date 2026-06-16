@@ -168,6 +168,44 @@ class TestProjectConfig:
         assert isinstance(config.java_refactor, JavaRefactorConfig)
         assert config.java_refactor == JavaRefactorConfig()
 
+    def test_from_dict_accepts_nested_java_refactor_v2_surface(self):
+        data, _ = ProjectConfig._load_yaml_dict(PROJECT_TEMPLATE_FILE)
+        data["project_name"] = "test"
+        data["languages"] = ["java"]
+        data["java_refactor"] = {
+            "enabled": True,
+            "v2": {
+                "enabled": True,
+                "sessions": {"max_open_sessions": 16, "session_ttl_minutes": 30, "require_revision_match_on_apply": True},
+                "generated_sources": {"read": True, "edit": False},
+                "lombok": {"allow": True},
+                "access": {"allow_access_widening": False},
+                "hierarchy": {"enabled": True, "allow_public_api_change": False},
+                "operation_defaults": {"visibility": "private"},
+                "extract_method": {"enabled": True, "allow_multiple_outputs": False},
+                "extract_interface": {"enabled": True, "replace_usages_default": False},
+                "encapsulate_field": {"enabled": True, "rewrite_internal_usages_default": False},
+                "inline_method": {"enabled": True, "max_call_sites": 100},
+                "diagnostics": {"report_delta": True},
+                "imports": {"preserve_static_imports": True},
+            },
+            "model": {
+                "modules": [
+                    {
+                        "project": ":app",
+                        "sourceSets": [{"name": "main", "srcDirs": ["src/main/java"]}],
+                    }
+                ]
+            },
+        }
+
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+
+        assert config.java_refactor.enabled is True
+        assert config.java_refactor.v2.sessions.max_open_sessions == 16
+        assert config.java_refactor.v2.extract_method.allow_multiple_outputs is False
+        assert config.java_refactor.model["modules"][0]["project"] == ":app"
+
 
 class TestProjectConfigLanguageBackend:
     """Tests for the per-project language_backend field."""

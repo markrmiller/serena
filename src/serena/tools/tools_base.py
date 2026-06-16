@@ -658,6 +658,18 @@ class ToolRegistry:
             is_beta = issubclass(cls, ToolMarkerBeta)
             name = cls.get_name_from_cls()
             if name in self._tool_dict:
+                existing_cls = self._tool_dict[name].tool_class
+                if (
+                    existing_cls.__module__ == "serena.tools.java_refactor_tools"
+                    and cls.__module__ == "serena.tools.java_refactor_v2_tools"
+                ):
+                    self._tool_dict[name] = RegisteredTool(tool_class=cls, is_optional=is_optional, tool_name=name, is_beta=is_beta)
+                    continue
+                if (
+                    existing_cls.__module__ == "serena.tools.java_refactor_v2_tools"
+                    and cls.__module__ == "serena.tools.java_refactor_tools"
+                ):
+                    continue
                 raise ValueError(f"Duplicate tool name found: {name}. Tool classes must have unique names.")
             self._tool_dict[name] = RegisteredTool(tool_class=cls, is_optional=is_optional, tool_name=name, is_beta=is_beta)
 

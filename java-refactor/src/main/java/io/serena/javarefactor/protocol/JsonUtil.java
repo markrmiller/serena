@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.util.Collection;
 import java.util.Map;
@@ -47,6 +47,11 @@ public final class JsonUtil {
 
     public static String array(Collection<String> values) {
         return values.stream().map(JsonUtil::quote).collect(Collectors.joining(",", "[", "]"));
+    }
+
+    /** Builds a JSON array from already-serialized JSON values (objects, numbers, arrays) without re-quoting them. */
+    public static String rawArray(Collection<String> serializedValues) {
+        return serializedValues.stream().collect(Collectors.joining(",", "[", "]"));
     }
 
     public static String object(Map<String, String> fields) {

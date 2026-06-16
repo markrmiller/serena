@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -49,6 +49,24 @@ public record JavaProjectModel(
     /** Whether javac validation reported unresolved diagnostics (the V1 "incomplete analysis" condition). */
     public boolean analysisIncomplete() {
         return !compilerDiagnostics.isEmpty();
+    }
+
+    /**
+     * G003 build-model completeness: true when any source set used by the operation could not have its dependency
+     * classpath proven during build-model extraction (see {@link SourceSet#classpathProven()} and
+     * {@link BuildModel.ModelSourceSet#classpathProven()}). This is a first-class model-incompleteness signal,
+     * INDEPENDENT of javac diagnostics: an incomplete classpath can leave javac "clean" on the edited file while
+     * corrupting semantic planning (overload resolution, type hierarchy) elsewhere, so the apply gate refuses on it
+     * exactly as it does on {@link #analysisIncomplete()}, unless {@link #allowIncompleteAnalysis()} is set. Derived
+     * from the source sets (like {@link #modular()}), so a re-discovered model preserves it without separate storage.
+     */
+    public boolean classpathUnproven() {
+        return sourceSets.stream().anyMatch(sourceSet -> !sourceSet.classpathProven());
+    }
+
+    /** The names of the source sets whose dependency classpath could not be proven (for model-safety messaging). */
+    public List<String> unprovenClasspathSourceSets() {
+        return sourceSets.stream().filter(sourceSet -> !sourceSet.classpathProven()).map(SourceSet::name).toList();
     }
 
     /**
@@ -217,6 +235,10 @@ public record JavaProjectModel(
     }
 
     public String toJson() {
+        return JsonUtil.object(toJsonFields());
+    }
+
+    private Map<String, String> toJsonFields() {
         Map<String, String> fields = new LinkedHashMap<>();
         fields.put("projectRoot", JsonUtil.quote(projectRoot.toString()));
         fields.put("discoveryKind", JsonUtil.quote(discoveryKind));
@@ -243,8 +265,50 @@ public record JavaProjectModel(
         fields.put("warnings", JsonUtil.array(warnings));
         fields.put("compilerDiagnostics", JsonUtil.array(compilerDiagnostics));
         fields.put("analysisIncomplete", Boolean.toString(analysisIncomplete()));
+        fields.put("classpathUnproven", Boolean.toString(classpathUnproven()));
+        fields.put("unprovenClasspathSourceSets", JsonUtil.array(unprovenClasspathSourceSets()));
         fields.put("invalidationFiles", JsonUtil.array(toRelativeStrings(invalidationFiles)));
-        return JsonUtil.object(fields);
+        return fields;
+    }
+
+    /**
+     * G003: a mechanically-derived revision digest over the project model for the incremental-apply guard. It hashes
+     * the COMPLETE {@link #toJson()} field set minus exactly two categories that legitimately drift mid-session: the
+     * {@code .java} file INVENTORY (which an in-flight partial apply mutates by creating/editing files) and the volatile
+     * analysis OUTPUTS (errors/warnings/diagnostics/unproven flags, re-derived by the apply-time recompile). Because it
+     * starts from the full field map and removes a fixed denylist, every NEW correctness field added to the model is
+     * captured by default — closing the silent-escape gap of the old hand-curated invalidation-input allowlist, which
+     * never compared inventory-independent fields like {@code discoveryKind}, {@code modulePath}, or {@code outputDirs}.
+     */
+    public String revisionDigest() {
+        Map<String, String> fields = new LinkedHashMap<>(toJsonFields());
+        // The .java inventory: any legitimate in-flight session apply creates/edits files, so excluding it wholesale
+        // (rather than only the session's own paths) is what lets multi-step incremental applies proceed.
+        fields.remove("javaFileCount");
+        fields.remove("allJavaFiles");
+        // Volatile analysis OUTPUTS: pure functions of the (retained) source/classpath/option inputs, re-derived by the
+        // apply-time recompile, so comparing them would falsely reject benign continuations without adding safety.
+        fields.remove("errors");
+        fields.remove("warnings");
+        fields.remove("compilerDiagnostics");
+        fields.remove("analysisIncomplete");
+        fields.remove("classpathUnproven");
+        fields.remove("unprovenClasspathSourceSets");
+        // Each source set embeds its own javaFiles inventory and classpathUnproven output; rebuild them without those.
+        fields.put("sourceSets", sourceSets.stream()
+                .map(sourceSet -> sourceSet.revisionDigestJson(projectRoot))
+                .collect(Collectors.joining(",", "[", "]")));
+        return sha256(JsonUtil.object(fields));
+    }
+
+    private static String sha256(String value) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(
+                    digest.digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            return "unavailable";
+        }
     }
 
     private static List<String> toAbsoluteStrings(List<Path> paths) {

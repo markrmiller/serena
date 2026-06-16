@@ -5,8 +5,8 @@ import io.serena.javarefactor.compiler.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.Tree;
@@ -78,7 +78,7 @@ public record SemanticKey(String kind, String owner, String name, String signatu
         return new SemanticKey(kind, owner, name, signature, canonical, declFile, declOffset);
     }
 
-    String toJson() {
+    public String toJson() {
         StringBuilder builder = new StringBuilder();
         builder.append("{")
                 .append("\"kind\":").append(JsonUtil.quote(kind)).append(",")

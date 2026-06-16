@@ -11,6 +11,14 @@ allprojects { p ->
     p.tasks.register("dumpSerenaModel") {
         doLast {
             def modules = []
+            // Build discriminator: the root (top-level) build has no parent and contributes project ids verbatim
+            // (':', ':a', ...). A project belonging to an INCLUDED build (Gradle composite, `includeBuild(...)`) is
+            // qualified with its build's name so its ':' root project does not collide with the root build's ':' root
+            // when grouped by project id on the Java side, and so two separate builds' `main` source sets stay distinct.
+            def includedBuildName = (p.gradle.parent == null) ? "" : p.rootProject.name
+            def projectKey = includedBuildName.isEmpty()
+                    ? p.path
+                    : (":" + includedBuildName + (p.path == ":" ? "" : p.path))
             p.plugins.withId("java") {
                 p.extensions.getByName("sourceSets").each { ss ->
                     def compileTask = p.tasks.findByName(ss.compileJavaTaskName)
@@ -22,6 +30,10 @@ allprojects { p ->
                     }
                     // Authoritative: the compile task's annotation-processor generated-sources output directory (a real
                     // generated output that may live OUTSIDE a /generated/ path and may not be registered as a srcDir).
+                    // Only report it when it actually exists on disk: in a project that has never been built this default
+                    // output dir does not exist yet and has no sources, so reporting it would add a phantom generated root
+                    // that is absent from sourceRoots (which list only existing dirs), violating the generatedRoot ⊆
+                    // sourceRoots invariant the Java side asserts.
                     try {
                         def genOut = compileTask?.options?.generatedSourceOutputDirectory?.getOrNull()?.asFile
                         if (genOut != null && genOut.exists()) {
@@ -31,15 +43,26 @@ allprojects { p ->
                         // Older Gradle without generatedSourceOutputDirectory: the /generated/ heuristic still applies.
                     }
                     def generatedRoots = generatedRootSet as List
-                    // A generated root is reported ONLY in generatedRoots, never also in srcDirs, so the Java side (which
-                    // appends both lists) does not add the same root twice and make javac see it doubly.
-                    def srcDirs = existingSrcDirs*.absolutePath.findAll { !generatedRoots.contains(it) }
+                    // sourceRoots (reported as srcDirs to the Java side) must be the union of the configured source dirs
+                    // and ALL generated roots, deduplicated. This satisfies the invariant that every generatedRoot ⊆
+                    // sourceRoots (exactly once). Some generated roots (e.g. the default annotationProcessor output dir)
+                    // are not registered as srcDirs in the source set but must still appear in sourceRoots so callers can
+                    // locate files under them. The Java side uses .distinct() when building analysisRoots, so adding a
+                    // generated root to both srcDirs and generatedRoots never causes javac to see the same root twice.
+                    def srcDirsSet = new LinkedHashSet<String>(existingSrcDirs*.absolutePath)
+                    srcDirsSet.addAll(generatedRoots)
+                    def srcDirs = srcDirsSet as List
                     def classpath = []
+                    // G004: a compile classpath that cannot be resolved (e.g. an unresolvable dependency offline) must NOT
+                    // be silently surfaced as an empty-but-proven classpath — that would let a mutating edit proceed against
+                    // a model that is missing real dependencies, leaving javac "clean" on the edited file while corrupting
+                    // overload resolution / type hierarchy elsewhere. Mark this source set classpath-UNPROVEN so the Java
+                    // side refuses apply (the same gate Maven uses for an unresolved scope), while preview still works.
+                    def classpathProven = true
                     try {
                         classpath = ss.compileClasspath.files*.absolutePath
                     } catch (Exception ignored) {
-                        // An unresolvable compile classpath (e.g. offline with a missing dependency) is surfaced as an
-                        // empty classpath; downstream javac validation reports the resulting errors.
+                        classpathProven = false
                     }
                     def annotationProcessorPath = []
                     try {
@@ -55,6 +78,24 @@ allprojects { p ->
                         outputDirs = ss.output.classesDirs.files*.absolutePath
                     } catch (Exception ignored) {
                         // An unresolvable output is surfaced as no output dirs; this is informational only.
+                    }
+                    // Kotlin/JVM mixed projects put javac-visible symbols in the Kotlin compile output. Gradle usually
+                    // wires that directory into the source set output, but capture the task destination explicitly so the
+                    // Java side still sees it when plugin/version differences omit it from ss.output.classesDirs.
+                    try {
+                        def kotlinTaskName = ss.name == 'main' ? 'compileKotlin' : 'compile' + ss.name.capitalize() + 'Kotlin'
+                        def kotlinTask = p.tasks.findByName(kotlinTaskName)
+                        def kotlinOut = kotlinTask?.destinationDirectory?.getOrNull()?.asFile
+                        if (kotlinOut != null) {
+                            outputDirs = (outputDirs + [kotlinOut.absolutePath]).unique()
+                            // Java sources in a mixed module resolve Kotlin-compiled symbols from this directory, so it must
+                            // be on the javac compile classpath — not only outputDirs (which is informational). Adding it
+                            // here makes Java->Kotlin resolution work even when plugin/version differences omit the Kotlin
+                            // output from ss.compileClasspath.
+                            classpath = (classpath + [kotlinOut.absolutePath]).unique()
+                        }
+                    } catch (Exception ignored) {
+                        // Projects without Kotlin or older Kotlin Gradle plugin APIs simply have no extra output dir.
                     }
                     // For a modular source set (one whose sources include a module-info.java), javac must receive the
                     // compile dependencies on the --module-path rather than the classpath. Gradle resolves the same
@@ -109,7 +150,7 @@ allprojects { p ->
                         // whatever the resolved classpath provides (e.g. a prebuilt jar), exactly as before.
                     }
                     modules << [
-                            project                : p.path,
+                            project                : projectKey,
                             sourceSet              : ss.name,
                             srcDirs                : srcDirs,
                             generatedRoots         : generatedRoots,
@@ -119,6 +160,7 @@ allprojects { p ->
                             annotationProcessorPath: annotationProcessorPath,
                             dependsOnProjects      : dependsOnProjects as List,
                             compilerArgs           : compilerArgs,
+                            classpathUnproven      : !classpathProven,
                             release       : compileTask?.options?.release?.orNull?.toString(),
                             source        : compileTask?.sourceCompatibility,
                             target        : compileTask?.targetCompatibility,
@@ -131,12 +173,35 @@ allprojects { p ->
             // it is replaced with '_'. The Java side merges every file in this directory.
             def base = new File(System.getProperty("serena.model.outDir"))
             base.mkdirs()
-            def safeName = p.path.replace(':', '_')
+            // The file name is derived from the project's absolute directory, which is globally unique across the root
+            // build AND every included build, so no project ever clobbers another's file (the simple ':'->'_' scheme
+            // collided between the root build's root project and an included build's root project, both ':'). The Java
+            // side globs and merges every file in this directory.
+            def safeName = p.projectDir.absolutePath.replaceAll('[^A-Za-z0-9]', '_')
             if (safeName.isEmpty()) {
                 safeName = '_'
             }
             def out = new File(base, safeName + ".json")
             out.text = JsonOutput.toJson([modules: modules])
+        }
+    }
+}
+
+// Composite builds: an init script is applied to every build in the composite, so `dumpSerenaModel` is registered on the
+// included builds' projects too, but running `dumpSerenaModel` by name only executes it in the ROOT build. From the
+// top-level build (the one with no parent), make the root project's task depend on each included build's root
+// `dumpSerenaModel` so the included builds' source sets are extracted and merged alongside the root build's.
+if (gradle.parent == null) {
+    gradle.rootProject { rp ->
+        rp.tasks.named("dumpSerenaModel").configure { aggregate ->
+            gradle.includedBuilds.each { ib ->
+                try {
+                    aggregate.dependsOn(ib.task(":dumpSerenaModel"))
+                } catch (Exception ignored) {
+                    // An included build without the task (e.g. a non-Gradle or incompatible build) is simply skipped;
+                    // its sources fall back to whatever the resolved classpath provides, exactly as before.
+                }
+            }
         }
     }
 }

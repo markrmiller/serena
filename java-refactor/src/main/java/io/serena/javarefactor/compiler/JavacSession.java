@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import com.sun.source.util.JavacTask;
 
@@ -49,7 +49,7 @@ public final class JavacSession {
      * the same compiler-diagnostic-augmented model {@link #validate(JavaProjectModel)} produces.
      */
     JavaProjectModel validate(JavaProjectModel model, FileOverlay overlay) {
-        return model.withCompilerDiagnostics(collectDiagnostics(model, overlay));
+        return model.withCompilerDiagnostics(collectDiagnosticReport(model, overlay).errorStrings());
     }
 
     /**
@@ -59,18 +59,28 @@ public final class JavacSession {
      * only a presentation concern for the permissive status/preview surface.
      */
     public List<String> collectDiagnostics(JavaProjectModel model, FileOverlay overlay) {
-        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
-        if (compiler == null) {
-            return List.of("JDK JavaCompiler is unavailable; run Serena with a JDK rather than a JRE.");
-        }
-        List<String> diagnostics = new ArrayList<>();
-        for (SourceSet sourceSet : model.sourceSets()) {
-            diagnostics.addAll(validateSourceSet(compiler, sourceSet, model.sourceSets(), overlay));
-        }
-        return diagnostics;
+        return collectDiagnosticReport(model, overlay).errorStrings();
     }
 
-    private List<String> validateSourceSet(JavaCompiler compiler, SourceSet sourceSet, List<SourceSet> allSourceSets, FileOverlay overlay) {
+    /** Returns separate javac error and warning diagnostics for the optionally overlaid model. */
+    public DiagnosticReport collectDiagnosticReport(JavaProjectModel model, FileOverlay overlay) {
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        if (compiler == null) {
+            return new DiagnosticReport(
+                    List.of(DiagnosticInfo.ofMessage("error", "JDK JavaCompiler is unavailable; run Serena with a JDK rather than a JRE.")),
+                    List.of());
+        }
+        List<DiagnosticInfo> errors = new ArrayList<>();
+        List<DiagnosticInfo> warnings = new ArrayList<>();
+        for (SourceSet sourceSet : model.sourceSets()) {
+            DiagnosticReport report = validateSourceSet(compiler, sourceSet, model.sourceSets(), overlay);
+            errors.addAll(report.errors());
+            warnings.addAll(report.warnings());
+        }
+        return new DiagnosticReport(errors, warnings);
+    }
+
+    private DiagnosticReport validateSourceSet(JavaCompiler compiler, SourceSet sourceSet, List<SourceSet> allSourceSets, FileOverlay overlay) {
         // Resolve the source files this set actually compiles after the overlay is applied: on-disk files that the
         // overlay deletes/renames-away are dropped, files the overlay renames into this set's roots are added, and
         // overlay content (changed or renamed-in) is substituted via in-memory JavaFileObjects. When the overlay is
@@ -85,28 +95,35 @@ public final class JavacSession {
         // class warnings nor reports diagnostics for those sourcepath-loaded files (each file's diagnostics are reported
         // only in its own source set's pass, with its own options — no double-reporting, no wrong-options attribution).
         List<String> options = crossSourceSetOptions(sourceSet, allSourceSets);
-        // Reuse the pooled standard file manager for this (charset, options) configuration so the classpath/jar scan is
-        // not repeated every pass. The manager is owned by the pool, so it is NOT closed here; the OverlayFileManager
-        // wrapper's close() is likewise a no-op for the same reason, so we let it go out of scope without try-with-
-        // resources. The pool drops these managers on model change / shutdown.
-        StandardJavaFileManager standardManager = fileManagerPool.acquire(compiler, charset, options);
         try {
+            // Reuse the pooled standard file manager for this (charset, options) configuration so the classpath/jar scan
+            // is not repeated every pass. The manager is owned by the pool, so it is NOT closed here; the
+            // OverlayFileManager wrapper's close() is likewise a no-op for the same reason, so we let it go out of scope
+            // without try-with-resources. The pool drops these managers on model change / shutdown.
+            //
+            // acquire() applies the source set's options (including --release N) to the file manager, so an unsupported
+            // language level (e.g. --release newer than this sidecar's JDK) throws HERE. Keeping it inside the try turns
+            // that into a structured per-source-set diagnostic (analysis-incomplete -> apply refused) instead of an
+            // opaque exception that would surface as a malformed-request error mid-operation.
+            StandardJavaFileManager standardManager = fileManagerPool.acquire(compiler, charset, options);
             OverlayFileManager fileManager = new OverlayFileManager(standardManager, overlay);
             List<JavaFileObject> files = overlay.fileObjectsFor(standardManager, sourceSet, allSourceSets);
             if (files.isEmpty()) {
-                return List.of();
+                return new DiagnosticReport(List.of(), List.of());
             }
             JavacTask task = (JavacTask) compiler.getTask(null, fileManager, collector, options, null, files);
             task.parse();
             task.analyze();
         } catch (IOException | RuntimeException e) {
-            List<String> errors = new ArrayList<>();
-            errors.add("javac session failed for source set " + sourceSet.name() + ": " + e.getMessage());
-            errors.addAll(formatDiagnostics(collector.getDiagnostics()));
-            return errors;
+            List<DiagnosticInfo> errors = new ArrayList<>();
+            errors.add(DiagnosticInfo.ofMessage("error", "javac session failed for source set " + sourceSet.name() + ": " + e.getMessage()));
+            errors.addAll(formatDiagnostics(collector.getDiagnostics(), Diagnostic.Kind.ERROR, sourceSet.name()));
+            return new DiagnosticReport(errors, formatWarnings(collector.getDiagnostics(), sourceSet.name()));
         }
 
-        return formatDiagnostics(collector.getDiagnostics());
+        return new DiagnosticReport(
+                formatDiagnostics(collector.getDiagnostics(), Diagnostic.Kind.ERROR, sourceSet.name()),
+                formatWarnings(collector.getDiagnostics(), sourceSet.name()));
     }
 
     /**
@@ -120,7 +137,7 @@ public final class JavacSession {
         // Only the source sets this one depends on (e.g. test -> main) are added to -sourcepath. main, with an empty
         // dependsOn, is validated WITHOUT visibility into test, so main can never resolve test-only symbols and an
         // illegal main -> test reference is reported as an error rather than silently resolving against source.
-        List<String> otherRoots = SourceSet.crossSourceRoots(sourceSet, allSourceSets);
+        List<Path> otherRoots = SourceSet.crossSourceRoots(sourceSet, allSourceSets);
         // Modular source sets resolve cross-module references via their own --module-source-path; adding a flat
         // -sourcepath would conflict, so leave their options untouched.
         if (otherRoots.isEmpty() || sourceSet.modular()) {
@@ -128,20 +145,56 @@ public final class JavacSession {
         }
         List<String> options = new ArrayList<>(sourceSet.javacOptions());
         options.add("-sourcepath");
-        options.add(String.join(File.pathSeparator, otherRoots));
+        options.add(otherRoots.stream().map(Path::toString).collect(java.util.stream.Collectors.joining(File.pathSeparator)));
         options.add("-implicit:none");
         return options;
     }
 
-    private List<String> formatDiagnostics(List<Diagnostic<? extends JavaFileObject>> diagnostics) {
-        List<String> result = new ArrayList<>();
+    private List<DiagnosticInfo> formatWarnings(List<Diagnostic<? extends JavaFileObject>> diagnostics, String sourceSetName) {
+        List<DiagnosticInfo> warnings = new ArrayList<>();
+        warnings.addAll(formatDiagnostics(diagnostics, Diagnostic.Kind.WARNING, sourceSetName));
+        warnings.addAll(formatDiagnostics(diagnostics, Diagnostic.Kind.MANDATORY_WARNING, sourceSetName));
+        return warnings;
+    }
+
+    private List<DiagnosticInfo> formatDiagnostics(
+            List<Diagnostic<? extends JavaFileObject>> diagnostics, Diagnostic.Kind kind, String sourceSetName) {
+        String severity = kind == Diagnostic.Kind.ERROR ? "error" : "warning";
+        List<DiagnosticInfo> result = new ArrayList<>();
         for (Diagnostic<? extends JavaFileObject> diagnostic : diagnostics) {
-            if (diagnostic.getKind() != Diagnostic.Kind.ERROR) {
+            if (diagnostic.getKind() != kind) {
                 continue;
             }
             String source = diagnostic.getSource() == null ? "<unknown>" : Path.of(diagnostic.getSource().toUri()).toString();
-            result.add(source + ":" + diagnostic.getLineNumber() + ":" + diagnostic.getColumnNumber() + ": " + diagnostic.getMessage(null));
+            String message = diagnostic.getMessage(null);
+            String display = source + ":" + diagnostic.getLineNumber() + ":" + diagnostic.getColumnNumber() + ": " + message;
+            result.add(new DiagnosticInfo(
+                    severity,
+                    source,
+                    diagnostic.getLineNumber(),
+                    diagnostic.getColumnNumber(),
+                    diagnostic.getStartPosition(),
+                    diagnostic.getEndPosition(),
+                    diagnostic.getCode(),
+                    message,
+                    sourceSetName,
+                    display));
         }
         return result;
+    }
+
+    /**
+     * Separate javac error and warning diagnostics. The canonical carrier is structured {@link DiagnosticInfo};
+     * {@link #errorStrings()}/{@link #warningStrings()} expose the derived display strings for the legacy
+     * string-oriented model/status surface.
+     */
+    public record DiagnosticReport(List<DiagnosticInfo> errors, List<DiagnosticInfo> warnings) {
+        public List<String> errorStrings() {
+            return DiagnosticInfo.displays(errors);
+        }
+
+        public List<String> warningStrings() {
+            return DiagnosticInfo.displays(warnings);
+        }
     }
 }

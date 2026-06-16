@@ -5,8 +5,8 @@ import io.serena.javarefactor.compiler.*;
 import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;

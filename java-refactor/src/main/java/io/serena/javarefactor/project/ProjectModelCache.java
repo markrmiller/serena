@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.io.IOException;
 import java.nio.file.Files;

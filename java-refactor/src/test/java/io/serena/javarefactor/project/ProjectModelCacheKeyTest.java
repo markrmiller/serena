@@ -9,7 +9,9 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Reviewer blocker #1: {@link ProjectModelCache#keyFor} must fold the module path, annotation-processor path and
@@ -148,6 +150,35 @@ class ProjectModelCacheKeyTest {
         String after = ProjectModelCache.keyFor(model, "cfg");
 
         assertNotEquals(before, after, "A directory module-path entry must be recursively fingerprinted");
+    }
+
+    /**
+     * G003: the classpath-unproven signal is derived from the source sets, so the validation transforms that re-wrap a
+     * model ({@code withCompilerDiagnostics} / {@code withValidatedDiagnostics} — the path a cache rehydrate takes) must
+     * preserve it. A model whose source set is unproven stays unproven through both transforms.
+     */
+    @Test
+    void classpathUnprovenSurvivesValidationTransforms(@TempDir Path tmp) {
+        SourceSet unproven = new SourceSet(
+                "main", List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                "17", null, null, "UTF-8", false, "none", List.of(), false, List.of(), List.of(), List.of(),
+                false /* classpathProven -> UNPROVEN */);
+        JavaProjectModel model = new JavaProjectModel(
+                tmp, "maven", List.of(unproven), List.of(), List.of(), List.of(), false, false, List.of());
+        assertTrue(model.classpathUnproven(), "precondition: model is unproven");
+
+        JavaProjectModel withDiagnostics = model.withCompilerDiagnostics(List.of("X.java:1: error: cannot find symbol"));
+        assertTrue(withDiagnostics.classpathUnproven(), "withCompilerDiagnostics must preserve classpathUnproven");
+
+        JavaProjectModel rehydrated = model.withValidatedDiagnostics(List.of(), List.of("warn"), List.of());
+        assertTrue(rehydrated.classpathUnproven(), "withValidatedDiagnostics (cache rehydrate) must preserve classpathUnproven");
+
+        SourceSet proven = new SourceSet(
+                "main", List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                "17", null, null, "UTF-8", false, "none", List.of(), false, List.of(), List.of(), List.of());
+        JavaProjectModel provenModel = new JavaProjectModel(
+                tmp, "maven", List.of(proven), List.of(), List.of(), List.of(), false, false, List.of());
+        assertFalse(provenModel.classpathUnproven(), "the backward-compatible source-set constructor defaults to proven");
     }
 
     @Test

@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -35,7 +35,7 @@ public final class Json {
      * legacy {@code configuration} string and the top-level {@code encoding}/{@code ignoredPatterns} into a single
      * configuration string the discovery layer parses uniformly.
      */
-    static String write(Object value) {
+    public static String write(Object value) {
         StringBuilder builder = new StringBuilder();
         writeValue(builder, value);
         return builder.toString();

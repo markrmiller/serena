@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 from serena.java_refactor.manager import JavaRefactorManager, target_hints_from_lsp_symbol
 from serena.tools import (
@@ -107,6 +108,62 @@ class _JavaRefactorToolBase(EditingToolWithDiagnostics, ToolMarkerSymbolicEdit, 
                     f"Failed to re-sync {relative_path} with the language server after apply: {error}"
                 )
 
+    def _json_argument(self, value: str | None, parameter_name: str, default: Any) -> Any:
+        """Decoded JSON value for structured V2 argument lists/options."""
+        if value is None or value == "":
+            return default
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{parameter_name} must be valid JSON: {error}") from error
+
+    def _session_refactor(
+        self,
+        operation: str,
+        relative_path: str,
+        name_path: str | None,
+        line: int | None,
+        column: int | None,
+        preview: bool | None,
+        validate: bool,
+        params: dict[str, Any],
+    ) -> str:
+        """Runs a V2 operation through the revision-guarded sidecar session protocol, honoring ``preview`` (G001).
+
+        ``preview=True`` (or omitted, resolved against the project's ``preview_default``) creates a revision-guarded
+        preview session and returns its planned edit without mutating the workspace; the caller can later apply it with
+        ``java_apply_refactor_session`` using the returned ``sessionId``. An explicit ``preview=False`` performs a
+        one-shot apply transactionally inside the manager: it creates the session, asks the sidecar to revalidate it,
+        then stages, commits, and post-validates the edit with rollback on failure — the same safety pipeline the
+        explicit session-apply tool runs. The high-level operation tools therefore never mutate outside that gated
+        transactional path.
+        """
+        if not relative_path:
+            raise ValueError("relative_path is required.")
+
+        # resolve optional semantic target
+        protocol_params: dict[str, Any] = {"relativePath": relative_path}
+        if name_path is not None or (line is not None and column is not None):
+            resolved_line, resolved_column, target_hints = self._resolve_target(relative_path, name_path, line, column)
+            protocol_params["line"] = resolved_line
+            protocol_params["column"] = resolved_column
+            protocol_params.update(target_hints)
+        elif line is not None or column is not None:
+            raise ValueError("Provide both line and column, or neither.")
+
+        # forward operation-specific model
+        protocol_params.update(params)
+        # honor the resolved preview mode: preview=False drives the manager's transactional
+        # create -> revalidate -> stage -> commit -> post-validate apply path; preview/None returns a preview session.
+        apply = self._resolve_preview(preview) is False
+        result = self._get_manager().v2_refactor_session(
+            operation,
+            protocol_params,
+            apply=apply,
+            validate=validate,
+        )
+        return self._finalize_result(result)
+
 
 class JavaRefactorStatusTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional, ToolMarkerBeta):
     """Reports readiness and diagnostics for Serena's optional Java-only refactoring sidecar."""
@@ -182,6 +239,8 @@ class JavaSafeDeleteTool(_JavaRefactorToolBase):
         relative_path: str = "",
         preview: bool | None = None,
         allow_public_api_delete: bool = False,
+        search_in_comments_and_strings: bool = False,
+        search_for_text_occurrences: bool = False,
         validate: bool = True,
         line: int | None = None,
         column: int | None = None,
@@ -195,6 +254,10 @@ class JavaSafeDeleteTool(_JavaRefactorToolBase):
             omitted, the project's ``java_refactor.preview_default`` decides (preview mode if that config is absent),
             matching the generic ``rename_symbol``/``safe_delete_symbol`` routing.
         :param allow_public_api_delete: Whether public/protected API deletion is allowed.
+        :param search_in_comments_and_strings: Whether to block deletion when the symbol's simple name appears in Java
+            comments or string/character literals, matching IntelliJ's "Search in comments and strings" option.
+        :param search_for_text_occurrences: Whether to block deletion when the symbol's simple name appears in non-Java
+            project text files, matching IntelliJ's "Search for text occurrences" option.
         :param validate: Preview-time reporting only. When true (default) a preview also runs and reports staged
             in-memory javac validation. This flag cannot weaken the apply safety gate: post-apply validation with
             rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project disables
@@ -211,6 +274,8 @@ class JavaSafeDeleteTool(_JavaRefactorToolBase):
             apply=not self._resolve_preview(preview),
             validate=validate,
             target_hints=target_hints,
+            search_in_comments_and_strings=search_in_comments_and_strings,
+            search_for_text_occurrences=search_for_text_occurrences,
         )
         return self._finalize_result(result)
 
@@ -353,6 +418,95 @@ class JavaInlineConstantTool(_JavaRefactorToolBase):
         return self._finalize_result(result)
 
 
+class JavaCreateRefactorSessionTool(_JavaRefactorToolBase):
+    """Creates an explicit V2 refactor preview session for later get/apply/cancel calls."""
+
+    def apply(self, operation: str = "", params_json: str = "{}", validate: bool | None = None) -> str:
+        """
+        Create a V2 Java refactor session without applying edits.
+
+        :param operation: V2 operation name, such as ``changeSignature`` or ``extractMethod``.
+        :param params_json: JSON object containing the operation-specific protocol parameters.
+        :param validate: Optional preview validation override.
+        """
+        params = self._json_argument(params_json, "params_json", {})
+        if not isinstance(params, dict):
+            raise ValueError("params_json must decode to a JSON object.")
+        return self._finalize_result(self._get_manager().create_v2_refactor_session(operation, params, validate=validate))
+
+
+class JavaGetRefactorSessionEditTool(_JavaRefactorToolBase):
+    """Retrieves an explicit V2 refactor session edit by session ID."""
+
+    def apply(
+        self, session_id: str = "", validate: bool | None = None, format: str | None = None, selection_json: str | None = None
+    ) -> str:
+        """
+        Retrieve the current edit for a V2 Java refactor session.
+
+        :param session_id: Session ID returned by ``java_create_refactor_session``.
+        :param validate: Optional preview validation override.
+        :param format: Optional edit serialization format. Defaults to the first-class ``serenaWorkspaceEdit`` format
+            (the Serena transactional-applier shape with per-file ``oldSha256`` preconditions and file operations). An
+            unknown format is refused by the sidecar with ``unsupported_edit_format``.
+        :param selection_json: Optional JSON object narrowing the session to a subset of its edits (incremental apply),
+            with any of ``files`` (project-relative paths), ``edits``/``fileOperations`` (stable unit ids from a prior
+            ``selectionModel``), or ``phases`` (edit ``kind`` groups). The returned envelope then carries only the
+            selected subset plus a ``remaining`` report of the still-unapplied units.
+        """
+        selection = self._json_argument(selection_json, "selection_json", None)
+        return self._finalize_result(
+            self._get_manager().get_v2_refactor_session_edit(
+                session_id, validate=validate, edit_format=format, selection=selection
+            )
+        )
+
+
+class JavaApplyRefactorSessionTool(_JavaRefactorToolBase):
+    """Applies an explicit V2 refactor session by session ID."""
+
+    def apply(
+        self,
+        session_id: str = "",
+        validate: bool | None = None,
+        expected_project_revision: str | None = None,
+        expectedProjectRevision: str | None = None,
+        selection_json: str | None = None,
+    ) -> str:
+        """
+        Apply a previously created V2 Java refactor session.
+
+        :param session_id: Session ID returned by ``java_create_refactor_session``.
+        :param validate: Optional apply validation override.
+        :param expected_project_revision: Optimistic-concurrency guard pinning the session's create-time project
+            revision. If the project changed, the sidecar refuses with ``project_revision_mismatch`` before any write.
+        :param expectedProjectRevision: camelCase alias for ``expected_project_revision``.
+        :param selection_json: Optional JSON object applying only a subset of the session's edits (incremental apply),
+            with any of ``files`` (project-relative paths), ``edits``/``fileOperations`` (stable unit ids from a prior
+            ``selectionModel``), or ``phases`` (edit ``kind`` groups). The sidecar validates that subset overlay via
+            javac, applies it, and reports the still-unapplied ``remaining`` units a later apply can target. Omitting it
+            applies the whole session, or — once a subset has been applied — the remaining units.
+        """
+        revision = expected_project_revision if expected_project_revision is not None else expectedProjectRevision
+        selection = self._json_argument(selection_json, "selection_json", None)
+        result = self._get_manager().apply_v2_refactor_session(
+            session_id, validate=validate, expected_project_revision=revision, selection=selection
+        )
+        return self._finalize_result(result)
+
+
+class JavaCancelRefactorSessionTool(_JavaRefactorToolBase):
+    """Cancels an explicit V2 refactor session by session ID."""
+
+    def apply(self, session_id: str = "") -> str:
+        """
+        Cancel a V2 Java refactor session.
+
+        :param session_id: Session ID returned by ``java_create_refactor_session``.
+        """
+        return self._finalize_result(self._get_manager().cancel_v2_refactor_session(session_id))
+
+
 class JavaRefactorSymbolTool(_JavaRefactorToolBase):
     def apply(
         self,
@@ -366,6 +520,8 @@ class JavaRefactorSymbolTool(_JavaRefactorToolBase):
         include_comments: bool | None = None,
         validate: bool = True,
         allow_public_api_delete: bool = False,
+        search_in_comments_and_strings: bool = False,
+        search_for_text_occurrences: bool = False,
         allow_public_api: bool = False,
         fallback_to_lsp: bool = True,
         line: int | None = None,
@@ -387,6 +543,8 @@ class JavaRefactorSymbolTool(_JavaRefactorToolBase):
         :param include_comments: Rename-only opt-in for plain comment/string textual edits.
         :param validate: Preview-time reporting flag; apply safety validation cannot be weakened by this flag.
         :param allow_public_api_delete: Safe-delete opt-in for public/protected API deletion.
+        :param search_in_comments_and_strings: Safe-delete opt-in matching IntelliJ's "Search in comments and strings".
+        :param search_for_text_occurrences: Safe-delete opt-in matching IntelliJ's "Search for text occurrences".
         :param allow_public_api: Inline-constant opt-in allowing non-private constant apply after preview safety gates.
         :param fallback_to_lsp: For rename, fall back to the existing LSP rename if the sidecar is unavailable and a
             ``name_path`` target was supplied. Hard semantic refusals never fall back.
@@ -419,6 +577,8 @@ class JavaRefactorSymbolTool(_JavaRefactorToolBase):
                     validate=validate,
                     allow_public_api_delete=allow_public_api_delete,
                     target_hints=target_hints,
+                    search_in_comments_and_strings=search_in_comments_and_strings,
+                    search_for_text_occurrences=search_for_text_occurrences,
                 )
             elif normalized == "move_top_level_type":
                 result = manager.move_top_level_type(
@@ -474,6 +634,10 @@ class JavaRefactorSymbolTool(_JavaRefactorToolBase):
 # exposed only for projects that opt in, rather than always-present and refusing at execution time.
 JAVA_REFACTOR_TOOL_CLASSES = (
     JavaRefactorStatusTool,
+    JavaCreateRefactorSessionTool,
+    JavaGetRefactorSessionEditTool,
+    JavaApplyRefactorSessionTool,
+    JavaCancelRefactorSessionTool,
     JavaRefactorSymbolTool,
     JavaSemanticRenameTool,
     JavaSafeDeleteTool,

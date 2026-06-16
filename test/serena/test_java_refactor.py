@@ -8,12 +8,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from serena.config.serena_config import JavaRefactorConfig, LanguageBackend, ProjectConfig, SerenaConfig
+from serena.config.serena_config import (
+    JavaRefactorConfig,
+    JavaRefactorV2Config,
+    LanguageBackend,
+    ProjectConfig,
+    SerenaConfig,
+)
 from serena.java_refactor.client import JavaRefactorClient
 from serena.java_refactor.manager import JavaRefactorManager, JavaRefactorRuntimeError
 from serena.project import Project
-from serena.tools import SUCCESS_RESULT
-from serena.tools.java_refactor_tools import (
+from serena.tools import (
+    SUCCESS_RESULT,
     JavaInlineConstantTool,
     JavaInlineLocalVariableTool,
     JavaMoveTopLevelTypeTool,
@@ -398,6 +404,51 @@ def test_java_refactor_manager_serializes_project_model_config(tmp_path: Path) -
     assert configuration["encoding"] == "UTF-16"
 
 
+def test_java_refactor_manager_serializes_nested_v2_config(tmp_path: Path) -> None:
+    # G006: v2 is now a strictly-typed dataclass. Build it via from_dict (the YAML-load path) and assert the manager
+    # serializes it back to the snake_case wire object the sidecar's expandNestedV2Config accepts.
+    v2_config = JavaRefactorV2Config.from_dict(
+        {
+            "enabled": True,
+            "sessions": {"max_open_sessions": 16, "session_ttl_minutes": 30, "require_revision_match_on_apply": True},
+            "generated_sources": {"read": True, "edit": False},
+            "lombok": {"allow": True},
+            "access": {"allow_access_widening": False},
+            "hierarchy": {"enabled": True, "allow_public_api_change": False},
+            "operation_defaults": {"visibility": "private"},
+            "extract_method": {"enabled": True, "allow_multiple_outputs": False},
+            "extract_interface": {"enabled": True, "replace_usages_default": False},
+            "encapsulate_field": {"enabled": True, "rewrite_internal_usages_default": False},
+            "inline_method": {"enabled": True, "max_call_sites": 100},
+            "diagnostics": {"report_delta": True},
+            "imports": {"preserve_static_imports": True},
+        }
+    )
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, v2=v2_config),
+    )
+
+    configuration = json.loads(manager._sidecar_configuration())
+
+    serialized_v2 = configuration["java_refactor"]["v2"]
+    assert serialized_v2["enabled"] is True
+    assert serialized_v2["sessions"] == {
+        "max_open_sessions": 16,
+        "session_ttl_minutes": 30,
+        "require_revision_match_on_apply": True,
+    }
+    assert serialized_v2["extract_method"] == {
+        "enabled": True,
+        "allow_multiple_outputs": False,
+        "allow_control_flow_exits": False,
+    }
+    assert serialized_v2["inline_method"]["max_call_sites"] == 100
+    assert serialized_v2["generated_sources"] == {"read": True, "edit": False}
+
+
 def test_java_refactor_manager_omits_auto_build_tool_mode(tmp_path: Path) -> None:
     manager = JavaRefactorManager(
         str(tmp_path),
@@ -449,6 +500,43 @@ def test_java_refactor_manager_omits_jdtls_settings_when_disabled(tmp_path: Path
 
     for key in ("mavenUserSettings", "gradleUserHome", "gradleJavaHome", "gradleWrapperEnabled"):
         assert key not in configuration
+
+
+def test_java_refactor_manager_forwards_nested_model_override(tmp_path: Path) -> None:
+    model = {
+        "modules": [
+            {
+                "project": ":app",
+                "sourceSets": [
+                    {
+                        "name": "main",
+                        "srcDirs": ["src/main/java"],
+                        "generatedRoots": ["build/generated/sources/annotations"],
+                        "outputDirs": ["build/classes/java/main"],
+                        "classpath": ["libs/api.jar"],
+                        "modulePath": [],
+                        "annotationProcessorPath": ["libs/lombok.jar"],
+                        "release": "21",
+                        "source": "21",
+                        "target": "21",
+                        "encoding": "UTF-8",
+                        "dependsOnProjects": [],
+                        "compilerArgs": ["-parameters"],
+                    }
+                ],
+            }
+        ]
+    }
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        JavaRefactorConfig(enabled=True, model=model),
+    )
+
+    configuration = json.loads(manager._sidecar_configuration())
+
+    assert configuration["java_refactor"]["model"] == model
 
 
 def test_java_refactor_manager_ignores_absent_jdtls_settings(tmp_path: Path) -> None:
@@ -572,6 +660,7 @@ def test_java_refactor_fixtures_and_bundled_resource_exist() -> None:
         "multi-source-set-gradle",
         "modules",
         "lombok-lite",
+        "generated-code",
     }
 
     assert expected == {path.name for path in fixture_root.iterdir() if path.is_dir()}
@@ -748,6 +837,13 @@ def _make_direct_java_tool(tool_cls, project_config, recorded: dict, monkeypatch
         move_top_level_type=record,
         inline_local_variable=record,
         inline_constant=record,
+        v2_refactor_session=lambda operation, params, apply=False, validate=None: {
+            "accepted": True,
+            "operation": operation,
+            "params": params,
+            "apply": apply,
+            "validate": validate,
+        },
     )
     monkeypatch.setattr(tool, "create_java_refactor_client", lambda: fake_manager, raising=False)
     return tool
@@ -1661,6 +1757,8 @@ def _make_java_tool(tool_cls, recorded: dict, monkeypatch, symbol):
         recorded["include_javadocs"] = kwargs.get("include_javadocs")
         recorded["include_comments"] = kwargs.get("include_comments")
         recorded["allow_public_api_delete"] = kwargs.get("allow_public_api_delete")
+        recorded["search_in_comments_and_strings"] = kwargs.get("search_in_comments_and_strings")
+        recorded["search_for_text_occurrences"] = kwargs.get("search_for_text_occurrences")
         recorded["allow_public_api"] = kwargs.get("allow_public_api")
         return {"accepted": True}
 
@@ -1677,7 +1775,7 @@ def _make_java_tool(tool_cls, recorded: dict, monkeypatch, symbol):
 
 
 def test_java_rename_tool_resolves_name_path_to_one_based_position(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     recorded: dict = {}
     symbol = SimpleNamespace(line=4, column=8)  # zero-based language-server position
@@ -1694,7 +1792,7 @@ def test_java_rename_tool_resolves_name_path_to_one_based_position(monkeypatch) 
 
 
 def test_java_rename_tool_advanced_line_column_bypasses_symbol_lookup(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     recorded: dict = {}
 
@@ -1711,7 +1809,7 @@ def test_java_rename_tool_advanced_line_column_bypasses_symbol_lookup(monkeypatc
 
 
 def test_java_rename_tool_refuses_name_path_when_lsp_symbol_resolution_disabled(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     recorded: dict = {}
     tool = _make_java_tool(JavaSemanticRenameTool, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
@@ -1722,7 +1820,7 @@ def test_java_rename_tool_refuses_name_path_when_lsp_symbol_resolution_disabled(
 
 
 def test_java_refactor_symbol_tool_dispatches_rename(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaRefactorSymbolTool
+    from serena.tools import JavaRefactorSymbolTool
 
     recorded: dict = {}
     tool = _make_java_tool(JavaRefactorSymbolTool, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
@@ -1736,7 +1834,7 @@ def test_java_refactor_symbol_tool_dispatches_rename(monkeypatch) -> None:
 
 
 def test_java_rename_tool_forwards_javadoc_and_comment_flags(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     recorded: dict = {}
     tool = _make_java_tool(JavaSemanticRenameTool, recorded, monkeypatch, SimpleNamespace())
@@ -1780,7 +1878,7 @@ def _make_rename_tool_with_real_manager(tool_cls, tmp_path: Path, monkeypatch, j
 def test_java_rename_tool_omitted_flags_honor_true_project_defaults(tmp_path: Path, monkeypatch) -> None:
     # Blocker regression: include_javadocs_default/include_comments_default true + caller omits the parameters
     # => the sidecar must receive true (the tool must NOT silently override the project config with False).
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     config = JavaRefactorConfig(enabled=True, include_javadocs=True, include_comments=True, preview_default=True)
     tool, recorded = _make_rename_tool_with_real_manager(JavaSemanticRenameTool, tmp_path, monkeypatch, config)
@@ -1793,7 +1891,7 @@ def test_java_rename_tool_omitted_flags_honor_true_project_defaults(tmp_path: Pa
 
 def test_java_rename_tool_explicit_false_overrides_true_project_defaults(tmp_path: Path, monkeypatch) -> None:
     # Project defaults true, caller explicitly passes false => the sidecar must receive false.
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     config = JavaRefactorConfig(enabled=True, include_javadocs=True, include_comments=True, preview_default=True)
     tool, recorded = _make_rename_tool_with_real_manager(JavaSemanticRenameTool, tmp_path, monkeypatch, config)
@@ -1806,7 +1904,7 @@ def test_java_rename_tool_explicit_false_overrides_true_project_defaults(tmp_pat
 
 def test_java_rename_tool_omitted_flags_honor_false_project_defaults(tmp_path: Path, monkeypatch) -> None:
     # Project defaults false (the config default), caller omits => the sidecar receives false.
-    from serena.tools.java_refactor_tools import JavaSemanticRenameTool
+    from serena.tools import JavaSemanticRenameTool
 
     config = JavaRefactorConfig(enabled=True, preview_default=True)
     tool, recorded = _make_rename_tool_with_real_manager(JavaSemanticRenameTool, tmp_path, monkeypatch, config)
@@ -1830,8 +1928,33 @@ def test_generic_rename_routing_honors_javadoc_and_comment_project_defaults(tmp_
     assert recorded["includeComments"] is True
 
 
+def test_java_safe_delete_manager_forwards_textual_search_options_to_sidecar(tmp_path: Path) -> None:
+    recorded: dict = {}
+
+    def preview(operation: str, params: dict) -> dict:
+        recorded.update(params)
+        recorded["operation"] = operation
+        return {"accepted": False, "refusal": {"code": "target_not_found", "message": "stub"}}
+
+    config = JavaRefactorConfig(enabled=True, preview_default=True)
+    manager = JavaRefactorManager(str(tmp_path), LanguageBackend.LSP, [Language.JAVA], java_refactor_config=config)
+    manager._client = SimpleNamespace(is_running=lambda: True, preview=preview)  # type: ignore[assignment]
+
+    manager.safe_delete(
+        "src/Demo.java",
+        2,
+        4,
+        search_in_comments_and_strings=True,
+        search_for_text_occurrences=True,
+    )
+
+    assert recorded["operation"] == "safeDelete"
+    assert recorded["searchInCommentsAndStrings"] is True
+    assert recorded["searchForTextOccurrences"] is True
+
+
 def test_java_safe_delete_tool_forwards_allow_public_api_delete(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaSafeDeleteTool
+    from serena.tools import JavaSafeDeleteTool
 
     recorded: dict = {}
     tool = _make_java_tool(JavaSafeDeleteTool, recorded, monkeypatch, SimpleNamespace())
@@ -1841,8 +1964,45 @@ def test_java_safe_delete_tool_forwards_allow_public_api_delete(monkeypatch) -> 
     assert recorded["allow_public_api_delete"] is True
 
 
+def test_java_safe_delete_tool_forwards_textual_search_options(monkeypatch) -> None:
+    from serena.tools import JavaSafeDeleteTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaSafeDeleteTool, recorded, monkeypatch, SimpleNamespace())
+
+    tool.apply(
+        relative_path="src/Demo.java",
+        search_in_comments_and_strings=True,
+        search_for_text_occurrences=True,
+        line=2,
+        column=4,
+    )
+
+    assert recorded["search_in_comments_and_strings"] is True
+    assert recorded["search_for_text_occurrences"] is True
+
+
+def test_java_refactor_symbol_safe_delete_forwards_textual_search_options(monkeypatch) -> None:
+    from serena.tools import JavaRefactorSymbolTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaRefactorSymbolTool, recorded, monkeypatch, SimpleNamespace())
+
+    tool.apply(
+        operation="safe_delete",
+        relative_path="src/Demo.java",
+        search_in_comments_and_strings=True,
+        search_for_text_occurrences=True,
+        line=2,
+        column=4,
+    )
+
+    assert recorded["search_in_comments_and_strings"] is True
+    assert recorded["search_for_text_occurrences"] is True
+
+
 def test_java_inline_constant_tool_forwards_allow_public_api(monkeypatch) -> None:
-    from serena.tools.java_refactor_tools import JavaInlineConstantTool
+    from serena.tools import JavaInlineConstantTool
 
     recorded: dict = {}
     tool = _make_java_tool(JavaInlineConstantTool, recorded, monkeypatch, SimpleNamespace())
@@ -1855,15 +2015,30 @@ def test_java_inline_constant_tool_forwards_allow_public_api(monkeypatch) -> Non
 
 def test_java_refactor_tool_markers_match_plan() -> None:
     """The status tool is a symbolic-read tool; mutating tools are EditingToolWithDiagnostics, optional, and beta."""
-    from serena.tools import EditingToolWithDiagnostics, ToolMarkerBeta, ToolMarkerOptional, ToolMarkerSymbolicEdit, ToolMarkerSymbolicRead
-    from serena.tools.java_refactor_tools import (
+    from serena.tools import (
+        EditingToolWithDiagnostics,
+        JavaChangeSignatureTool,
+        JavaEncapsulateFieldTool,
+        JavaExtractInterfaceTool,
+        JavaExtractMethodTool,
         JavaInlineConstantTool,
         JavaInlineLocalVariableTool,
+        JavaInlineMethodTool,
+        JavaIntroduceFieldTool,
+        JavaIntroduceParameterTool,
+        JavaMoveInstanceMethodTool,
+        JavaMoveStaticMemberTool,
         JavaMoveTopLevelTypeTool,
+        JavaPullUpMemberTool,
+        JavaPushDownMemberTool,
         JavaRefactorStatusTool,
         JavaRefactorSymbolTool,
         JavaSafeDeleteTool,
         JavaSemanticRenameTool,
+        ToolMarkerBeta,
+        ToolMarkerOptional,
+        ToolMarkerSymbolicEdit,
+        ToolMarkerSymbolicRead,
     )
 
     assert issubclass(JavaRefactorStatusTool, ToolMarkerSymbolicRead)
@@ -1877,6 +2052,17 @@ def test_java_refactor_tool_markers_match_plan() -> None:
         JavaMoveTopLevelTypeTool,
         JavaInlineLocalVariableTool,
         JavaInlineConstantTool,
+        JavaInlineMethodTool,
+        JavaChangeSignatureTool,
+        JavaIntroduceParameterTool,
+        JavaMoveStaticMemberTool,
+        JavaMoveInstanceMethodTool,
+        JavaPullUpMemberTool,
+        JavaPushDownMemberTool,
+        JavaExtractMethodTool,
+        JavaExtractInterfaceTool,
+        JavaIntroduceFieldTool,
+        JavaEncapsulateFieldTool,
     ):
         assert issubclass(mutating, EditingToolWithDiagnostics), mutating
         assert issubclass(mutating, ToolMarkerSymbolicEdit), mutating
@@ -1884,9 +2070,1245 @@ def test_java_refactor_tool_markers_match_plan() -> None:
         assert issubclass(mutating, ToolMarkerBeta), mutating
 
 
+def test_v2_java_refactor_tools_are_exposed_by_name() -> None:
+    from serena.tools import java_refactor_tool_names
+
+    names = set(java_refactor_tool_names())
+
+    assert {
+        "java_create_refactor_session",
+        "java_get_refactor_session_edit",
+        "java_apply_refactor_session",
+        "java_cancel_refactor_session",
+        "java_change_signature",
+        "java_introduce_parameter",
+        "java_move_static_member",
+        "java_move_instance_method",
+        "java_pull_up_member",
+        "java_push_down_member",
+        "java_inline_method",
+        "java_extract_method",
+        "java_extract_interface",
+        "java_introduce_field",
+        "java_encapsulate_field",
+    }.issubset(names)
+
+
+def test_v2_refactor_session_refuses_missing_advertised_capability(tmp_path: Path, monkeypatch) -> None:
+    class FakeClient:
+        create_session_called = False
+
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": {"refactorSessions": {"level": "beta", "status": "supported"}}}
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            self.create_session_called = True
+            return {"accepted": True, "session": {"sessionId": "S"}}
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("changeSignature", {"relativePath": "Demo.java"})
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "java_refactor_capability_unavailable"
+    assert fake_client.create_session_called is False
+
+
+def test_v2_refactor_session_refuses_partial_advertised_capability(tmp_path: Path, monkeypatch) -> None:
+    class FakeClient:
+        create_session_called = False
+
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "changeSignature": {"level": "experimental", "status": "partial"},
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            self.create_session_called = True
+            return {"accepted": True, "session": {"sessionId": "S"}}
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("changeSignature", {"relativePath": "Demo.java"})
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "java_refactor_capability_unavailable"
+    assert fake_client.create_session_called is False
+
+
+def test_v2_refactor_session_passes_supported_advertised_capability_to_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FakeClient:
+        create_session_called = False
+
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "changeSignature": {"level": "beta", "status": "supported"},
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(
+            self, operation: str, params: dict[str, object], apply: bool = False, **_: object
+        ) -> dict[str, object]:
+            self.create_session_called = True
+            return {"accepted": True, "session": {"sessionId": "S", "operation": operation, "params": params}}
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda *_, **__: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda *_, **__: fake_client)
+
+    result = manager.v2_refactor_session("changeSignature", {"relativePath": "Demo.java"})
+
+    assert fake_client.create_session_called is True
+    assert result["refusal"]["code"] != "java_refactor_capability_unavailable"
+
+
+def test_capabilities_normalizer_does_not_promote_preview_string_to_supported(tmp_path: Path, monkeypatch) -> None:
+    """G001 (T3): a sidecar that returns a legacy bare-string capability of "preview" must NOT be normalized to
+    status "supported". This pins the normalizer so a future change cannot silently promote a preview op.
+    """
+
+    class FakeClient:
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": {"changeSignature": "preview", "refactorSessions": {"level": "beta", "status": "supported"}}}
+
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    capabilities = manager._capabilities(FakeClient())  # type: ignore[arg-type]
+
+    assert capabilities["changeSignature"]["status"] != "supported"
+
+
+def test_capabilities_preview_status_object_is_refused_by_ensure(tmp_path: Path, monkeypatch) -> None:
+    """G001 (T1, Python half): every op the sidecar advertises with status != "supported" (e.g. "preview") must be
+    refused by _ensure_v2_capability, while a "supported" op passes. Regression-guards truthful gating.
+    """
+
+    class FakeClient:
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "changeSignature": {"level": "beta", "status": "preview"},
+                    "extractMethod": {"level": "beta", "status": "supported"},
+                }
+            }
+
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    fake = FakeClient()
+
+    preview_refusal = manager._ensure_v2_capability(fake, "changeSignature", "preview")  # type: ignore[arg-type]
+    assert preview_refusal is not None
+    assert preview_refusal["refusal"]["code"] == "java_refactor_capability_unavailable"
+
+    supported = manager._ensure_v2_capability(fake, "extractMethod", "preview")  # type: ignore[arg-type]
+    assert supported is None
+
+
+def test_v2_refactor_session_refuses_legacy_experimental_capability(tmp_path: Path, monkeypatch) -> None:
+    class FakeClient:
+        create_session_called = False
+
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": {"changeSignature": "experimental"}}
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            self.create_session_called = True
+            return {"accepted": True, "session": {"sessionId": "S"}}
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("changeSignature", {"relativePath": "Demo.java"})
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "java_refactor_capability_unavailable"
+    assert fake_client.create_session_called is False
+
+
+def test_v2_refactor_session_preview_exposes_full_diagnostic_delta(tmp_path: Path, monkeypatch) -> None:
+    from serena.java_refactor.workspace_edit import sha256_bytes
+
+    source = tmp_path / "Demo.java"
+    source.write_text("class Demo { int value = 1; }\n", encoding="utf-8")
+
+    class FakeClient:
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                    "inlineMethod": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            workspace_edit = {
+                "changes": [
+                    {
+                        "path": "Demo.java",
+                        "oldSha256": sha256_bytes(source.read_bytes()),
+                        "edits": [{"startOffset": 17, "endOffset": 22, "newText": "total", "kind": "REPLACE"}],
+                    }
+                ],
+                "fileOperations": [],
+                "warnings": [],
+                "preconditions": [],
+                "stats": {"editCount": 1, "fileOperationCount": 0},
+            }
+            return {"accepted": True, "session": {"sessionId": "S", "operation": operation}, "preview": {"workspaceEdit": workspace_edit}}
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            if not overlay.get("changedFiles"):
+                return {
+                    "accepted": True,
+                    "ready": False,
+                    "errors": ["/p/Broken.java:1:1: cannot find symbol"],
+                    "compilerErrors": ["/p/Broken.java:1:1: cannot find symbol"],
+                    "compilerWarnings": ["/p/Legacy.java:2:1: old rawtype warning"],
+                    "warnings": ["/p/Legacy.java:2:1: old rawtype warning"],
+                }
+            return {
+                "accepted": True,
+                "ready": False,
+                "errors": ["/p/Broken.java:9:1: cannot find symbol", "/p/Demo.java:1:18: cannot find symbol"],
+                "compilerErrors": ["/p/Broken.java:9:1: cannot find symbol", "/p/Demo.java:1:18: cannot find symbol"],
+                "compilerWarnings": [
+                    "/p/Legacy.java:4:1: old rawtype warning",
+                    "/p/Demo.java:1:1: unchecked conversion warning",
+                ],
+                "warnings": [
+                    "/p/Legacy.java:4:1: old rawtype warning",
+                    "/p/Demo.java:1:1: unchecked conversion warning",
+                ],
+            }
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_incomplete_analysis=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"})
+
+    assert result["accepted"] is True
+    validation = result["previewValidation"]
+    assert validation["ready"] is False
+    delta = validation["diagnosticDelta"]
+    # G003: the canonical diagnosticDelta arrays carry structured DiagnosticInfo dicts (with a derived display field).
+    assert [d["display"] for d in delta["before"]["errors"]] == ["/p/Broken.java:1:1: cannot find symbol"]
+    assert [d["display"] for d in delta["after"]["errors"]] == [
+        "/p/Broken.java:9:1: cannot find symbol",
+        "/p/Demo.java:1:18: cannot find symbol",
+    ]
+    assert [d["display"] for d in delta["unchangedErrors"]] == ["/p/Broken.java:9:1: cannot find symbol"]
+    assert [d["display"] for d in delta["newErrors"]] == ["/p/Demo.java:1:18: cannot find symbol"]
+    assert delta["resolvedErrors"] == []
+    new_error = delta["newErrors"][0]
+    assert new_error["severity"] == "error"
+    assert new_error["path"] == "/p/Demo.java"
+    assert new_error["line"] == 1 and new_error["column"] == 18
+    assert new_error["message"] == "cannot find symbol"
+    assert validation["newWarnings"] == ["/p/Demo.java:1:1: unchecked conversion warning"]
+
+
+def _g002_session_manager(tmp_path: Path, monkeypatch, *, baseline_errors, staged_errors, allow_incomplete):
+    """Builds a JavaRefactorManager wired to a fake sidecar whose staged javac validation returns ``staged_errors``.
+
+    The baseline (empty overlay) returns ``baseline_errors``; the staged overlay (the session edit) returns
+    ``staged_errors``. This lets a single helper drive G002's complete-vs-incomplete policy on the session preview path.
+    """
+    from serena.java_refactor.workspace_edit import sha256_bytes
+
+    source = tmp_path / "Demo.java"
+    source.write_text("class Demo { int value = 1; }\n", encoding="utf-8")
+
+    class FakeClient:
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                    "inlineMethod": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            workspace_edit = {
+                "changes": [
+                    {
+                        "path": "Demo.java",
+                        "oldSha256": sha256_bytes(source.read_bytes()),
+                        "edits": [{"startOffset": 17, "endOffset": 22, "newText": "total", "kind": "REPLACE"}],
+                    }
+                ],
+                "fileOperations": [],
+                "warnings": [],
+                "preconditions": [],
+                "stats": {"editCount": 1, "fileOperationCount": 0},
+            }
+            return {"accepted": True, "session": {"sessionId": "S", "operation": operation}, "preview": {"workspaceEdit": workspace_edit}}
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            errors = staged_errors if overlay.get("changedFiles") else baseline_errors
+            return {"accepted": True, "ready": not errors, "errors": list(errors), "compilerErrors": list(errors), "warnings": []}
+
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_incomplete_analysis=allow_incomplete),
+    )
+    fake_client = FakeClient()
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+    return manager
+
+
+def test_v2_session_complete_mode_refuses_preexisting_errors(tmp_path: Path, monkeypatch) -> None:
+    # G002: in complete-analysis mode (the default), an accepted session preview must leave the after-state error-free.
+    # An unchanged pre-existing error therefore blocks with a refusal distinct from new_compiler_errors.
+    preexisting = "/p/Broken.java:1:1: cannot find symbol"
+    manager = _g002_session_manager(
+        tmp_path, monkeypatch, baseline_errors=[preexisting], staged_errors=[preexisting], allow_incomplete=False
+    )
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"})
+
+    validation = result["previewValidation"]
+    assert validation["ready"] is False
+    assert validation["errors"] == [preexisting]
+    assert validation["newErrors"] == []
+    assert validation["refusal"]["code"] == "preexisting_compiler_errors_not_allowed"
+    assert [d["display"] for d in validation["refusal"]["diagnosticDelta"]["unchangedErrors"]] == [preexisting]
+
+
+def test_v2_session_incomplete_mode_tolerates_preexisting_errors(tmp_path: Path, monkeypatch) -> None:
+    # G002: with allow_incomplete_analysis opted in, the SAME unchanged pre-existing error is tolerated — the preview is
+    # ready and carries no refusal, because the edit introduced no new compiler error.
+    preexisting = "/p/Broken.java:1:1: cannot find symbol"
+    manager = _g002_session_manager(
+        tmp_path, monkeypatch, baseline_errors=[preexisting], staged_errors=[preexisting], allow_incomplete=True
+    )
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"})
+
+    validation = result["previewValidation"]
+    assert validation["ready"] is True
+    assert validation["errors"] == []
+    assert "refusal" not in validation
+    assert [d["display"] for d in validation["diagnosticDelta"]["unchangedErrors"]] == [preexisting]
+
+
+@pytest.mark.parametrize("allow_incomplete", [False, True])
+def test_v2_session_new_errors_refused_in_both_modes(tmp_path: Path, monkeypatch, allow_incomplete: bool) -> None:
+    # G002: a newly introduced compiler error is refused regardless of the incomplete-analysis policy, and keeps the
+    # new_compiler_errors code so it is never confused with the pre-existing-error case.
+    new_error = "/p/Demo.java:1:18: cannot find symbol"
+    manager = _g002_session_manager(
+        tmp_path, monkeypatch, baseline_errors=[], staged_errors=[new_error], allow_incomplete=allow_incomplete
+    )
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"})
+
+    validation = result["previewValidation"]
+    assert validation["ready"] is False
+    assert validation["newErrors"] == [new_error]
+    assert validation["refusal"]["code"] == "new_compiler_errors"
+
+
+def test_get_v2_refactor_session_edit_defaults_to_serena_workspace_edit_format(tmp_path: Path, monkeypatch) -> None:
+    # HB-10: the first-class session edit-retrieval flow requests the serenaWorkspaceEdit format by default, and
+    # honors an explicit override.
+    recorded: dict[str, object] = {"formats": []}
+
+    class FakeClient:
+        def get_session_edit(self, session_id: str, edit_format: str | None = None, selection: dict | None = None) -> dict[str, object]:
+            recorded["session_id"] = session_id
+            recorded["formats"].append(edit_format)  # type: ignore[attr-defined]
+            return {
+                "accepted": True,
+                "format": edit_format,
+                "preview": {
+                    "workspaceEdit": {
+                        "changes": [],
+                        "fileOperations": [],
+                        "warnings": [],
+                        "preconditions": [],
+                        "stats": {},
+                    }
+                },
+            }
+
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_incomplete_analysis=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: FakeClient())
+
+    default_result = manager.get_v2_refactor_session_edit("S", validate=False)
+    assert default_result["format"] == "serenaWorkspaceEdit"
+    assert recorded["formats"][-1] == "serenaWorkspaceEdit"  # type: ignore[index]
+
+    manager.get_v2_refactor_session_edit("S", validate=False, edit_format="workspaceEdit")
+    assert recorded["formats"][-1] == "workspaceEdit"  # type: ignore[index]
+
+
+def test_v2_refactor_session_apply_always_gates_new_diagnostic_delta(tmp_path: Path, monkeypatch) -> None:
+    from serena.java_refactor.workspace_edit import sha256_bytes
+
+    source = tmp_path / "Demo.java"
+    source.write_text("class Demo { int value = 1; }\n", encoding="utf-8")
+
+    class FakeClient:
+        validate_calls = 0
+
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                    "inlineMethod": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            return {"accepted": True, "session": {"sessionId": "S", "operation": operation}, "preview": {}}
+
+        def apply_session(self, session_id: str, expected_project_revision: object = None, selection: dict | None = None) -> dict[str, object]:
+            workspace_edit = {
+                "changes": [
+                    {
+                        "path": "Demo.java",
+                        "oldSha256": sha256_bytes(source.read_bytes()),
+                        "edits": [{"startOffset": 17, "endOffset": 22, "newText": "total", "kind": "REPLACE"}],
+                    }
+                ],
+                "fileOperations": [],
+                "warnings": [],
+                "preconditions": [],
+                "stats": {"editCount": 1, "fileOperationCount": 0},
+            }
+            return {
+                "accepted": True,
+                "session": {"sessionId": session_id},
+                "validation": {"accepted": True},
+                "preview": {"accepted": True, "workspaceEdit": workspace_edit},
+            }
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            self.validate_calls += 1
+            if not overlay.get("changedFiles"):
+                return {
+                    "accepted": True,
+                    "ready": False,
+                    "compilerErrors": ["/p/Broken.java:1:1: cannot find symbol"],
+                    "compilerWarnings": ["/p/Legacy.java:2:1: old rawtype warning"],
+                }
+            return {
+                "accepted": True,
+                "ready": False,
+                "compilerErrors": [
+                    "/p/Broken.java:9:1: cannot find symbol",
+                    "/p/Demo.java:1:18: cannot find symbol",
+                ],
+                "compilerWarnings": [
+                    "/p/Legacy.java:4:1: old rawtype warning",
+                    "/p/Demo.java:1:1: unchecked conversion warning",
+                ],
+            }
+
+        def status(self, refresh: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(ready=True, errors=[], project_model={"conventionalFallbackUsed": False, "warnings": []})
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_incomplete_analysis=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"}, apply=True, validate=False)
+
+    assert fake_client.validate_calls == 2
+    assert result["accepted"] is False
+    assert result["applied"] is False
+    assert result["refusal"]["code"] == "session_pre_apply_validation_failed"
+    assert result["preValidation"]["newErrors"] == ["/p/Demo.java:1:18: cannot find symbol"]
+    assert result["preValidation"]["newWarnings"] == ["/p/Demo.java:1:1: unchecked conversion warning"]
+    assert [d["display"] for d in result["preValidation"]["diagnosticDelta"]["unchangedErrors"]] == [
+        "/p/Broken.java:9:1: cannot find symbol"
+    ]
+    assert source.read_text(encoding="utf-8") == "class Demo { int value = 1; }\n"
+
+
+def test_v2_session_apply_uses_revalidated_plan_edit_not_stored_preview(tmp_path: Path, monkeypatch) -> None:
+    """Blocker 1 regression (Python apply half): the workspace edit Python applies must be the freshly recomputed +
+    revalidated plan the sidecar surfaces in the apply envelope's ``preview.workspaceEdit`` — never a separately-stored
+    create-time preview. The fake apply envelope surfaces a *revalidated* edit (value -> ``revalidated``) under
+    ``preview.workspaceEdit`` while also carrying a divergent *stored* edit (value -> ``stored``) under a top-level
+    ``plan``. After apply, the committed bytes must reflect the revalidated edit, proving Python keys off the surfaced
+    revalidated plan. Paired with the sidecar-side unit test that proves the apply envelope carries ``currentPlan``
+    (RefactorSessionManagerTest#applyEnvelopeSurfacesSuppliedRevalidatedPlanNotStoredPreview), this closes the contract.
+    """
+    from serena.java_refactor.workspace_edit import sha256_bytes
+
+    source = tmp_path / "Demo.java"
+    source.write_text("class Demo { int value = 1; }\n", encoding="utf-8")
+
+    def _change_to(new_text: str) -> dict[str, object]:
+        return {
+            "changes": [
+                {
+                    "path": "Demo.java",
+                    "oldSha256": sha256_bytes(source.read_bytes()),
+                    "edits": [{"startOffset": 17, "endOffset": 22, "newText": new_text, "kind": "REPLACE"}],
+                }
+            ],
+            "fileOperations": [],
+            "warnings": [],
+            "preconditions": [],
+            "stats": {"editCount": 1, "fileOperationCount": 0},
+        }
+
+    class FakeClient:
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": {"refactorSessions": {"level": "beta", "status": "supported"}}}
+
+        def apply_session(self, session_id: str, expected_project_revision: object = None, selection: dict | None = None) -> dict[str, object]:
+            # The apply envelope surfaces the revalidated plan under preview.workspaceEdit (what Python applies) and a
+            # divergent stored edit under plan — a regressed sidecar that re-surfaced the stored preview would put the
+            # "stored" edit under preview.workspaceEdit and the assertion below would catch it.
+            return {
+                "accepted": True,
+                "session": {"sessionId": session_id},
+                "validation": {"accepted": True},
+                "plan": {"accepted": True, "workspaceEdit": _change_to("stored")},
+                "preview": {"accepted": True, "workspaceEdit": _change_to("revalidated")},
+            }
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            return {"accepted": True, "ready": True, "compilerErrors": [], "compilerWarnings": []}
+
+        def status(self, refresh: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(ready=True, errors=[], project_model={"warnings": []})
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.apply_v2_refactor_session("S")
+
+    assert result["applied"] is True
+    assert result.get("refusal") is None
+    assert source.read_text(encoding="utf-8") == "class Demo { int revalidated = 1; }\n"
+
+
+def _degraded_v2_change(source: "Path") -> dict[str, object]:
+    from serena.java_refactor.workspace_edit import sha256_bytes
+
+    return {
+        "changes": [
+            {
+                "path": "Demo.java",
+                "oldSha256": sha256_bytes(source.read_bytes()),
+                "edits": [{"startOffset": 17, "endOffset": 22, "newText": "total", "kind": "REPLACE"}],
+            }
+        ],
+        "fileOperations": [],
+        "warnings": [],
+        "preconditions": [],
+        "stats": {"editCount": 1, "fileOperationCount": 0},
+    }
+
+
+def test_v2_refactor_session_apply_refuses_degraded_conventional_fallback_model(tmp_path: Path, monkeypatch) -> None:
+    """G002: v2_refactor_session(apply=True) refuses BEFORE any sidecar apply or Python-side write when the project model
+    is degraded (conventional fallback => no resolved classpath). The refusal is structured (not a warning) and no file
+    is mutated.
+    """
+    source = tmp_path / "Demo.java"
+    original = "class Demo { int value = 1; }\n"
+    source.write_text(original, encoding="utf-8")
+
+    class FakeClient:
+        apply_session_calls = 0
+
+        def capabilities(self) -> dict[str, object]:
+            return {
+                "capabilities": {
+                    "refactorSessions": {"level": "beta", "status": "supported"},
+                    "inlineMethod": {"level": "beta", "status": "supported"},
+                }
+            }
+
+        def create_session(self, operation: str, params: dict[str, object]) -> dict[str, object]:
+            return {"accepted": True, "session": {"sessionId": "S", "operation": operation}, "preview": {}}
+
+        def apply_session(self, session_id: str, expected_project_revision: object = None, selection: dict | None = None) -> dict[str, object]:
+            self.apply_session_calls += 1
+            return {
+                "accepted": True,
+                "session": {"sessionId": session_id},
+                "validation": {"accepted": True},
+                "preview": {"accepted": True, "workspaceEdit": _degraded_v2_change(source)},
+            }
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            return {"accepted": True, "ready": True, "compilerErrors": [], "compilerWarnings": []}
+
+        def status(self, refresh: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(ready=True, errors=[], project_model={"conventionalFallbackUsed": True, "warnings": []})
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_conventional_fallback=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.v2_refactor_session("inlineMethod", {"relativePath": "Demo.java"}, apply=True, validate=False)
+
+    assert result["accepted"] is False, result
+    assert result["applied"] is False, result
+    assert result["refusal"]["code"] == "degraded_model_apply_refused", result
+    # The gate runs before the sidecar apply revalidation and before any write.
+    assert fake_client.apply_session_calls == 0
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_apply_v2_refactor_session_refuses_degraded_conventional_fallback_model(tmp_path: Path, monkeypatch) -> None:
+    """G002: apply_v2_refactor_session refuses BEFORE the sidecar apply revalidation and any Python-side write on a
+    degraded (conventional fallback) project model, leaving the file untouched.
+    """
+    source = tmp_path / "Demo.java"
+    original = "class Demo { int value = 1; }\n"
+    source.write_text(original, encoding="utf-8")
+
+    class FakeClient:
+        apply_session_calls = 0
+
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": {"refactorSessions": {"level": "beta", "status": "supported"}}}
+
+        def apply_session(self, session_id: str, expected_project_revision: object = None, selection: dict | None = None) -> dict[str, object]:
+            self.apply_session_calls += 1
+            return {
+                "accepted": True,
+                "session": {"sessionId": session_id},
+                "validation": {"accepted": True},
+                "preview": {"accepted": True, "workspaceEdit": _degraded_v2_change(source)},
+            }
+
+        def validate_edit(self, overlay: dict) -> dict[str, object]:
+            return {"accepted": True, "ready": True, "compilerErrors": [], "compilerWarnings": []}
+
+        def status(self, refresh: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(ready=True, errors=[], project_model={"conventionalFallbackUsed": True, "warnings": []})
+
+    fake_client = FakeClient()
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True, allow_conventional_fallback=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: fake_client)
+
+    result = manager.apply_v2_refactor_session("S")
+
+    assert result["accepted"] is False, result
+    assert result["applied"] is False, result
+    assert result["refusal"]["code"] == "degraded_model_apply_refused", result
+    assert fake_client.apply_session_calls == 0
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_java_change_signature_tool_builds_v2_session_params(monkeypatch) -> None:
+    from serena.tools import JavaChangeSignatureTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaChangeSignatureTool, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+    def v2_refactor_session(operation, params, apply=False, validate=None):
+        recorded["operation"] = operation
+        recorded["params"] = params
+        recorded["apply"] = apply
+        recorded["validate"] = validate
+        return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+    tool.apply(
+        name_path="Demo/method",
+        relative_path="src/Demo.java",
+        new_name="renamed",
+        new_return_type="String",
+        parameters_json='[{"name":"value","type":"String","default_value":"\\"x\\""},{"name":"extra","type":"int"}]',
+        default_values_json='{"extra":"1"}',
+        line=11,
+        column=3,
+        preview=True,
+        validate=False,
+    )
+
+    assert recorded["operation"] == "changeSignature"
+    assert recorded["apply"] is False
+    assert recorded["validate"] is False
+    assert recorded["params"]["relativePath"] == "src/Demo.java"
+    assert recorded["params"]["line"] == 11 and recorded["params"]["column"] == 3
+    assert recorded["params"]["newName"] == "renamed"
+    assert recorded["params"]["newReturnType"] == "String"
+    assert "updateOverrides" not in recorded["params"]
+    assert recorded["params"]["defaultValues"] == {"extra": "1"}
+    assert recorded["params"]["parameters"] == [
+        {"name": "value", "type": "String", "default_value": '"x"', "defaultValue": '"x"'},
+        {"name": "extra", "type": "int", "defaultValue": "1"},
+    ]
+
+
+def test_java_introduce_parameter_tool_builds_v2_session_params(monkeypatch) -> None:
+    from serena.tools import JavaIntroduceParameterTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaIntroduceParameterTool, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+    def v2_refactor_session(operation, params, apply=False, validate=None):
+        recorded["operation"] = operation
+        recorded["params"] = params
+        recorded["apply"] = apply
+        recorded["validate"] = validate
+        return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+    tool.apply(
+        name_path="Demo/method",
+        relative_path="src/Demo.java",
+        parameter_name="prefix",
+        selection_start_line=6,
+        selection_start_column=16,
+        selection_end_line=6,
+        selection_end_column=24,
+        preview=True,
+        validate=False,
+    )
+
+    assert recorded["operation"] == "introduceParameter"
+    assert recorded["apply"] is False
+    assert recorded["validate"] is False
+    assert recorded["params"]["relativePath"] == "src/Demo.java"
+    assert recorded["params"]["line"] == 5 and recorded["params"]["column"] == 9
+    assert recorded["params"]["selectedExpression"] is None
+    assert recorded["params"]["selection"] == {"startLine": 6, "startColumn": 16, "endLine": 6, "endColumn": 24}
+    assert recorded["params"]["parameterName"] == "prefix"
+    assert recorded["params"]["parameterType"] is None
+    # G003: the side-effect opt-in defaults to False and is always forwarded to the sidecar as allowSideEffects.
+    assert recorded["params"]["allowSideEffects"] is False
+
+
+def test_java_explicit_session_tools_call_manager(monkeypatch) -> None:
+    from serena.tools import (
+        JavaApplyRefactorSessionTool,
+        JavaCancelRefactorSessionTool,
+        JavaCreateRefactorSessionTool,
+        JavaGetRefactorSessionEditTool,
+    )
+
+    recorded: dict = {}
+
+    create_tool = _make_java_tool(JavaCreateRefactorSessionTool, recorded, monkeypatch, SimpleNamespace())
+
+    def create_v2_refactor_session(operation, params, validate=None):
+        recorded["create"] = (operation, params, validate)
+        return {"accepted": True}
+
+    create_tool.create_java_refactor_client().create_v2_refactor_session = create_v2_refactor_session
+    create_tool.apply(operation="changeSignature", params_json='{"relativePath":"src/Demo.java"}', validate=False)
+    assert recorded["create"] == ("changeSignature", {"relativePath": "src/Demo.java"}, False)
+
+    get_tool = _make_java_tool(JavaGetRefactorSessionEditTool, recorded, monkeypatch, SimpleNamespace())
+
+    def get_v2_refactor_session_edit(session_id, validate=None, edit_format=None, selection=None):
+        recorded["get"] = (session_id, validate, edit_format, selection)
+        return {"accepted": True}
+
+    get_tool.create_java_refactor_client().get_v2_refactor_session_edit = get_v2_refactor_session_edit
+    get_tool.apply(session_id="S1", validate=True, format="workspaceEdit", selection_json='{"files":["src/Demo.java"]}')
+    assert recorded["get"] == ("S1", True, "workspaceEdit", {"files": ["src/Demo.java"]})
+
+    apply_tool = _make_java_tool(JavaApplyRefactorSessionTool, recorded, monkeypatch, SimpleNamespace())
+
+    def apply_v2_refactor_session(session_id, validate=None, expected_project_revision=None, selection=None):
+        recorded["apply"] = (session_id, validate, expected_project_revision, selection)
+        return {"accepted": True, "applied": False}
+
+    apply_tool.create_java_refactor_client().apply_v2_refactor_session = apply_v2_refactor_session
+    apply_tool.apply(
+        session_id="S1", validate=False, expected_project_revision="rev-123", selection_json='{"files":["src/Demo.java"]}'
+    )
+    assert recorded["apply"] == ("S1", False, "rev-123", {"files": ["src/Demo.java"]})
+
+    cancel_tool = _make_java_tool(JavaCancelRefactorSessionTool, recorded, monkeypatch, SimpleNamespace())
+
+    def cancel_v2_refactor_session(session_id):
+        recorded["cancel"] = session_id
+        return {"accepted": True}
+
+    cancel_tool.create_java_refactor_client().cancel_v2_refactor_session = cancel_v2_refactor_session
+    cancel_tool.apply(session_id="S1")
+    assert recorded["cancel"] == "S1"
+
+
+# --- HB-1: high-level V2 operation tools are preview/session-only (no one-shot apply) ---------------------------------
+
+# (tool import name, apply kwargs that reach _session_refactor) for every high-level V2 operation tool.
+_HB1_V2_OPERATION_TOOLS = [
+    ("JavaInlineMethodTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java"}),
+    ("JavaChangeSignatureTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "new_name": "renamed"}),
+    ("JavaIntroduceParameterTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "parameter_name": "p"}),
+    ("JavaMoveStaticMemberTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "target_type": "x.Y"}),
+    ("JavaMoveInstanceMethodTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "target_parameter_name": "p"}),
+    ("JavaPullUpMemberTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "target_supertype": "x.Base"}),
+    ("JavaPushDownMemberTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "target_subtypes_json": '["x.Sub"]'}),
+    (
+        "JavaExtractMethodTool",
+        {
+            "relative_path": "src/Demo.java",
+            "start_line": 2,
+            "start_col": 1,
+            "end_line": 3,
+            "end_col": 1,
+            "new_method_name": "extracted",
+        },
+    ),
+    ("JavaExtractInterfaceTool", {"name_path": "Demo", "relative_path": "src/Demo.java", "interface_name": "IDemo"}),
+    ("JavaIntroduceFieldTool", {"name_path": "Demo/m", "relative_path": "src/Demo.java", "field_name": "f", "field_type": "int"}),
+    ("JavaEncapsulateFieldTool", {"name_path": "Demo/field", "relative_path": "src/Demo.java"}),
+]
+
+
+def _hb1_make_tool(tool_name, monkeypatch):
+    """Builds a V2 operation tool wired to a recording ``v2_refactor_session`` stub that honors the apply flag."""
+    import serena.tools as tools_module
+
+    tool_cls = getattr(tools_module, tool_name)
+    recorded: dict = {}
+    tool = _make_java_tool(tool_cls, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+    calls: dict = {}
+
+    def v2_refactor_session(operation, params, apply=False, validate=None):
+        calls["operation"] = operation
+        calls["apply"] = apply
+        # Mirror the manager contract: a one-shot apply (apply=True) returns an applied envelope; a preview returns a
+        # revision-guarded preview session carrying a concrete sessionId.
+        return {
+            "accepted": True,
+            "applied": bool(apply),
+            "mode": "apply" if apply else "preview",
+            "operation": operation,
+            "session": {"sessionId": "S-hb1"},
+            "preview": {"workspaceEdit": {"changes": []}},
+        }
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    return tool, calls
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _HB1_V2_OPERATION_TOOLS, ids=[t[0] for t in _HB1_V2_OPERATION_TOOLS])
+def test_g001_v2_operation_tool_honors_preview_false_one_shot_apply(tool_name, kwargs, monkeypatch) -> None:
+    """G001: an explicit preview=False applies through the manager's transactional session apply path."""
+    tool, calls = _hb1_make_tool(tool_name, monkeypatch)
+
+    result = json.loads(tool.apply(preview=False, **kwargs))
+
+    # preview=False now reaches the manager with apply=True (the transactional create -> revalidate -> commit path).
+    assert calls["apply"] is True, f"{tool_name} did not honor preview=False (manager not asked to apply)"
+    assert result["applied"] is True
+    # The legacy refusal annotation is gone: the tool no longer redirects to the explicit session-apply tool.
+    assert "oneShotApplyRefused" not in result
+
+
+@pytest.mark.parametrize("tool_name,kwargs", _HB1_V2_OPERATION_TOOLS, ids=[t[0] for t in _HB1_V2_OPERATION_TOOLS])
+def test_hb1_v2_operation_tool_preview_is_default_and_unannotated(tool_name, kwargs, monkeypatch) -> None:
+    """HB-1: preview (omitted or True) never mutates and is not flagged as a refused one-shot apply."""
+    for preview_value in (None, True):
+        tool, calls = _hb1_make_tool(tool_name, monkeypatch)
+        call_kwargs = dict(kwargs)
+        if preview_value is not None:
+            call_kwargs["preview"] = preview_value
+        result = json.loads(tool.apply(**call_kwargs))
+        assert calls["apply"] is False
+        assert result["accepted"] is True
+        assert result["applied"] is False
+        assert "oneShotApplyRefused" not in result
+        assert result["session"]["sessionId"] == "S-hb1"
+
+
+def test_g001_change_signature_tool_preview_false_applies_to_disk(tmp_path, monkeypatch) -> None:
+    """G001 end-to-end: a high-level V2 tool with preview=False applies the planned edit to disk through the manager's
+    transactional create -> revalidate -> stage -> commit -> post-validate pipeline (no one-shot-apply refusal).
+    """
+    from serena.config.serena_config import JavaRefactorConfig, LanguageBackend
+    from serena.java_refactor.manager import JavaRefactorManager
+    from serena.java_refactor.workspace_edit import sha256_bytes
+    from serena.tools import JavaChangeSignatureTool
+    from solidlsp.ls_config import Language
+
+    source = tmp_path / "App.java"
+    source.write_text("class App { int value = 1; }\n", encoding="utf-8")
+
+    def workspace_edit() -> dict:
+        # A one-file REPLACE (`value` -> `total`) in the Serena workspace-edit shape the sidecar returns. The planner is
+        # faked here; this test pins the apply WIRING, i.e. that preview=False drives a real commit to disk.
+        return {
+            "changes": [
+                {
+                    "path": "App.java",
+                    "oldSha256": sha256_bytes(source.read_bytes()),
+                    "edits": [{"startOffset": 16, "endOffset": 21, "newText": "total", "kind": "REPLACE"}],
+                }
+            ],
+            "fileOperations": [],
+            "warnings": [],
+            "preconditions": [],
+            "stats": {"editCount": 1, "fileOperationCount": 0},
+        }
+
+    class FakeClient:
+        def capabilities(self) -> dict:
+            return {
+                "capabilities": {"changeSignature": "beta"},
+                "capabilityDetails": {"changeSignature": {"level": "beta", "status": "supported"}},
+            }
+
+        def create_session(self, operation: str, params: dict) -> dict:
+            return {
+                "accepted": True,
+                "session": {"sessionId": "S1", "operation": operation, "touchedFiles": ["App.java"]},
+                "preview": {"accepted": True, "workspaceEdit": workspace_edit()},
+            }
+
+        def apply_session(self, session_id: str, expected_project_revision=None, selection=None) -> dict:
+            return {
+                "accepted": True,
+                "session": {"sessionId": session_id, "operation": "changeSignature"},
+                "validation": {"accepted": True},
+                "preview": {"accepted": True, "workspaceEdit": workspace_edit()},
+            }
+
+        def validate_edit(self, overlay: dict) -> dict:
+            return {"accepted": True, "ready": True, "compilerErrors": [], "compilerWarnings": []}
+
+        def status(self, refresh: bool = False) -> SimpleNamespace:
+            return SimpleNamespace(ready=True, errors=[], project_model={"conventionalFallbackUsed": False, "warnings": []})
+
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: FakeClient())
+
+    project = SimpleNamespace(
+        project_root=str(tmp_path),
+        project_config=SimpleNamespace(java_refactor=JavaRefactorConfig(enabled=True)),
+    )
+    agent = SimpleNamespace(
+        get_active_project_or_raise=lambda: project,
+        get_language_server_manager=lambda: None,
+        get_language_backend=lambda: LanguageBackend.LSP,
+    )
+    tool = object.__new__(JavaChangeSignatureTool)
+    tool.agent = agent  # type: ignore[attr-defined]
+    monkeypatch.setattr(tool, "create_java_refactor_client", lambda: manager, raising=False)
+
+    result = json.loads(tool.apply(relative_path="App.java", line=1, column=17, new_name="x", preview=False))
+
+    # preview=False applied the edit end-to-end; the legacy refusal is gone and disk reflects the committed change.
+    assert "oneShotApplyRefused" not in result
+    assert result["applied"] is True, result
+    assert result.get("refusal") is None, result
+    assert source.read_text(encoding="utf-8") == "class App { int total = 1; }\n"
+
+
+def test_java_inline_method_tool_defaults_to_preserving_declaration(monkeypatch) -> None:
+    from serena.tools import JavaInlineMethodTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaInlineMethodTool, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+    def v2_refactor_session(operation, params, apply=False, validate=None):
+        recorded["operation"] = operation
+        recorded["params"] = params
+        recorded["apply"] = apply
+        recorded["validate"] = validate
+        return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+    tool.apply(name_path="Demo/helper", relative_path="src/Demo.java", method_name="helper", preview=True, validate=False)
+
+    assert recorded["operation"] == "inlineMethod"
+    assert recorded["apply"] is False
+    assert recorded["validate"] is False
+    assert recorded["params"]["methodName"] == "helper"
+    assert recorded["params"]["deleteMethod"] is False
+
+
+def test_java_extract_method_tool_builds_selection_session_params(monkeypatch) -> None:
+    from serena.tools import JavaExtractMethodTool
+
+    recorded: dict = {}
+    tool = _make_java_tool(JavaExtractMethodTool, recorded, monkeypatch, SimpleNamespace())
+
+    def v2_refactor_session(operation, params, apply=False, validate=None):
+        recorded["operation"] = operation
+        recorded["params"] = params
+        recorded["apply"] = apply
+        return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+    tool.apply(
+        relative_path="src/Demo.java",
+        start_line=3,
+        start_col=9,
+        end_line=5,
+        end_col=10,
+        new_method_name="extracted",
+        make_static=True,
+        preview=True,
+    )
+
+    assert recorded["operation"] == "extractMethod"
+    assert recorded["apply"] is False
+    assert recorded["params"] == {
+        "relativePath": "src/Demo.java",
+        "newMethodName": "extracted",
+        "selection": {"startLine": 3, "startColumn": 9, "endLine": 5, "endColumn": 10},
+        "visibility": None,
+        "makeStatic": True,
+    }
+
+
+def test_java_move_and_hierarchy_tools_build_v2_session_params(monkeypatch) -> None:
+    from serena.tools import (
+        JavaMoveInstanceMethodTool,
+        JavaMoveStaticMemberTool,
+        JavaPullUpMemberTool,
+        JavaPushDownMemberTool,
+    )
+
+    cases = [
+        (
+            JavaMoveStaticMemberTool,
+            "moveStaticMember",
+            {"target_type": "com.acme.Target", "new_name": "renamed"},
+            {
+                "targetType": "com.acme.Target",
+                "newName": "renamed",
+                "allowAccessWidening": False,
+            },
+        ),
+        (
+            JavaMoveInstanceMethodTool,
+            "moveInstanceMethod",
+            {"target_parameter_name": "target", "target_type": "com.acme.Target"},
+            {"targetParameter": "target", "targetType": "com.acme.Target", "keepDelegate": True},
+        ),
+        (
+            JavaPullUpMemberTool,
+            "pullUpMember",
+            {"target_supertype": "com.acme.Base", "make_abstract": True},
+            {"targetType": "com.acme.Base", "makeAbstract": True},
+        ),
+        (
+            JavaPushDownMemberTool,
+            "pushDownMember",
+            {"target_subtypes_json": '["com.acme.Child", "com.acme.OtherChild"]'},
+            {"targetTypes": ["com.acme.Child", "com.acme.OtherChild"], "removeFromSource": False},
+        ),
+    ]
+
+    for tool_cls, operation, kwargs, expected_params in cases:
+        recorded: dict = {}
+        tool = _make_java_tool(tool_cls, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+        def v2_refactor_session(operation_name, params, apply=False, validate=None, _recorded=recorded):
+            _recorded["operation"] = operation_name
+            _recorded["params"] = params
+            _recorded["apply"] = apply
+            _recorded["validate"] = validate
+            return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+        tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+        tool.apply(
+            name_path="Demo/member",
+            relative_path="src/Demo.java",
+            preview=True,
+            validate=False,
+            **kwargs,
+        )
+
+        assert recorded["operation"] == operation
+        assert recorded["apply"] is False
+        assert recorded["validate"] is False
+        assert recorded["params"]["relativePath"] == "src/Demo.java"
+        assert recorded["params"]["line"] == 5 and recorded["params"]["column"] == 9
+        for key, value in expected_params.items():
+            assert recorded["params"][key] == value
+
+
+def test_java_interface_field_tools_build_v2_session_params(monkeypatch) -> None:
+    from serena.tools import (
+        JavaEncapsulateFieldTool,
+        JavaExtractInterfaceTool,
+        JavaIntroduceFieldTool,
+    )
+
+    cases = [
+        (
+            JavaExtractInterfaceTool,
+            "extractInterface",
+            {
+                "interface_name": "Named",
+                "target_package": "com.acme.api",
+                "members_json": '[{"name":"run","kind":"method"}]',
+                "replace_usages": True,
+            },
+            {
+                "interfaceName": "Named",
+                "targetPackage": "com.acme.api",
+                "members": [{"name": "run", "kind": "method"}],
+                "replaceUsages": True,
+            },
+        ),
+        (
+            JavaIntroduceFieldTool,
+            "introduceField",
+            {
+                "field_name": "cache",
+                "field_type": "String",
+                "initializer": '"value"',
+                "selection_json": '{"startLine":2,"startColumn":4,"endLine":2,"endColumn":11}',
+                "constant": True,
+                "initialize_in_constructor": False,
+            },
+            {
+                "fieldName": "cache",
+                "fieldType": "String",
+                "initializer": '"value"',
+                "selection": {"startLine": 2, "startColumn": 4, "endLine": 2, "endColumn": 11},
+                "constant": True,
+                "initializeInConstructor": False,
+            },
+        ),
+        (
+            JavaEncapsulateFieldTool,
+            "encapsulateField",
+            {"getter_name": "getValue", "setter": False, "update_usages": False},
+            {"getterName": "getValue", "setterName": None, "setter": False, "updateReferences": False},
+        ),
+    ]
+
+    for tool_cls, operation, kwargs, expected_params in cases:
+        recorded: dict = {}
+        tool = _make_java_tool(tool_cls, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+        def v2_refactor_session(operation_name, params, apply=False, validate=None, _recorded=recorded):
+            _recorded["operation"] = operation_name
+            _recorded["params"] = params
+            _recorded["apply"] = apply
+            _recorded["validate"] = validate
+            return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+        tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+
+        tool.apply(
+            name_path="Demo/member",
+            relative_path="src/Demo.java",
+            preview=True,
+            validate=False,
+            **kwargs,
+        )
+
+        assert recorded["operation"] == operation
+        assert recorded["apply"] is False
+        assert recorded["validate"] is False
+        assert recorded["params"]["relativePath"] == "src/Demo.java"
+        assert recorded["params"]["line"] == 5 and recorded["params"]["column"] == 9
+        for key, value in expected_params.items():
+            assert recorded["params"][key] == value
+
+
 def test_create_java_refactor_client_binds_project_and_honors_lsp_resolution_config() -> None:
     from serena.java_refactor.manager import JavaRefactorManager
-    from serena.tools.java_refactor_tools import JavaRefactorStatusTool
+    from serena.tools import JavaRefactorStatusTool
 
     project = SimpleNamespace(
         project_root="/tmp/proj",
@@ -2110,18 +3532,19 @@ def test_bundled_sidecar_jar_is_included_in_built_wheel(tmp_path: Path) -> None:
     )
 
 
-def test_java_refactor_tools_visibility_gated_by_config() -> None:
-    # G012: the optional Java refactoring tools appear in the tool set only when java_refactor.enabled is true, and are
-    # excluded otherwise (config gates visibility at discovery, not just execution-time refusal).
-    from serena.agent import SerenaAgent, ToolSet
-    from serena.tools.java_refactor_tools import java_refactor_tool_names
+def test_java_refactor_tools_visibility_gated_by_config(tmp_path: Path, monkeypatch) -> None:
+    # G001: with java_refactor.enabled AND the sidecar advertising every V2 operation as supported, the full Java
+    # refactoring tool set (always-on + capability-negotiated V2 ops) is surfaced through the applied ToolSet; disabled
+    # excludes every Java refactor tool (config gates visibility at discovery, not just execution-time refusal). Per-op
+    # capability gating of the V2 subset is covered by test_tool_inclusion_registers_supported_subset_only.
+    from serena.agent import ToolSet
+    from serena.tools import java_refactor_tool_names
+    from serena.tools.java_refactor_v2_tools import java_refactor_v2_capability_tool_operations
 
     names = set(java_refactor_tool_names())
-    enabled_cfg = SimpleNamespace(java_refactor=JavaRefactorConfig(enabled=True))
-    disabled_cfg = SimpleNamespace(java_refactor=JavaRefactorConfig(enabled=False))
-
-    enabled_tools = ToolSet.default().apply(SerenaAgent._java_refactor_tool_inclusion(enabled_cfg)).get_tool_names()
-    disabled_tools = ToolSet.default().apply(SerenaAgent._java_refactor_tool_inclusion(disabled_cfg)).get_tool_names()
+    all_ops = set(java_refactor_v2_capability_tool_operations().values())
+    enabled_tools = ToolSet.default().apply(_tool_inclusion(_java_project(tmp_path, enabled=True), all_ops, monkeypatch)).get_tool_names()
+    disabled_tools = ToolSet.default().apply(_tool_inclusion(_java_project(tmp_path, enabled=False), all_ops, monkeypatch)).get_tool_names()
 
     assert names, "expected a non-empty set of Java refactor tool names"
     assert names.issubset(enabled_tools), names - enabled_tools
@@ -2134,7 +3557,7 @@ def test_java_refactor_tools_exposed_in_multi_project_context() -> None:
     # _update_active_tools could only ever make them internally active while absent from the exposed schema.
     from serena.agent import ActiveModes, SerenaAgent
     from serena.config.context_mode import SerenaAgentContext
-    from serena.tools.java_refactor_tools import java_refactor_tool_names
+    from serena.tools import java_refactor_tool_names
 
     context = SerenaAgentContext.load_default()
     context.single_project = False
@@ -2163,15 +3586,37 @@ def _write_minimal_project(parent: Path, name: str, java_refactor_enabled: bool 
     return root
 
 
+def _patch_capability_negotiation(monkeypatch, supported: set[str] | None) -> None:
+    """Forces ``_java_refactor_tool_inclusion`` to negotiate against a fake sidecar advertising ``supported`` ops.
+
+    Real-agent visibility tests must not depend on a live Java sidecar (these projects are python-only), so the
+    capability registry is stubbed deterministically; per-op gating is unit-tested in test_tool_inclusion_*.
+    """
+    import serena.java_refactor.manager as manager_module
+
+    monkeypatch.setattr(
+        manager_module,
+        "get_or_create_java_refactor_manager",
+        lambda *_, **__: _FakeCapabilityManager(supported),
+    )
+
+
+def _all_v2_operations() -> set[str]:
+    from serena.tools.java_refactor_v2_tools import java_refactor_v2_capability_tool_operations
+
+    return set(java_refactor_v2_capability_tool_operations().values())
+
+
 @pytest.mark.parametrize("enabled", [True, False])
-def test_java_refactor_tools_single_project_visibility_gated_by_config(tmp_path: Path, enabled: bool) -> None:
+def test_java_refactor_tools_single_project_visibility_gated_by_config(tmp_path: Path, enabled: bool, monkeypatch) -> None:
     # Single-project context: java_refactor.enabled gates the EXPOSED (client-visible) schema itself — the tools are
     # advertised and active only when the startup project opts in, and absent from the schema entirely otherwise.
     from serena.agent import SerenaAgent
     from serena.config.context_mode import SerenaAgentContext
-    from serena.tools.java_refactor_tools import java_refactor_tool_names
+    from serena.tools import java_refactor_tool_names
 
     root = _write_minimal_project(tmp_path, "proj", enabled)
+    _patch_capability_negotiation(monkeypatch, _all_v2_operations())
     context = SerenaAgentContext.load_default()
     context.single_project = True
     agent = SerenaAgent(project=str(root), serena_config=SerenaConfig(gui_log_window=False, web_dashboard=False), context=context)
@@ -2191,7 +3636,7 @@ def test_java_refactor_tools_single_project_visibility_gated_by_config(tmp_path:
         agent.on_shutdown(timeout=5)
 
 
-def test_java_refactor_tools_not_available_without_enabled_active_project(tmp_path: Path) -> None:
+def test_java_refactor_tools_not_available_without_enabled_active_project(tmp_path: Path, monkeypatch) -> None:
     # Multi-project / no-startup-project context: the exposed schema is a fixed superset (MCP clients get the tool
     # list once at session start, so the tools must be present there or activating an enabled project could never
     # surface them), but AVAILABILITY is config-gated in every state: not active before any activation, not active
@@ -2199,10 +3644,11 @@ def test_java_refactor_tools_not_available_without_enabled_active_project(tmp_pa
     # from an enabled to a disabled project. Calling a non-active tool is refused by Tool.apply_ex.
     from serena.agent import SerenaAgent
     from serena.config.context_mode import SerenaAgentContext
-    from serena.tools.java_refactor_tools import java_refactor_tool_names
+    from serena.tools import java_refactor_tool_names
 
     enabled_root = _write_minimal_project(tmp_path, "enabled_proj", True)
     disabled_root = _write_minimal_project(tmp_path, "disabled_proj", False)
+    _patch_capability_negotiation(monkeypatch, _all_v2_operations())
     context = SerenaAgentContext.load_default()
     context.single_project = False
     agent = SerenaAgent(project=None, serena_config=SerenaConfig(gui_log_window=False, web_dashboard=False), context=context)
@@ -2749,3 +4195,695 @@ def test_rename_baseline_scan_forwards_full_identity_for_overloaded_method(tmp_p
 
     assert result["accepted"] is True, result
     assert recorded["scan_hints"] == ("f", "method", 1)
+
+
+
+def test_java_refactor_v2_dispatch_uses_semantic_planning_model_for_all_planners():
+    main_source = (
+        Path(__file__).resolve().parents[2]
+        / "java-refactor/src/main/java/io/serena/javarefactor/protocol/Main.java"
+    ).read_text(encoding="utf-8")
+
+    assert "try (SemanticIndex ignored = SemanticIndex.open(projectModel, relativePath))" in main_source
+
+    operation_block = main_source[
+        main_source.index("    private String changeSignatureJson") : main_source.index("    private String validateEditJson")
+    ]
+    assert "discoverModel())." not in operation_block
+    assert "= discoverModel();" not in operation_block
+
+    required_dispatches = [
+        "new ChangeSignaturePlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).changeSignature",
+        "new ChangeSignaturePlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).introduceParameter",
+        "new MoveMemberPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).moveStaticMember",
+        "new MoveMemberPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).moveInstanceMethod",
+        "new PullPushMemberPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).pullUpMember",
+        "new PullPushMemberPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).pushDownMember",
+        "new ExtractMethodPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).extractMethod",
+        "new InlineMethodPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).inlineMethod",
+        "new ExtractInterfacePlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).extractInterface",
+        "new FieldRefactorPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).introduceField",
+        "new EncapsulateFieldPlanner(java.nio.file.Path.of(projectRoot), discoverSemanticPlanningModel(fields)).encapsulateField",
+        "JavaProjectModel projectModel = discoverSemanticPlanningModel(fields);",
+    ]
+    for dispatch in required_dispatches:
+        assert dispatch in operation_block
+
+def test_java_refactor_v2_module_exports_designed_tool_contracts() -> None:
+    import inspect
+
+    from serena.tools import JavaMoveInstanceMethodTool as PackageMoveInstanceMethodTool
+    from serena.tools.java_refactor_v2_tools import (
+        JavaChangeSignatureTool,
+        JavaEncapsulateFieldTool,
+        JavaExtractInterfaceTool,
+        JavaExtractMethodTool,
+        JavaMoveInstanceMethodTool,
+        JavaMoveStaticMemberTool,
+        JavaPullUpMemberTool,
+        JavaPushDownMemberTool,
+    )
+
+    assert PackageMoveInstanceMethodTool is JavaMoveInstanceMethodTool
+    assert JavaMoveInstanceMethodTool.__module__ == "serena.tools.java_refactor_v2_tools"
+
+    expected_signatures = {
+        JavaChangeSignatureTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "new_name",
+            "new_return_type",
+            "parameters_json",
+            "default_values_json",
+            "line",
+            "column",
+            "preview",
+            "validate",
+            "remove_parameters_json",
+            "confirm_public_api",
+            "return_conversion",
+            "body_return_conversion",
+        ],
+        JavaMoveStaticMemberTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "target_type",
+            "new_name",
+            "allow_access_widening",
+            "allow_security_sensitive_private_widening",
+            "preview",
+            "validate",
+        ],
+        JavaMoveInstanceMethodTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "target_parameter_name",
+            "target_field_name",
+            "target_receiver",
+            "receiver_selection_json",
+            "target_type",
+            "new_name",
+            "rewrite_call_sites",
+            "leave_delegate",
+            "allow_access_widening",
+            "allow_security_sensitive_private_widening",
+            "preview",
+            "validate",
+        ],
+        JavaPullUpMemberTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "target_supertype",
+            "make_abstract",
+            "leave_delegate",
+            "allow_access_widening",
+            "allow_security_sensitive_private_widening",
+            "confirm_serialization_impact",
+            "preview",
+            "validate",
+        ],
+        JavaPushDownMemberTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "target_subtypes_json",
+            "remove_from_source",
+            "allow_access_widening",
+            "allow_security_sensitive_private_widening",
+            "confirm_serialization_impact",
+            "include_indirect_subtypes",
+            "preview",
+            "validate",
+        ],
+        JavaExtractMethodTool: [
+            "self",
+            "relative_path",
+            "start_line",
+            "start_col",
+            "end_line",
+            "end_col",
+            "new_method_name",
+            "visibility",
+            "make_static",
+            "preview",
+            "validate",
+        ],
+        JavaExtractInterfaceTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "interface_name",
+            "target_package",
+            "members_json",
+            "replace_usages",
+            "confirm_public_api_change",
+            "preview",
+            "validate",
+        ],
+        JavaEncapsulateFieldTool: [
+            "self",
+            "name_path",
+            "relative_path",
+            "getter_name",
+            "setter_name",
+            "setter",
+            "update_usages",
+            "preview",
+            "validate",
+        ],
+    }
+    for tool_cls, expected in expected_signatures.items():
+        assert list(inspect.signature(tool_cls.apply).parameters) == expected
+
+    move_instance_defaults = inspect.signature(JavaMoveInstanceMethodTool.apply).parameters
+    assert move_instance_defaults["rewrite_call_sites"].default is True
+    assert move_instance_defaults["leave_delegate"].default is True
+    pull_up_defaults = inspect.signature(JavaPullUpMemberTool.apply).parameters
+    assert pull_up_defaults["leave_delegate"].default is False
+    push_down_defaults = inspect.signature(JavaPushDownMemberTool.apply).parameters
+    assert push_down_defaults["target_subtypes_json"].default == "[]"
+    assert push_down_defaults["remove_from_source"].default is False
+    encapsulate_defaults = inspect.signature(JavaEncapsulateFieldTool.apply).parameters
+    assert encapsulate_defaults["update_usages"].default is True
+
+
+def test_java_refactor_v2_tool_class_tuple_exports_full_public_surface() -> None:
+    from serena.tools.java_refactor_v2_tools import JAVA_REFACTOR_V2_TOOL_CLASSES
+
+    exported_names = {tool_class.__name__ for tool_class in JAVA_REFACTOR_V2_TOOL_CLASSES}
+
+    assert exported_names == {
+        "JavaApplyRefactorSessionTool",
+        "JavaCancelRefactorSessionTool",
+        "JavaChangeSignatureTool",
+        "JavaCreateRefactorSessionTool",
+        "JavaEncapsulateFieldTool",
+        "JavaExtractInterfaceTool",
+        "JavaExtractMethodTool",
+        "JavaGetRefactorSessionEditTool",
+        "JavaInlineMethodTool",
+        "JavaIntroduceFieldTool",
+        "JavaIntroduceParameterTool",
+        "JavaMoveInstanceMethodTool",
+        "JavaMoveStaticMemberTool",
+        "JavaPullUpMemberTool",
+        "JavaPushDownMemberTool",
+    }
+
+
+def test_java_refactor_v2_tools_are_registered_as_public_mcp_surface() -> None:
+    from serena.tools.tools_base import ToolRegistry
+
+    required_tools = {
+        "java_create_refactor_session": "JavaCreateRefactorSessionTool",
+        "java_get_refactor_session_edit": "JavaGetRefactorSessionEditTool",
+        "java_apply_refactor_session": "JavaApplyRefactorSessionTool",
+        "java_cancel_refactor_session": "JavaCancelRefactorSessionTool",
+        "java_change_signature": "JavaChangeSignatureTool",
+        "java_introduce_parameter": "JavaIntroduceParameterTool",
+        "java_move_static_member": "JavaMoveStaticMemberTool",
+        "java_move_instance_method": "JavaMoveInstanceMethodTool",
+        "java_pull_up_member": "JavaPullUpMemberTool",
+        "java_push_down_member": "JavaPushDownMemberTool",
+        "java_inline_method": "JavaInlineMethodTool",
+        "java_extract_method": "JavaExtractMethodTool",
+        "java_extract_interface": "JavaExtractInterfaceTool",
+        "java_introduce_field": "JavaIntroduceFieldTool",
+        "java_encapsulate_field": "JavaEncapsulateFieldTool",
+    }
+    registered_tools = ToolRegistry()._tool_dict
+
+    missing_tools = required_tools.keys() - registered_tools.keys()
+    wrong_classes = {
+        name: registered_tools[name].tool_class.__name__
+        for name, expected_class in required_tools.items()
+        if name in registered_tools and registered_tools[name].tool_class.__name__ != expected_class
+    }
+
+    assert missing_tools == set()
+    assert wrong_classes == {}
+
+
+def test_java_refactor_v2_tools_adapt_designed_names_to_session_params(monkeypatch) -> None:
+    from serena.tools.java_refactor_v2_tools import (
+        JavaEncapsulateFieldTool,
+        JavaMoveInstanceMethodTool,
+        JavaPullUpMemberTool,
+        JavaPushDownMemberTool,
+    )
+
+    captured: list[dict] = []
+
+    def capture_session(self, operation, relative_path, name_path, line, column, preview, validate, params):
+        captured.append(
+            {
+                "operation": operation,
+                "relative_path": relative_path,
+                "name_path": name_path,
+                "line": line,
+                "column": column,
+                "preview": preview,
+                "validate": validate,
+                "params": params,
+            }
+        )
+        return '{"accepted": false, "refusal": {"code": "stub", "message": "stub"}}'
+
+    monkeypatch.setattr("serena.tools.java_refactor_tools._JavaRefactorToolBase._session_refactor", capture_session)
+
+    object.__new__(JavaMoveInstanceMethodTool).apply(
+        name_path="Demo/moveMe",
+        relative_path="src/Demo.java",
+        target_parameter_name="target",
+        new_name="moved",
+        rewrite_call_sites=False,
+        leave_delegate=False,
+        preview=False,
+        validate=False,
+    )
+    object.__new__(JavaPullUpMemberTool).apply(
+        name_path="Demo/member",
+        relative_path="src/Demo.java",
+        target_supertype="com.acme.Base",
+    )
+    object.__new__(JavaPushDownMemberTool).apply(
+        name_path="Demo/member",
+        relative_path="src/Demo.java",
+        target_subtypes_json='["com.acme.Child"]',
+    )
+    object.__new__(JavaEncapsulateFieldTool).apply(
+        name_path="Demo/field",
+        relative_path="src/Demo.java",
+        update_usages=False,
+    )
+
+    assert captured[0]["operation"] == "moveInstanceMethod"
+    assert captured[0]["preview"] is False
+    assert captured[0]["validate"] is False
+    assert captured[0]["params"] == {
+        "targetParameter": "target",
+        "newName": "moved",
+        "rewriteCallSites": False,
+        "leaveDelegate": False,
+        "keepDelegate": False,
+        "allowAccessWidening": False,
+        "allowSecuritySensitivePrivateWidening": False,
+    }
+    assert captured[1]["params"] == {
+        "targetSupertype": "com.acme.Base",
+        "targetType": "com.acme.Base",
+        "makeAbstract": False,
+        "leaveDelegate": False,
+        "allowAccessWidening": False,
+        "allowSecuritySensitivePrivateWidening": False,
+        "confirmSerializationImpact": False,
+    }
+    assert captured[2]["params"] == {
+        "targetSubtypes": ["com.acme.Child"],
+        "targetTypes": ["com.acme.Child"],
+        "removeFromSource": False,
+        "allowAccessWidening": False,
+        "allowSecuritySensitivePrivateWidening": False,
+        "confirmSerializationImpact": False,
+        "includeIndirectSubtypes": False,
+    }
+    assert captured[3]["params"] == {
+        "getterName": None,
+        "setterName": None,
+        "setter": True,
+        "updateUsages": False,
+        "updateReferences": False,
+    }
+
+
+def test_java_introduce_field_forwards_constructor_strategy(monkeypatch):
+    from serena.tools.java_refactor_v2_tools import JavaIntroduceFieldTool
+
+    captured = []
+
+    def capture_session(self, operation, relative_path, name_path, line, column, preview, validate, params):
+        captured.append(
+            {
+                "operation": operation,
+                "relative_path": relative_path,
+                "name_path": name_path,
+                "preview": preview,
+                "validate": validate,
+                "params": params,
+            }
+        )
+        return '{"accepted": true}'
+
+    monkeypatch.setattr("serena.tools.java_refactor_tools._JavaRefactorToolBase._session_refactor", capture_session)
+
+    object.__new__(JavaIntroduceFieldTool).apply(
+        name_path="Demo/read",
+        relative_path="src/Demo.java",
+        field_name="label",
+        field_type="String",
+        initializer='"value"',
+        initialize_in_constructor=True,
+        constructor_strategy="allTerminal",
+        preview=True,
+        validate=True,
+    )
+
+    assert captured == [
+        {
+            "operation": "introduceField",
+            "relative_path": "src/Demo.java",
+            "name_path": "Demo/read",
+            "preview": True,
+            "validate": True,
+            "params": {
+                "fieldName": "label",
+                "fieldType": "String",
+                "initializer": '"value"',
+                "selection": None,
+                "constant": False,
+                "initializeInConstructor": True,
+                "constructorStrategy": "allTerminal",
+            },
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# G005 — hard-gate parameter threading tests
+# ---------------------------------------------------------------------------
+
+
+def _make_v2_tool_with_recorder(tool_cls, monkeypatch):
+    """Build a V2 tool wired to a recording v2_refactor_session stub."""
+    recorded: dict = {}
+    tool = _make_java_tool(tool_cls, recorded, monkeypatch, SimpleNamespace(line=4, column=8))
+
+    def v2_refactor_session(operation_name, params, apply=False, validate=None):
+        recorded["operation"] = operation_name
+        recorded["params"] = params
+        return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
+
+    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    return tool, recorded
+
+
+def test_change_signature_tool_threads_remove_parameters(monkeypatch) -> None:
+    from serena.tools import JavaChangeSignatureTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaChangeSignatureTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/bar",
+        remove_parameters_json='["x"]',
+    )
+    assert recorded["params"].get("removeParameters") == ["x"]
+
+
+def test_change_signature_tool_threads_confirm_public_api(monkeypatch) -> None:
+    from serena.tools import JavaChangeSignatureTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaChangeSignatureTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/bar",
+        confirm_public_api=True,
+    )
+    assert recorded["params"].get("confirmPublicApi") is True
+
+
+def test_change_signature_tool_threads_return_conversion(monkeypatch) -> None:
+    from serena.tools import JavaChangeSignatureTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaChangeSignatureTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/bar",
+        return_conversion="(int) $return",
+    )
+    assert recorded["params"].get("returnConversion") == "(int) $return"
+
+
+def test_move_static_member_tool_threads_security_widening(monkeypatch) -> None:
+    from serena.tools import JavaMoveStaticMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaMoveStaticMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/CONSTANT",
+        target_type="com.acme.Other",
+        allow_security_sensitive_private_widening=True,
+    )
+    assert recorded["params"].get("allowSecuritySensitivePrivateWidening") is True
+
+
+def test_move_instance_method_tool_threads_access_widening(monkeypatch) -> None:
+    from serena.tools import JavaMoveInstanceMethodTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaMoveInstanceMethodTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/process",
+        allow_access_widening=True,
+    )
+    assert recorded["params"].get("allowAccessWidening") is True
+
+
+def test_move_instance_method_tool_threads_security_widening(monkeypatch) -> None:
+    from serena.tools import JavaMoveInstanceMethodTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaMoveInstanceMethodTool, monkeypatch)
+    tool.apply(
+        relative_path="Foo.java",
+        name_path="Foo/process",
+        allow_security_sensitive_private_widening=True,
+    )
+    assert recorded["params"].get("allowSecuritySensitivePrivateWidening") is True
+
+
+def test_pull_up_member_tool_threads_access_widening(monkeypatch) -> None:
+    from serena.tools import JavaPullUpMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaPullUpMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Child.java",
+        name_path="Child/method",
+        target_supertype="com.acme.Base",
+        allow_access_widening=True,
+    )
+    assert recorded["params"].get("allowAccessWidening") is True
+
+
+def test_pull_up_member_tool_threads_security_widening(monkeypatch) -> None:
+    from serena.tools import JavaPullUpMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaPullUpMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Child.java",
+        name_path="Child/method",
+        target_supertype="com.acme.Base",
+        allow_security_sensitive_private_widening=True,
+    )
+    assert recorded["params"].get("allowSecuritySensitivePrivateWidening") is True
+
+
+def test_pull_up_member_tool_threads_serialization_impact(monkeypatch) -> None:
+    from serena.tools import JavaPullUpMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaPullUpMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Child.java",
+        name_path="Child/field",
+        target_supertype="com.acme.Base",
+        confirm_serialization_impact=True,
+    )
+    assert recorded["params"].get("confirmSerializationImpact") is True
+
+
+def test_push_down_member_tool_threads_indirect_subtypes(monkeypatch) -> None:
+    from serena.tools import JavaPushDownMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaPushDownMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Base.java",
+        name_path="Base/field",
+        include_indirect_subtypes=True,
+    )
+    assert recorded["params"].get("includeIndirectSubtypes") is True
+
+
+def test_push_down_member_tool_threads_serialization_impact(monkeypatch) -> None:
+    from serena.tools import JavaPushDownMemberTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaPushDownMemberTool, monkeypatch)
+    tool.apply(
+        relative_path="Base.java",
+        name_path="Base/field",
+        confirm_serialization_impact=True,
+    )
+    assert recorded["params"].get("confirmSerializationImpact") is True
+
+
+def test_extract_interface_tool_threads_confirm_public_api_change(monkeypatch) -> None:
+    from serena.tools import JavaExtractInterfaceTool
+
+    tool, recorded = _make_v2_tool_with_recorder(JavaExtractInterfaceTool, monkeypatch)
+    tool.apply(
+        relative_path="Service.java",
+        name_path="Service",
+        interface_name="IService",
+        replace_usages=True,
+        confirm_public_api_change=True,
+    )
+    assert recorded["params"].get("confirmPublicApiChange") is True
+
+
+# --- G001: capability-aware V2 tool registration -------------------------------------------------
+
+
+class _CapabilityFakeClient:
+    def __init__(self, registry: dict[str, object]) -> None:
+        self._registry = registry
+
+    def capabilities(self) -> dict[str, object]:
+        return {"capabilities": self._registry}
+
+
+def _capability_manager(tmp_path: Path, monkeypatch, client_or_error) -> JavaRefactorManager:
+    manager = JavaRefactorManager(
+        str(tmp_path),
+        LanguageBackend.LSP,
+        [Language.JAVA],
+        java_refactor_config=JavaRefactorConfig(enabled=True),
+    )
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda *_, **__: None)
+
+    def _start(*_, **__):
+        if isinstance(client_or_error, Exception):
+            raise client_or_error
+        return client_or_error
+
+    monkeypatch.setattr(manager, "_get_or_start_client", _start)
+    return manager
+
+
+def test_supported_v2_operations_returns_supported_subset(tmp_path: Path, monkeypatch) -> None:
+    client = _CapabilityFakeClient(
+        {
+            "changeSignature": {"level": "beta", "status": "supported"},
+            "extractMethod": {"level": "experimental", "status": "preview"},
+            "inlineMethod": {"level": "stable", "status": "supported"},
+            "refactorSessions": {"level": "beta", "status": "supported"},
+        }
+    )
+    manager = _capability_manager(tmp_path, monkeypatch, client)
+
+    supported = manager.supported_v2_operations()
+
+    assert supported == {"changeSignature", "inlineMethod"}
+
+
+def test_supported_v2_operations_returns_none_on_sidecar_startup_failure(tmp_path: Path, monkeypatch) -> None:
+    manager = _capability_manager(tmp_path, monkeypatch, JavaRefactorRuntimeError("sidecar would not start"))
+
+    assert manager.supported_v2_operations() is None
+    assert manager._initialization_error is not None
+
+
+def test_supported_v2_operations_returns_none_on_malformed_registry(tmp_path: Path, monkeypatch) -> None:
+    class _MalformedClient:
+        def capabilities(self) -> dict[str, object]:
+            return {"capabilities": "not-a-mapping"}
+
+    manager = _capability_manager(tmp_path, monkeypatch, _MalformedClient())
+
+    assert manager.supported_v2_operations() is None
+
+
+class _FakeCapabilityManager:
+    def __init__(self, supported: set[str] | None) -> None:
+        self._supported = supported
+
+    def supported_v2_operations(self) -> set[str] | None:
+        return self._supported
+
+
+def _java_project(tmp_path: Path, *, enabled: bool) -> Project:
+    project_config = ProjectConfig(
+        project_name="java-test",
+        languages=[Language.JAVA],
+        java_refactor=JavaRefactorConfig(enabled=enabled),
+    )
+    return Project(
+        project_root=str(tmp_path),
+        project_config=project_config,
+        serena_config=SerenaConfig(gui_log_window=False, web_dashboard=False),
+    )
+
+
+def _tool_inclusion(project: Project | None, supported: set[str] | None, monkeypatch):
+    import serena.java_refactor.manager as manager_module
+    from serena.agent import SerenaAgent
+
+    monkeypatch.setattr(
+        manager_module,
+        "get_or_create_java_refactor_manager",
+        lambda *_, **__: _FakeCapabilityManager(supported),
+    )
+    return SerenaAgent._java_refactor_tool_inclusion(project, LanguageBackend.LSP)
+
+
+def test_tool_inclusion_registers_supported_subset_only(tmp_path: Path, monkeypatch) -> None:
+    project = _java_project(tmp_path, enabled=True)
+    inclusion = _tool_inclusion(project, {"changeSignature", "inlineMethod"}, monkeypatch)
+    included = set(inclusion.included_optional_tools)
+    excluded = set(inclusion.excluded_tools)
+
+    # supported V2 op tools registered
+    assert "java_change_signature" in included
+    assert "java_inline_method" in included
+    # unsupported V2 op tool NOT registered (and explicitly excluded)
+    assert "java_extract_method" not in included
+    assert "java_extract_method" in excluded
+    # always-on tools (status/debug, session lifecycle) always present
+    assert "java_refactor_status" in included
+    assert "java_create_refactor_session" in included
+    assert included.isdisjoint(excluded)
+
+
+def test_tool_inclusion_disables_all_v2_ops_when_capabilities_unavailable(tmp_path: Path, monkeypatch) -> None:
+    project = _java_project(tmp_path, enabled=True)
+    inclusion = _tool_inclusion(project, None, monkeypatch)
+    included = set(inclusion.included_optional_tools)
+    excluded = set(inclusion.excluded_tools)
+
+    # no V2 operation tools registered when the sidecar capability registry is unavailable
+    for v2_op in (
+        "java_change_signature",
+        "java_inline_method",
+        "java_extract_method",
+        "java_encapsulate_field",
+    ):
+        assert v2_op not in included
+        assert v2_op in excluded
+    # status/debug tool remains reachable for diagnosis
+    assert "java_refactor_status" in included
+
+
+def test_tool_inclusion_excludes_everything_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    project = _java_project(tmp_path, enabled=False)
+    inclusion = _tool_inclusion(project, {"changeSignature"}, monkeypatch)
+
+    assert not inclusion.included_optional_tools
+    assert "java_change_signature" in set(inclusion.excluded_tools)
+    assert "java_refactor_status" in set(inclusion.excluded_tools)
+
+
+def test_tool_inclusion_excludes_everything_without_active_project(tmp_path: Path, monkeypatch) -> None:
+    inclusion = _tool_inclusion(None, {"changeSignature"}, monkeypatch)
+
+    assert not inclusion.included_optional_tools
+    assert "java_change_signature" in set(inclusion.excluded_tools)

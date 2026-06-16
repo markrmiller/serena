@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Self, TypeVar, get_args, get_origin
 
 import yaml
 from ruamel.yaml.comments import CommentedMap
@@ -249,6 +249,418 @@ class LineEnding(Enum):
             raise ValueError(f"Invalid line_ending: {value!r}. Valid values are: {valid}") from e
 
 
+def _is_optional_str_type(field_type: Any) -> bool:
+    """Whether a dataclass field's declared type is ``str | None`` (equivalently ``Optional[str]``).
+
+    Handles both the runtime union object (``types.UnionType`` from ``str | None`` or ``typing.Union[str, None]``) and the
+    stringized annotation forms produced under ``from __future__ import annotations``.
+    """
+    if isinstance(field_type, str):
+        normalized = field_type.replace(" ", "")
+        return normalized in {"str|None", "None|str", "Optional[str]", "typing.Optional[str]", "Union[str,None]"}
+    args = get_args(field_type)
+    return bool(args) and set(args) == {str, type(None)}
+
+
+def _is_str_list_type(field_type: Any) -> bool:
+    """Whether a dataclass field's declared type is ``list[str]`` (handles both the runtime ``list[str]`` object and the
+    stringized annotation form)."""
+    if isinstance(field_type, str):
+        return field_type.replace(" ", "") in {"list[str]", "List[str]", "typing.List[str]"}
+    return get_origin(field_type) is list and get_args(field_type) == (str,)
+
+
+def _validated_from_dict(cls: type[T], data: "dict[str, Any] | None", *, domain: str) -> T:
+    """Builds a typed V2 sub-config dataclass from a mapping, rejecting unknown keys and wrong-typed values.
+
+    Shared helper for the ``JavaRefactorV2Config`` family. It enumerates the dataclass field names (via
+    ``dataclasses.fields``), rejects any key not declared on the dataclass with a clear ``ValueError`` naming the
+    offending ``domain``, and coerces/validates each value against the declared field default's runtime type
+    (``bool``/``int``/``str``). Nested dataclass fields are recursed into via their own ``from_dict``. Missing keys fall
+    back to the authoritative dataclass defaults. ``data`` of ``None`` yields all defaults.
+    """
+    if data is None:
+        return cls()  # type: ignore[call-arg]
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid {domain} v2 config value {data!r}; expected a mapping of settings.")
+    fields_by_name = {f.name: f for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
+    unknown = [key for key in data if key not in fields_by_name]
+    if unknown:
+        raise ValueError(
+            f"Unknown {domain} v2 config key(s): {sorted(unknown)}; expected one of {sorted(fields_by_name)}."
+        )
+    kwargs: dict[str, Any] = {}
+    for name, value in data.items():
+        field_def = fields_by_name[name]
+        field_type = field_def.type
+        nested_cls = _V2_NESTED_DATACLASSES.get((cls, name))
+        if nested_cls is not None:
+            kwargs[name] = nested_cls.from_dict(value)
+            continue
+        if field_type is bool or field_type == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"Invalid {domain}.{name} value {value!r}; expected a boolean.")
+        elif field_type is int or field_type == "int":
+            # bool is a subclass of int; reject it so a stray ``true`` is not accepted as ``1``.
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Invalid {domain}.{name} value {value!r}; expected a positive integer.")
+        elif field_type is str or field_type == "str":
+            if not isinstance(value, str):
+                raise ValueError(f"Invalid {domain}.{name} value {value!r}; expected a string.")
+        elif _is_optional_str_type(field_type):
+            # Optional-string fields accept either a string or None; any other type is rejected.
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Invalid {domain}.{name} value {value!r}; expected a string or null.")
+        elif _is_str_list_type(field_type):
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"Invalid {domain}.{name} value {value!r}; expected a list of strings.")
+        kwargs[name] = value
+    return cls(**kwargs)  # type: ignore[call-arg]
+
+
+@dataclass
+class V2SessionsConfig:
+    """Preview-session lifecycle limits (design §20)."""
+
+    max_open_sessions: int = 16
+    session_ttl_minutes: int = 30
+    require_revision_match_on_apply: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2SessionsConfig":
+        config = _validated_from_dict(cls, data, domain="sessions")
+        # G003: the apply-time stale-revision guard is non-bypassable by design (the sidecar enforces it
+        # unconditionally). Reject an explicit opt-out at config-load instead of accepting a value that cannot
+        # affect behavior.
+        if not config.require_revision_match_on_apply:
+            raise ValueError(
+                "sessions.require_revision_match_on_apply:false is not supported; the apply-time stale-revision "
+                "guard is non-bypassable. Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class V2ChangeSignatureConfig:
+    """Change-signature operation defaults (design §20)."""
+
+    enabled: bool = True
+    allow_public_api_change: bool = False
+    allow_removed_side_effecting_arguments: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2ChangeSignatureConfig":
+        return _validated_from_dict(cls, data, domain="change_signature")
+
+
+@dataclass
+class V2MoveMemberConfig:
+    """Move-member operation defaults (design §20)."""
+
+    enabled: bool = True
+    allow_access_widening: bool = False
+    leave_delegate_default: bool = True
+    rewrite_call_sites_default: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2MoveMemberConfig":
+        return _validated_from_dict(cls, data, domain="move_member")
+
+
+@dataclass
+class V2HierarchyConfig:
+    """Pull-up/push-down hierarchy operation defaults (design §20)."""
+
+    enabled: bool = True
+    allow_public_api_change: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2HierarchyConfig":
+        return _validated_from_dict(cls, data, domain="hierarchy")
+
+
+@dataclass
+class V2ExtractMethodConfig:
+    """Extract-method operation defaults (design §20).
+
+    ``allow_multiple_outputs`` and ``allow_control_flow_exits`` are reserved for a future V3 plan and are NOT honored
+    in V2: V2 extract method supports only zero/one-output complete-statement selections and expression extraction.
+    The keys remain in the schema so a V2 config that explicitly pins them to ``false`` round-trips, but pinning either
+    to ``true`` is rejected rather than silently ignored (which would falsely imply the opt-in works).
+    """
+
+    enabled: bool = True
+    allow_multiple_outputs: bool = False
+    allow_control_flow_exits: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2ExtractMethodConfig":
+        config = _validated_from_dict(cls, data, domain="extract_method")
+        # G006: V2 extract method is single-output and refuses non-local control-flow exits; the multi-output and
+        # control-flow-exit behaviors are V3 scope and hardwired off in the sidecar. Reject an attempt to enable them
+        # rather than accept a no-op that implies the opt-in works.
+        if config.allow_multiple_outputs:
+            raise ValueError(
+                "extract_method.allow_multiple_outputs:true is not supported; V2 extract method is single-output. "
+                "Multi-output extraction is reserved for a future V3 plan. Remove the key or set it to false."
+            )
+        if config.allow_control_flow_exits:
+            raise ValueError(
+                "extract_method.allow_control_flow_exits:true is not supported; V2 extract method refuses selections "
+                "with non-local return/break/continue. Control-flow-exit extraction is reserved for a future V3 plan. "
+                "Remove the key or set it to false."
+            )
+        return config
+
+
+@dataclass
+class V2ExtractInterfaceConfig:
+    """Extract-interface operation defaults (design §20)."""
+
+    enabled: bool = True
+    replace_usages_default: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2ExtractInterfaceConfig":
+        return _validated_from_dict(cls, data, domain="extract_interface")
+
+
+@dataclass
+class V2EncapsulateFieldConfig:
+    """Encapsulate-field operation defaults (design §20)."""
+
+    enabled: bool = True
+    rewrite_internal_usages_default: bool = False
+    refuse_compound_assignments: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2EncapsulateFieldConfig":
+        return _validated_from_dict(cls, data, domain="encapsulate_field")
+
+
+@dataclass
+class V2InlineMethodConfig:
+    """Inline-method operation defaults (design §20)."""
+
+    enabled: bool = True
+    max_call_sites: int = 100
+    delete_inlined_method_default: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2InlineMethodConfig":
+        return _validated_from_dict(cls, data, domain="inline_method")
+
+
+@dataclass
+class V2DiagnosticsConfig:
+    """Diagnostic-delta reporting controls (design §20 diagnostics block)."""
+
+    enabled: bool = True
+    report_delta: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2DiagnosticsConfig":
+        config = _validated_from_dict(cls, data, domain="diagnostics")
+        # G006: the sidecar always runs javac validation and always emits the before/after diagnostic delta — neither
+        # can be turned off (a disabled value would silently weaken the safety report). Reject the opt-out rather than
+        # accept a no-op.
+        if not config.enabled:
+            raise ValueError(
+                "diagnostics.enabled:false is not supported; compiler diagnostics are always collected and cannot be "
+                "disabled. Remove the key or set it to true."
+            )
+        if not config.report_delta:
+            raise ValueError(
+                "diagnostics.report_delta:false is not supported; the before/after diagnostic delta is always "
+                "reported and cannot be disabled. Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class V2ImportsConfig:
+    """Import-management controls (design §20 imports block)."""
+
+    preserve_static_imports: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2ImportsConfig":
+        config = _validated_from_dict(cls, data, domain="imports")
+        # G006: the import rewriter always preserves existing static imports; there is no code path that drops them, so
+        # an opt-out value cannot affect behavior. Reject it rather than accept a no-op.
+        if not config.preserve_static_imports:
+            raise ValueError(
+                "imports.preserve_static_imports:false is not supported; static imports are always preserved. "
+                "Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class V2AccessConfig:
+    """Access-widening policy gates (design §20 / §10 access block)."""
+
+    allow_access_widening: bool = False
+    allow_security_sensitive_private_widening: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2AccessConfig":
+        return _validated_from_dict(cls, data, domain="access")
+
+
+@dataclass
+class V2GeneratedSourcesConfig:
+    """Generated-source read/edit policy (design §18)."""
+
+    read: bool = True
+    edit: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2GeneratedSourcesConfig":
+        return _validated_from_dict(cls, data, domain="generated_sources")
+
+
+@dataclass
+class V2LombokConfig:
+    """Lombok-generated-API handling (design §18).
+
+    Lombok synthesizes API (getters/setters/builders) at compile time, so the sidecar can only resolve those members
+    when it analyzes with Lombok on the annotation-processor path. ``jar``/``classpath`` supply that path end-to-end:
+    they are validated here and mapped to the sidecar's ``lombokJar``/``lombokClasspath`` discovery keys
+    (:meth:`JavaRefactorManager._sidecar_config_dict`). ``allow`` opts edits of Lombok-managed source files in;
+    ``enabled`` is rejected because it is read by nothing — the real switch is supplying ``jar``/``classpath``.
+    """
+
+    enabled: bool = False
+    allow: bool = False
+    jar: str | None = None
+    classpath: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2LombokConfig":
+        config = _validated_from_dict(cls, data, domain="lombok")
+        # G006: Lombok-aware analysis is driven by supplying lombok.jar/lombok.classpath and opting edits in with
+        # lombok.allow; `lombok.enabled` is read by nothing in the sidecar. Reject the value that reads as "turn lombok
+        # on" so it cannot silently no-op, pointing the user at the real mechanism.
+        if config.enabled:
+            raise ValueError(
+                "lombok.enabled:true has no effect; enable Lombok-aware analysis by setting lombok.jar/lombok.classpath "
+                "and opt edits in with lombok.allow:true."
+            )
+        return config
+
+
+@dataclass
+class V2OperationDefaultsConfig:
+    """Cross-operation defaults (design §20 operation_defaults block)."""
+
+    visibility: str = "private"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2OperationDefaultsConfig":
+        return _validated_from_dict(cls, data, domain="operation_defaults")
+
+
+@dataclass
+class V2StyleConfig:
+    """Output-formatting style controls (design §19). The sidecar infers the surrounding style (line ending,
+    indentation, blank-line and brace conventions) from the edited source and ALWAYS preserves the source's inferred
+    line ending (CRLF vs LF) when rendering synthesized members. ``preserve_line_endings`` documents that always-on
+    behavior; ``false`` is rejected at config-load (G006) because it cannot affect the sidecar."""
+
+    preserve_line_endings: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2StyleConfig":
+        config = _validated_from_dict(cls, data, domain="style")
+        # G006: the sidecar infers and preserves the surrounding source's line ending (JavaStyleProfile) on every
+        # synthesized member; there is no path that rewrites line endings, so an opt-out value cannot affect behavior.
+        if not config.preserve_line_endings:
+            raise ValueError(
+                "style.preserve_line_endings:false is not supported; the source's inferred line ending is always "
+                "preserved. Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class V2IntroduceFieldConfig:
+    """Introduce-field operation defaults (design §20). Minimal+forward-compatible: the block must exist and be mapped
+    to the sidecar's ``introduceField`` operation config so future per-operation defaults can be threaded without a
+    schema break."""
+
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2IntroduceFieldConfig":
+        return _validated_from_dict(cls, data, domain="introduce_field")
+
+
+@dataclass
+class V2FormattingConfig:
+    """External-formatter integration controls (design §19). When ``use_external_formatter`` is true the sidecar may
+    run ``command`` over edited sources; ``command`` is an optional string (``None`` leaves it unset)."""
+
+    use_external_formatter: bool = False
+    command: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V2FormattingConfig":
+        # Consumed by JavaRefactorManager._run_external_formatter as a post-apply pass (design §19): when
+        # use_external_formatter is true and command is set, the command runs once per changed/created file.
+        return _validated_from_dict(cls, data, domain="formatting")
+
+
+@dataclass
+class JavaRefactorV2Config:
+    """Typed, strictly-validated V2 java_refactor configuration (design §20)."""
+
+    enabled: bool = True
+    sessions: V2SessionsConfig = field(default_factory=V2SessionsConfig)
+    diagnostics: V2DiagnosticsConfig = field(default_factory=V2DiagnosticsConfig)
+    imports: V2ImportsConfig = field(default_factory=V2ImportsConfig)
+    access: V2AccessConfig = field(default_factory=V2AccessConfig)
+    hierarchy: V2HierarchyConfig = field(default_factory=V2HierarchyConfig)
+    change_signature: V2ChangeSignatureConfig = field(default_factory=V2ChangeSignatureConfig)
+    move_member: V2MoveMemberConfig = field(default_factory=V2MoveMemberConfig)
+    extract_method: V2ExtractMethodConfig = field(default_factory=V2ExtractMethodConfig)
+    extract_interface: V2ExtractInterfaceConfig = field(default_factory=V2ExtractInterfaceConfig)
+    encapsulate_field: V2EncapsulateFieldConfig = field(default_factory=V2EncapsulateFieldConfig)
+    inline_method: V2InlineMethodConfig = field(default_factory=V2InlineMethodConfig)
+    introduce_field: V2IntroduceFieldConfig = field(default_factory=V2IntroduceFieldConfig)
+    formatting: V2FormattingConfig = field(default_factory=V2FormattingConfig)
+    generated_sources: V2GeneratedSourcesConfig = field(default_factory=V2GeneratedSourcesConfig)
+    lombok: V2LombokConfig = field(default_factory=V2LombokConfig)
+    operation_defaults: V2OperationDefaultsConfig = field(default_factory=V2OperationDefaultsConfig)
+    style: V2StyleConfig = field(default_factory=V2StyleConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "JavaRefactorV2Config":
+        return _validated_from_dict(cls, data, domain="java_refactor")
+
+
+# Maps (containing dataclass, field name) -> nested dataclass type so the shared validator recurses correctly.
+_V2_NESTED_DATACLASSES: dict[tuple[type, str], type] = {
+    (JavaRefactorV2Config, "sessions"): V2SessionsConfig,
+    (JavaRefactorV2Config, "diagnostics"): V2DiagnosticsConfig,
+    (JavaRefactorV2Config, "imports"): V2ImportsConfig,
+    (JavaRefactorV2Config, "access"): V2AccessConfig,
+    (JavaRefactorV2Config, "hierarchy"): V2HierarchyConfig,
+    (JavaRefactorV2Config, "change_signature"): V2ChangeSignatureConfig,
+    (JavaRefactorV2Config, "move_member"): V2MoveMemberConfig,
+    (JavaRefactorV2Config, "extract_method"): V2ExtractMethodConfig,
+    (JavaRefactorV2Config, "extract_interface"): V2ExtractInterfaceConfig,
+    (JavaRefactorV2Config, "encapsulate_field"): V2EncapsulateFieldConfig,
+    (JavaRefactorV2Config, "inline_method"): V2InlineMethodConfig,
+    (JavaRefactorV2Config, "introduce_field"): V2IntroduceFieldConfig,
+    (JavaRefactorV2Config, "formatting"): V2FormattingConfig,
+    (JavaRefactorV2Config, "generated_sources"): V2GeneratedSourcesConfig,
+    (JavaRefactorV2Config, "lombok"): V2LombokConfig,
+    (JavaRefactorV2Config, "operation_defaults"): V2OperationDefaultsConfig,
+    (JavaRefactorV2Config, "style"): V2StyleConfig,
+}
+
+
 @dataclass
 class JavaRefactorConfig:
     """Optional Java-only compiler-backed refactoring configuration."""
@@ -294,6 +706,9 @@ class JavaRefactorConfig:
     source: str | None = None
     target: str | None = None
     encoding: str | None = None
+    v2: JavaRefactorV2Config = field(default_factory=JavaRefactorV2Config)
+    # Design-shaped explicit build model override: java_refactor.model.modules.
+    model: dict[str, Any] = field(default_factory=dict)
     # Patterns pruned while discovering Java sources/build files. Sent to the sidecar as the initialize contract's
     # ``ignoredPatterns`` and replaces the sidecar's former hard-coded exclusion list. A bare directory name (e.g.
     # ``build``) keeps directory-segment semantics (pruned anywhere); an entry with a path separator or glob
@@ -347,6 +762,16 @@ class JavaRefactorConfig:
         if unknown:
             accepted = sorted(field_names | set(cls._DESIGN_ALIASES))
             raise ValueError(f"Unknown java_refactor config key(s): {sorted(unknown)}; expected one of {accepted}.")
+        # The v2 sub-tree is a strictly-typed schema: convert it before constructing the dataclass so unknown/malformed
+        # V2 keys are rejected at config-load time rather than passed opaquely to the sidecar.
+        if "v2" in normalized:
+            v2_value = normalized["v2"]
+            if isinstance(v2_value, JavaRefactorV2Config):
+                pass
+            elif v2_value is None or isinstance(v2_value, dict):
+                normalized["v2"] = JavaRefactorV2Config.from_dict(v2_value)
+            else:
+                raise ValueError(f"Invalid v2 value {v2_value!r}; expected a mapping of V2 java_refactor settings.")
         config = cls(**normalized)
         valid_modes = {"none", "classpath", "project"}
         if config.annotation_processing not in valid_modes:
@@ -357,6 +782,12 @@ class JavaRefactorConfig:
             raise ValueError(
                 f"Invalid ignored_patterns value {config.ignored_patterns!r}; expected a list of pattern strings "
                 f"(bare directory names or globs such as 'target/**')."
+            )
+        if not isinstance(config.v2, JavaRefactorV2Config):
+            raise ValueError(f"Invalid v2 value {config.v2!r}; expected a mapping of V2 java_refactor settings.")
+        if not isinstance(config.model, dict):
+            raise ValueError(
+                f"Invalid model value {config.model!r}; expected a mapping with java_refactor.model modules."
             )
         if not re.fullmatch(r"\d+[kKmMgG]?", config.max_heap.strip()):
             raise ValueError(f"Invalid max_heap value {config.max_heap!r}; expected a JVM heap size such as '512m', '2G', or '1024'.")

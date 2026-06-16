@@ -101,6 +101,10 @@ class JavaRefactorClient:
         result = self._request("status", {"refresh": refresh})
         return JavaRefactorStatus.from_protocol_result(result, jar_path=str(self._jar_path))
 
+    def capabilities(self) -> dict[str, object]:
+        """Fetches the sidecar capability registry without using status as a substitute."""
+        return self._request("capabilities", {})
+
     def preview(self, operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Requests a no-write refactoring preview from the sidecar."""
         return self._request("preview", {"operation": operation, "params": params or {}})
@@ -108,6 +112,63 @@ class JavaRefactorClient:
     def apply_refactor(self, operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Requests a refactoring apply plan from the sidecar; Python performs workspace writes."""
         return self._request("apply", {"operation": operation, "params": params or {}})
+
+    def create_session(self, operation: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Creates a revision-guarded preview session for a Java refactor."""
+        return self._request("createSession", {"operation": operation, "params": params or {}})
+
+    def get_session_edit(
+        self, session_id: str, edit_format: str | None = None, selection: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Fetches a session preview and validation report without requesting application.
+
+        ``edit_format`` optionally selects the edit serialization format (e.g. ``"unified"`` or ``"workspaceEdit"``).
+        It is forwarded to the sidecar, which validates it and refuses an unknown format with a structured code.
+
+        ``selection`` optionally narrows the session to a subset of its edits (incremental apply): a mapping with any of
+        ``files``/``edits``/``fileOperations``/``phases``. When present, the returned envelope carries only the selected
+        subset plus a ``remaining`` report of the still-unapplied units.
+        """
+        params: dict[str, Any] = {"sessionId": session_id}
+        if edit_format is not None:
+            params["format"] = edit_format
+        if selection:
+            params["selection"] = selection
+        return self._request("getSessionEdit", params)
+
+    def apply_session(
+        self, session_id: str, expected_project_revision: Any = None, selection: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Requests the stored session edit after the sidecar revalidates its revision guard.
+
+        ``expected_project_revision`` pins an optimistic-concurrency guard: the session's create-time project revision
+        (its ``modelHash`` string, or the session metadata's ``projectRevision`` object) must still match, otherwise the
+        sidecar refuses with ``project_revision_mismatch`` before re-resolving or writing anything.
+
+        ``selection`` optionally applies only a subset of the session's edits (incremental apply); the sidecar validates
+        that subset overlay via javac, surfaces it for application, and reports the still-unapplied ``remaining`` units a
+        later apply can target.
+        """
+        params: dict[str, Any] = {"sessionId": session_id}
+        if expected_project_revision is not None:
+            params["expectedProjectRevision"] = expected_project_revision
+        if selection:
+            params["selection"] = selection
+        return self._request("applySession", params)
+
+    def ack_session_apply(self, session_id: str, unit_ids: list[str]) -> dict[str, Any]:
+        """Acknowledges that an incremental session subset was committed to disk (G001 post-commit ack).
+
+        Called strictly AFTER the transactional applier commits and post-validation passes. The sidecar records the
+        named ``unit_ids`` as applied and returns the session's now-authoritative incremental state (``applied``,
+        ``complete``, ``remaining``). Before this call, the units are reported as unapplied, so a staging/commit/
+        post-validation failure leaves session state untouched.
+        """
+        return self._request("ackSessionApply", {"sessionId": session_id, "unitIds": list(unit_ids)})
+
+    def cancel_session(self, session_id: str) -> dict[str, Any]:
+        """Cancels a live Java refactor session."""
+        return self._request("cancelSession", {"sessionId": session_id})
 
     def validate_edit(self, overlay: dict[str, Any]) -> dict[str, Any]:
         """Validates a staged (post-edit) overlay against the project model without writing to disk.

@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -44,13 +44,13 @@ public final class ExtractionCache implements ProjectModelDiscoverer.ExtractionP
 
     @Override
     public BuildModelExtractor.Result extract(ProjectModelDiscoverer.BuildKind buildKind, Path projectRoot, ProjectModelDiscoverer.DiscoveryConfig config) {
-        String key = keyFor(buildKind, projectRoot, config.offline(), config.jdtlsSettings());
+        String key = keyFor(buildKind, projectRoot, config.offline(), config.mavenProfiles(), config.jdtlsSettings());
         if (key.equals(cachedKey) && cachedResult != null) {
             return cachedResult;
         }
         BuildModelExtractor.Result result = buildKind == ProjectModelDiscoverer.BuildKind.GRADLE
                 ? extractor.extractGradle(projectRoot, config.offline(), config.jdtlsSettings())
-                : extractor.extractMaven(projectRoot, config.offline(), null, config.jdtlsSettings());
+                : extractor.extractMaven(projectRoot, config.offline(), null, config.jdtlsSettings(), config.mavenProfiles());
         // Only cache successful extractions; a transient failure (e.g. a daemon hiccup) should be retried next call.
         if (!result.isFailure()) {
             cachedKey = key;
@@ -59,7 +59,7 @@ public final class ExtractionCache implements ProjectModelDiscoverer.ExtractionP
         return result;
     }
 
-    private static String keyFor(ProjectModelDiscoverer.BuildKind buildKind, Path projectRoot, boolean offline, BuildModelExtractor.JdtlsSettings jdtls) {
+    private static String keyFor(ProjectModelDiscoverer.BuildKind buildKind, Path projectRoot, boolean offline, List<String> mavenProfiles, BuildModelExtractor.JdtlsSettings jdtls) {
         try {
             // A NUL byte delimiter separates every field/entry so that adjacent values cannot run together and collide
             // (e.g. ("src/foo", GRADLE) must not hash the same as ("src/fooGRADLE", ...)). NUL cannot occur in a path,
@@ -72,6 +72,10 @@ public final class ExtractionCache implements ProjectModelDiscoverer.ExtractionP
             digest.update(separator);
             digest.update((offline ? "offline" : "online").getBytes());
             digest.update(separator);
+            for (String profile : mavenProfiles) {
+                digest.update(profile.getBytes());
+                digest.update(separator);
+            }
             // JDTLS-derived build-tool settings change dependency resolution (settings.xml mirrors/credentials, Gradle
             // user home/JDK, wrapper preference), so a change in any of them must invalidate the cached extraction.
             for (String value : List.of(

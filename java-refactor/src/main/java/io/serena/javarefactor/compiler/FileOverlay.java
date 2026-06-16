@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import javax.tools.JavaFileObject;
 import javax.tools.SimpleJavaFileObject;
@@ -96,20 +96,22 @@ public final class FileOverlay {
         for (JavaFileObject object : standardManager.getJavaFileObjectsFromPaths(onDisk)) {
             result.add(object);
         }
-        // Add files the overlay introduces (e.g. rename targets, created files) that land under this set's roots but are
-        // not yet part of any source set's on-disk javaFiles() listing.
+        // Add files the overlay introduces (e.g. rename targets, created files) that land under this set's roots or
+        // dependency source roots but are not yet part of any source set's on-disk javaFiles() listing.
         LinkedHashSet<Path> existing = new LinkedHashSet<>();
         for (SourceSet set : allSourceSets) {
             for (Path file : set.javaFiles()) {
                 existing.add(file.toAbsolutePath().normalize());
             }
         }
+        List<Path> visibleRoots = new ArrayList<>(sourceSet.sourceRoots());
+        visibleRoots.addAll(SourceSet.crossSourceRoots(sourceSet, allSourceSets));
         for (Map.Entry<Path, String> entry : content.entrySet()) {
             Path path = entry.getKey();
             if (existing.contains(path)) {
                 continue;
             }
-            if (underAnyRoot(path, sourceSet.sourceRoots())) {
+            if (underAnyRoot(path, visibleRoots)) {
                 result.add(source(path, entry.getValue()));
             }
         }

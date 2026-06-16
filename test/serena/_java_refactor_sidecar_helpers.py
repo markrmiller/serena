@@ -15,29 +15,29 @@ CROSS_SOURCE_SET_CONFIG = json.dumps(
 
 __all__ = [
     'CROSS_SOURCE_SET_CONFIG',
-    'text_edits',
-    'file_ops',
-    'sidecar_jar',
-    'maven_offline_repo',
-    'maven_offline_config',
-    'run_status',
+    '_apply_edits_to_text',
+    '_build_processor_jar',
     '_build_vendored_jar',
-    'write_maven_offline_project',
-    '_write_gradle_java_project',
-    '_preview_rename',
-    '_preview_safe_delete',
-    '_preview_op',
-    '_write_two_module_project',
-    '_write_cross_source_set_project',
-    '_write_demo_main',
     '_crafted_apply',
     '_plain_project',
-    '_build_processor_jar',
-    '_write_divergent_gradle_project',
-    '_write_source_level_divergent_project',
+    '_preview_op',
+    '_preview_rename',
+    '_preview_safe_delete',
     '_utf16_offset',
+    '_write_cross_source_set_project',
+    '_write_demo_main',
+    '_write_divergent_gradle_project',
     '_write_generated_root_project',
-    '_apply_edits_to_text',
+    '_write_gradle_java_project',
+    '_write_source_level_divergent_project',
+    '_write_two_module_project',
+    'file_ops',
+    'maven_offline_config',
+    'maven_offline_repo',
+    'run_status',
+    'sidecar_jar',
+    'text_edits',
+    'write_maven_offline_project',
 ]
 
 @pytest.fixture(scope="module")
@@ -220,13 +220,30 @@ def _preview_rename(sidecar_jar: Path, project_root: Path, relative_path: str, l
 
 
 
-def _preview_safe_delete(sidecar_jar: Path, project_root: Path, relative_path: str, line: int, column: int, allow_public_api: bool = False) -> dict:
+def _preview_safe_delete(
+    sidecar_jar: Path,
+    project_root: Path,
+    relative_path: str,
+    line: int,
+    column: int,
+    allow_public_api: bool = False,
+    search_in_comments_and_strings: bool = False,
+    search_for_text_occurrences: bool = False,
+) -> dict:
     client = JavaRefactorClient(sidecar_jar)
     client.start()
     try:
         client.initialize(JavaRefactorInitializeParams(project_root=str(project_root), configuration="default"))
         return client.preview(
-            "safeDelete", {"relativePath": relative_path, "line": line, "column": column, "allowPublicApi": allow_public_api}
+            "safeDelete",
+            {
+                "relativePath": relative_path,
+                "line": line,
+                "column": column,
+                "allowPublicApi": allow_public_api,
+                "searchInCommentsAndStrings": search_in_comments_and_strings,
+                "searchForTextOccurrences": search_for_text_occurrences,
+            },
         )
     finally:
         client.shutdown()

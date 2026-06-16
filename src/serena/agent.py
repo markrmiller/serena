@@ -811,16 +811,17 @@ class SerenaAgent:
                 )
             )
             tool_inclusion_definitions.append(project.project_config)
-            tool_inclusion_definitions.append(cls._java_refactor_tool_inclusion(project.project_config))
+            tool_inclusion_definitions.append(cls._java_refactor_tool_inclusion(project, language_backend))
         else:
             # In a multi-project (or no-startup-project) context, the project that will be worked on is not fixed:
             # a Java project with java_refactor.enabled may be activated later. The exposed (client-visible) toolset is
             # a schema SUPERSET fixed at session start for MCP clients, so the optional Java refactoring tools must be
-            # present here or they could never surface; availability is gated separately: _update_active_tools()
-            # excludes them whenever there is no active project or the active project does not set
-            # java_refactor.enabled, and calling a non-active tool is refused. So config still gates availability in
-            # every startup mode; only the static schema advertises the superset.
-            from serena.tools.java_refactor_tools import java_refactor_tool_names
+            # present here or they could never surface. Effective enablement is negotiated per active project at
+            # _update_active_tools() time via _java_refactor_tool_inclusion(): it excludes these tools whenever there is
+            # no active project or java_refactor is disabled, and registers V2 operation tools only for sidecar
+            # capabilities advertised as "supported". So config and capability negotiation gate availability; only the
+            # static schema advertises the superset.
+            from serena.tools.java_refactor_v2_tools import java_refactor_tool_names
 
             tool_inclusion_definitions.append(
                 NamedToolInclusionDefinition(name="JavaRefactorExposed", included_optional_tools=java_refactor_tool_names())
@@ -1159,22 +1160,60 @@ class SerenaAgent:
             log.info(f"Active modes ({len(active_mode_names)}): {', '.join(active_mode_names)}")
 
     @staticmethod
-    def _java_refactor_tool_inclusion(project_config: "ProjectConfig | None") -> "NamedToolInclusionDefinition":
-        """A tool-inclusion definition that makes the optional Java refactoring tools available only when the active
-        project's ``java_refactor.enabled`` flag is set, and excludes them otherwise — including when there is no
-        active project at all (``None``), since without a project there is no opt-in. Config thereby gates
-        availability, not just execution.
-        """
-        from serena.tools.java_refactor_tools import java_refactor_tool_names
+    def _java_refactor_tool_inclusion(
+        project: "Project | None", language_backend: LanguageBackend
+    ) -> "NamedToolInclusionDefinition":
+        """A tool-inclusion definition for the optional Java refactoring tools.
 
-        names = java_refactor_tool_names()
-        if (
+        The tools are available only when the active project's ``java_refactor.enabled`` flag is set; without a
+        project (``None``) or with the flag unset, all of them are excluded (config gates availability, not just
+        execution).
+
+        When enabled, registration of the V2 compiler-backed operation tools is negotiated against the sidecar's
+        capability registry: each V2 operation tool is enabled only when the sidecar advertises its operation with
+        status ``supported``. The always-on tools (status/debug, session lifecycle, V1 operations) are always
+        included. If the sidecar fails to start or returns a malformed capability registry
+        (``supported_v2_operations()`` returns ``None``), no V2 operation tools are enabled, leaving only the
+        always-on set so the status/debug tool remains reachable for diagnosis. The manager's execution-time
+        ``_ensure_v2_capability`` check remains as defense-in-depth.
+        """
+        from serena.tools.java_refactor_v2_tools import (
+            java_refactor_always_on_tool_names,
+            java_refactor_tool_names,
+            java_refactor_v2_capability_tool_operations,
+        )
+
+        all_names = java_refactor_tool_names()
+        project_config = project.project_config if project is not None else None
+        enabled = (
             project_config is not None
             and getattr(project_config, "java_refactor", None) is not None
             and project_config.java_refactor.enabled
-        ):
-            return NamedToolInclusionDefinition(name="JavaRefactorEnabled", included_optional_tools=names)
-        return NamedToolInclusionDefinition(name="JavaRefactorDisabled", excluded_tools=names)
+        )
+        if not enabled or project is None:
+            return NamedToolInclusionDefinition(name="JavaRefactorDisabled", excluded_tools=all_names)
+
+        included = list(java_refactor_always_on_tool_names())
+        capability_tool_operations = java_refactor_v2_capability_tool_operations()
+
+        from serena.java_refactor.manager import get_or_create_java_refactor_manager
+
+        try:
+            manager = get_or_create_java_refactor_manager(project, language_backend)
+            supported = manager.supported_v2_operations()
+        except Exception:
+            log.warning("Java refactor capability negotiation failed; V2 operation tools will not be enabled.", exc_info=True)
+            supported = None
+
+        if supported is not None:
+            included.extend(name for name, operation in capability_tool_operations.items() if operation in supported)
+
+        excluded = [name for name in all_names if name not in included]
+        return NamedToolInclusionDefinition(
+            name="JavaRefactorCapabilityNegotiated",
+            included_optional_tools=included,
+            excluded_tools=excluded,
+        )
 
     def _update_active_tools(self) -> None:
         """
@@ -1190,7 +1229,7 @@ class SerenaAgent:
             tool_set = tool_set.apply(self._active_project.project_config)
             # Gate the optional Java compiler-backed refactoring tools on the project's java_refactor.enabled flag, so
             # they are available only for projects that opt in (rather than always-present and refusing at execution).
-            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(self._active_project.project_config))
+            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(self._active_project, self._language_backend))
             if self._active_project.project_config.read_only:
                 tool_set = tool_set.without_editing_tools()
         else:
@@ -1198,7 +1237,7 @@ class SerenaAgent:
             # in a multi-project/no-startup-project session before an enabled project is activated. (They may still be
             # present in the exposed schema superset, which is fixed at startup for MCP clients; availability is what
             # this gates — calling them in this state is refused as an inactive tool.)
-            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(None))
+            tool_set = tool_set.apply(self._java_refactor_tool_inclusion(None, self._language_backend))
 
         self._active_tools = tool_set.to_available_tools(self._all_tools)
         log.info(f"Active tools ({len(self._active_tools)}): {', '.join(self._active_tools.tool_names)}")

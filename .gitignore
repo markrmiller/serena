@@ -279,3 +279,9 @@ news/news.json
 
 # oh-my-claudecode local state
 .omc/
+
+# Headroom local state
+.headroom/
+
+# Java refactor sidecar generated classes
+/java-refactor/bin/

@@ -228,7 +228,6 @@ class JavaChangeSignatureTool(EditingToolWithDiagnostics, ToolMarkerSymbolicEdit
         new_name: str | None = None,
         new_return_type: str | None = None,
         parameters_json: str = "[]",
-        update_overrides: bool = True,
         default_values_json: str = "{}",
         preview: bool = True,
         validate: bool = True,
@@ -632,8 +631,7 @@ Defer:
       "defaultValue": "Currency.USD"
     }
   ],
-  "removedParameterPolicy": "requireUnused",
-  "updateOverrides": true
+  "removedParameterPolicy": "requireUnused"
 }
 ```
 
@@ -1772,7 +1770,6 @@ java_refactor:
       enabled: true
       allow_public_api_change: false
       allow_removed_side_effecting_arguments: false
-      update_overrides_default: true
 
     move_member:
       enabled: true

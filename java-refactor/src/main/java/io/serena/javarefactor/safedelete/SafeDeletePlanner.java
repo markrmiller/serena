@@ -5,8 +5,8 @@ import io.serena.javarefactor.compiler.*;
 import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ExecutableElement;
@@ -14,6 +14,7 @@ import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -30,11 +31,16 @@ import static io.serena.javarefactor.edits.PlannerSupport.simpleName;
 
 public final class SafeDeletePlanner {
     public String plan(JavaProjectModel model, String relativePath, long line, long column, boolean allowPublicApi) throws IOException {
-        return plan(model, relativePath, line, column, allowPublicApi, TargetHints.NONE);
+        return plan(model, relativePath, line, column, allowPublicApi, false, false, TargetHints.NONE);
     }
 
     public String plan(JavaProjectModel model, String relativePath, long line, long column, boolean allowPublicApi, TargetHints hints)
             throws IOException {
+        return plan(model, relativePath, line, column, allowPublicApi, false, false, hints);
+    }
+
+    public String plan(JavaProjectModel model, String relativePath, long line, long column, boolean allowPublicApi,
+            boolean searchInCommentsAndStrings, boolean searchForTextOccurrences, TargetHints hints) throws IOException {
         try (SemanticIndex index = SemanticIndex.open(model, relativePath)) {
             RefactorAnalysisResult analysis = index.resolveTarget(relativePath, line, column, hints.nameHint());
             if (analysis.target() == null) {
@@ -54,7 +60,7 @@ public final class SafeDeletePlanner {
                 return refusalJson("non_editable_target", originRefusal, "[]");
             }
             if ("PARAMETER".equals(analysis.target().key().kind())) {
-                return planParameterDelete(index, model, analysis.target());
+                return planParameterDelete(index, model, analysis.target(), searchInCommentsAndStrings, searchForTextOccurrences);
             }
             if (!allowPublicApi && isPublicApi(analysis.target())) {
                 return refusalJson("public_api", "Safe delete refuses public/protected Java API unless explicitly allowed.",
@@ -66,6 +72,11 @@ public final class SafeDeletePlanner {
             if (!externalReferences.isEmpty()) {
                 return refusalJson("semantic_references_exist", "Safe delete target still has semantic references.",
                         index.referencesJsonRich(model.projectRoot(), externalReferences));
+            }
+            String targetName = simpleName(analysis.target().key().name());
+            String textualRefusal = textualReferenceRefusal(index, model, targetName, searchInCommentsAndStrings, searchForTextOccurrences);
+            if (textualRefusal != null) {
+                return textualRefusal;
             }
             String targetKind = analysis.target().key().kind();
             // Per-construct gate (replaces a broad "standalone block locals only" refusal): a block-statement local —
@@ -124,7 +135,8 @@ public final class SafeDeletePlanner {
      * rather than producing a partial edit. Parameters of non-private or hierarchy-participating methods are refused
      * with the existing-style message.
      */
-    private static String planParameterDelete(SemanticIndex index, JavaProjectModel model, ResolvedTarget target) throws IOException {
+    private static String planParameterDelete(SemanticIndex index, JavaProjectModel model, ResolvedTarget target,
+            boolean searchInCommentsAndStrings, boolean searchForTextOccurrences) throws IOException {
         Element parameter = target.element();
         if (!(parameter.getEnclosingElement() instanceof ExecutableElement method)
                 || !method.getModifiers().contains(Modifier.PRIVATE)
@@ -152,6 +164,10 @@ public final class SafeDeletePlanner {
         String nonEditable = index.detectNonEditableFiles(affected);
         if (nonEditable != null) {
             return refusalJson("non_editable_target", nonEditable, "[]");
+        }
+        String textualRefusal = textualReferenceRefusal(index, model, simpleName(target.key().name()), searchInCommentsAndStrings, searchForTextOccurrences);
+        if (textualRefusal != null) {
+            return textualRefusal;
         }
         return parameterDeleteJson(model.projectRoot(), target, plan.edits(), PlannerSupport.modelSafetyWarnings(model));
     }
@@ -199,6 +215,201 @@ public final class SafeDeletePlanner {
         return null;
     }
 
+
+    private static String textualReferenceRefusal(SemanticIndex index, JavaProjectModel model, String targetName,
+            boolean searchInCommentsAndStrings, boolean searchForTextOccurrences) throws IOException {
+        if (!searchInCommentsAndStrings && !searchForTextOccurrences) {
+            return null;
+        }
+        List<String> referenceArrays = new ArrayList<>();
+        int referenceCount = 0;
+        if (searchInCommentsAndStrings) {
+            List<IdentifierSpan> commentAndStringSpans = index.textualOccurrenceSpans(targetName);
+            if (!commentAndStringSpans.isEmpty()) {
+                referenceArrays.add(index.referencesJsonRich(model.projectRoot(), commentAndStringSpans));
+                referenceCount += commentAndStringSpans.size();
+            }
+        }
+        if (searchForTextOccurrences) {
+            TextOccurrenceSearch textOccurrences = projectTextOccurrences(model, targetName);
+            if (textOccurrences.count() > 0) {
+                referenceArrays.add(textOccurrences.referencesJson());
+                referenceCount += textOccurrences.count();
+            }
+        }
+        if (referenceCount == 0) {
+            return null;
+        }
+        return refusalJson("textual_references_exist",
+                "Safe delete target still has textual occurrence(s). These were found because the IntelliJ-style "
+                        + "comments/strings or text-occurrence search options were enabled; review them before "
+                        + "deleting the declaration.",
+                concatenateJsonArrays(referenceArrays));
+    }
+
+    private static String refusalJson(String code, String message, String referencesJson) {
+        return "{\"accepted\":false,\"canDelete\":false,\"reason\":" + JsonUtil.quote(message)
+                + ",\"references\":" + referencesJson
+                + ",\"refusal\":{\"code\":" + JsonUtil.quote(code)
+                + ",\"message\":" + JsonUtil.quote(message) + "}}";
+    }
+
+    private record TextOccurrenceSearch(String referencesJson, int count) {
+    }
+
+    private static TextOccurrenceSearch projectTextOccurrences(JavaProjectModel model, String targetName) throws IOException {
+        StringBuilder references = new StringBuilder("[");
+        int count = 0;
+        try (Stream<Path> files = Files.walk(model.projectRoot())) {
+            for (Path file : (Iterable<Path>) files::iterator) {
+                Path normalized = file.toAbsolutePath().normalize();
+                if (shouldSkipTextOccurrenceFile(model, normalized)) {
+                    continue;
+                }
+                String content;
+                try {
+                    content = Files.readString(normalized, StandardCharsets.UTF_8);
+                } catch (IOException | RuntimeException ignored) {
+                    continue;
+                }
+                count = appendTextOccurrences(model.projectRoot(), normalized, content, targetName, references, count);
+            }
+        }
+        return new TextOccurrenceSearch(references.append("]").toString(), count);
+    }
+
+    private static boolean shouldSkipTextOccurrenceFile(JavaProjectModel model, Path file) throws IOException {
+        if (!Files.isRegularFile(file) || isJavaFile(file) || Files.size(file) > 1024 * 1024) {
+            return true;
+        }
+        Path root = model.projectRoot().toAbsolutePath().normalize();
+        if (!file.startsWith(root)) {
+            return true;
+        }
+        Path relative = root.relativize(file);
+        for (Path part : relative) {
+            String name = part.toString();
+            if (Set.of(".git", ".gradle", ".serena", ".omx", "build", "target", "out", "node_modules").contains(name)) {
+                return true;
+            }
+        }
+        for (SourceSet sourceSet : model.sourceSets()) {
+            for (Path generatedRoot : sourceSet.generatedRoots()) {
+                if (file.startsWith(generatedRoot.toAbsolutePath().normalize())) {
+                    return true;
+                }
+            }
+            for (Path outputDir : sourceSet.outputDirs()) {
+                if (file.startsWith(outputDir.toAbsolutePath().normalize())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isJavaFile(Path file) {
+        String name = file.getFileName() == null ? "" : file.getFileName().toString();
+        return name.endsWith(".java");
+    }
+
+    private static int appendTextOccurrences(Path projectRoot, Path file, String content, String targetName, StringBuilder references,
+            int count) {
+        if (content.indexOf('\0') >= 0) {
+            return count;
+        }
+        int nameLength = targetName.length();
+        for (int i = 0; i + nameLength <= content.length(); i++) {
+            if (!matchesWholeToken(content, targetName, i)) {
+                continue;
+            }
+            if (count > 0) {
+                references.append(',');
+            }
+            appendTextOccurrence(projectRoot, file, content, targetName, i, references);
+            count++;
+            i += nameLength - 1;
+        }
+        return count;
+    }
+
+    private static boolean matchesWholeToken(String content, String targetName, int offset) {
+        int nameLength = targetName.length();
+        if (offset + nameLength > content.length()) {
+            return false;
+        }
+        for (int i = 0; i < nameLength; i++) {
+            if (content.charAt(offset + i) != targetName.charAt(i)) {
+                return false;
+            }
+        }
+        boolean leftBoundary = offset == 0 || !Character.isJavaIdentifierPart(content.charAt(offset - 1));
+        boolean rightBoundary = offset + nameLength >= content.length()
+                || !Character.isJavaIdentifierPart(content.charAt(offset + nameLength));
+        return leftBoundary && rightBoundary;
+    }
+
+    private static void appendTextOccurrence(Path projectRoot, Path file, String content, String targetName, int offset,
+            StringBuilder references) {
+        int[] lineColumn = lineColumn(content, offset);
+        String relativePath = relative(projectRoot, file);
+        references.append("{")
+                .append("\"relativePath\":").append(JsonUtil.quote(relativePath)).append(',')
+                .append("\"path\":").append(JsonUtil.quote(relativePath)).append(',')
+                .append("\"line\":").append(lineColumn[0]).append(',')
+                .append("\"column\":").append(lineColumn[1]).append(',')
+                .append("\"startOffset\":").append(offset).append(',')
+                .append("\"endOffset\":").append(offset + targetName.length()).append(',')
+                .append("\"text\":").append(JsonUtil.quote(targetName)).append(',')
+                .append("\"containingSymbol\":null,")
+                .append("\"snippet\":").append(JsonUtil.quote(snippet(content, offset)))
+                .append("}");
+    }
+
+    private static int[] lineColumn(String content, int offset) {
+        int line = 1;
+        int column = 1;
+        for (int i = 0; i < offset; i++) {
+            char c = content.charAt(i);
+            if (c == '\n') {
+                line++;
+                column = 1;
+            } else {
+                column++;
+            }
+        }
+        return new int[] {line, column};
+    }
+
+    private static String snippet(String content, int offset) {
+        int start = offset;
+        while (start > 0 && content.charAt(start - 1) != '\n' && content.charAt(start - 1) != '\r') {
+            start--;
+        }
+        int end = offset;
+        while (end < content.length() && content.charAt(end) != '\n' && content.charAt(end) != '\r') {
+            end++;
+        }
+        return content.substring(start, end);
+    }
+
+    private static String concatenateJsonArrays(List<String> arrays) {
+        StringBuilder result = new StringBuilder("[");
+        boolean first = true;
+        for (String array : arrays) {
+            String trimmed = array.trim();
+            if (trimmed.length() <= 2) {
+                continue;
+            }
+            if (!first) {
+                result.append(',');
+            }
+            result.append(trimmed, 1, trimmed.length() - 1);
+            first = false;
+        }
+        return result.append("]").toString();
+    }
+
     private static String declarationDeleteJson(SemanticIndex index, Path projectRoot, ResolvedTarget target, java.nio.charset.Charset charset, List<String> warnings) throws IOException {
         SemanticIndex.DeclarationRange declaration = index.declarationRange(target.element());
         if (declaration == null) {
@@ -231,9 +442,13 @@ public final class SafeDeletePlanner {
                         "Safe delete refuses a declaration that shares a line with other code; deleting the line would "
                                 + "remove that code too. Move the declaration to its own line first.", "[]");
             }
-            range = local
-                    ? SemanticIndex.localDeclarationDeleteRange(source, declaration.start(), declaration.end())
-                    : SemanticIndex.expandDeclarationRangeForDelete(source, declaration.start(), declaration.end());
+        if (local) {
+            range = SemanticIndex.localDeclarationDeleteRange(source, declaration.start(), declaration.end());
+        } else if (SemanticIndex.declarationSharesLineWithOtherCode(source, declaration.start(), declaration.end())) {
+            range = SemanticIndex.localDeclarationDeleteRange(source, declaration.start(), declaration.end());
+        } else {
+            range = SemanticIndex.expandDeclarationRangeForDelete(source, declaration.start(), declaration.end());
+        }
         }
         List<PlannerSupport.TextEdit> textEdits = List.of(
                 new PlannerSupport.TextEdit(declaration.file(), range[0], range[1], "", "DECLARATION"));

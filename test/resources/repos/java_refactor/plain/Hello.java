@@ -1,1 +1,4 @@
-class Hello { private void helper() {} }
+class Hello {
+    private void helper() {
+    }
+}

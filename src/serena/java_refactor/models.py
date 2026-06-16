@@ -13,6 +13,11 @@ class JavaRefactorInitializeParams:
     retained for backward compatibility with sidecars that predate the structured ``config`` object; the sidecar merges
     the structured object over the parsed legacy string, then overlays the top-level ``encoding``/``ignoredPatterns``.
 
+    The sidecar also accepts the documented nested V2 schema under ``config["java_refactor"]["v2"]`` (or
+    ``javaRefactor.v2``). Those keys are normalized into the effective configuration for session limits, operation
+    defaults, access widening, hierarchy settings, extract-method/interface constraints, encapsulate-field and
+    inline-method options, generated/Lombok policy, diagnostics, imports, and style.
+
     The new fields default to ``None``/unset so callers that only pass ``project_root`` (and optionally the legacy
     ``configuration`` string) produce exactly the prior payload shape — none of the new keys are emitted unless set.
     """
@@ -76,6 +81,8 @@ class JavaRefactorStatus:
     errors: list[str] = field(default_factory=list)
     jar_path: str | None = None
     project_model: dict[str, Any] | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    live_sessions: int = 0
     # Where the validated project model came from: "memory" (in-process), "persistent" (Serena project-data cache), or
     # "fresh" (re-validated). None when no model was discovered.
     model_cache_source: str | None = None
@@ -122,6 +129,8 @@ class JavaRefactorStatus:
             errors=errors,
             jar_path=jar_path,
             project_model=project_model,
+            capabilities=dict(result.get("capabilities", {})) if isinstance(result.get("capabilities"), dict) else {},
+            live_sessions=int(result.get("liveSessions", 0) or 0),
             model_cache_source=result.get("modelCacheSource"),
         )
 

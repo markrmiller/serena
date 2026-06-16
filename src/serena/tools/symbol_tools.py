@@ -694,6 +694,8 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
         self,
         name_path_pattern: str,
         relative_path: str,
+        search_in_comments_and_strings: bool = False,
+        search_for_text_occurrences: bool = False,
     ) -> str:
         """
         Deletes the symbol if it is safe to do so (i.e., if there are no references to it)
@@ -701,6 +703,10 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
 
         :param name_path_pattern: name path of the symbol to delete
         :param relative_path: the relative path to the file containing the symbol to delete
+        :param search_in_comments_and_strings: Java sidecar only: whether to also treat comment/string occurrences as
+            blocking usages, matching IntelliJ's "Search in comments and strings" option.
+        :param search_for_text_occurrences: Java sidecar only: whether to also treat non-Java project text occurrences
+            as blocking usages, matching IntelliJ's "Search for text occurrences" option.
         """
         java_refactor = self.project.project_config.java_refactor
         ls_symbol_retriever = self.create_language_server_symbol_retriever()
@@ -727,6 +733,8 @@ class SafeDeleteSymbol(Tool, ToolMarkerSymbolicEdit):
                     symbol_col + 1,
                     apply=not java_refactor.preview_default,
                     target_hints=target_hints_from_lsp_symbol(symbol),
+                    search_in_comments_and_strings=search_in_comments_and_strings,
+                    search_for_text_occurrences=search_for_text_occurrences,
                 )
                 if result.get("accepted") or result.get("refusal"):
                     # The engine analyzed the deletion and produced a definitive verdict (success or a

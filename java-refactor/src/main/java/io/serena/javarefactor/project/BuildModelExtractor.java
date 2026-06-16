@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -171,6 +171,10 @@ public final class BuildModelExtractor {
      * how Serena's Java language server resolves the project.
      */
     Result extractMaven(Path projectRoot, boolean offline, Path localRepo, JdtlsSettings jdtls) {
+        return extractMaven(projectRoot, offline, localRepo, jdtls, List.of());
+    }
+
+    Result extractMaven(Path projectRoot, boolean offline, Path localRepo, JdtlsSettings jdtls, List<String> profiles) {
         Path launcher = resolveLauncher(projectRoot, "mvnw", "mvnw.cmd", "mvn");
         if (launcher == null) {
             return Result.failure("Maven build-model extraction failed: no ./mvnw or mvn executable was found. "
@@ -187,7 +191,7 @@ public final class BuildModelExtractor {
             // (correctly distinct) classpath file there. Nothing is ever written inside the project root.
             classpathDir = Files.createTempDirectory("serena-maven-cp");
 
-            List<String> pomCommand = mavenCommand(launcher, offline, localRepo, jdtls,
+            List<String> pomCommand = mavenCommand(launcher, offline, localRepo, jdtls, profiles,
                     "help:effective-pom", "-Doutput=" + effectivePom.toAbsolutePath());
             ProcessResult pomProcess = run(pomCommand, projectRoot);
             if (pomProcess.exitCode() != 0) {
@@ -196,24 +200,29 @@ public final class BuildModelExtractor {
             }
 
             // Resolve compile and test scopes separately so main and test source sets get the correct (and correctly
-            // distinct) classpaths. A non-zero build-classpath exit is NOT fatal: in an unbuilt multi-module reactor a
-            // module that references a sibling which is not yet installed/compiled cannot resolve that sibling's jar
-            // offline, but its sibling is modeled as a source dependency (its source root feeds -sourcepath), so the
-            // dependency classpath being incomplete is tolerated and surfaced as a warning. javac validation still
-            // reports any genuinely-missing symbol, so apply stays gated.
+            // distinct) classpaths. A non-zero build-classpath exit does NOT abort extraction: in an unbuilt multi-module
+            // reactor a module that references a sibling which is not yet installed/compiled cannot resolve that sibling's
+            // jar offline, but its sibling is modeled as a source dependency (its source root feeds -sourcepath). What we
+            // must NOT do (G003) is silently treat a possibly-incomplete classpath as proven: an unresolved EXTERNAL
+            // (non-reactor) dependency can leave javac clean on the edited file while corrupting semantic planning
+            // elsewhere. So we record which scopes failed to resolve and let parseMavenModel mark exactly the affected
+            // source sets classpath-UNPROVEN, which flows into the same apply-refusal gate as javac diagnostics.
             List<String> classpathWarnings = new ArrayList<>();
-            String compileWarning = runBuildClasspath(launcher, offline, localRepo, jdtls, projectRoot, classpathDir,
+            Set<String> unresolvedScopes = new LinkedHashSet<>();
+            String compileWarning = runBuildClasspath(launcher, offline, localRepo, jdtls, profiles, projectRoot, classpathDir,
                     MAVEN_COMPILE_SCOPE);
             if (compileWarning != null) {
                 classpathWarnings.add(compileWarning);
+                unresolvedScopes.add(MAVEN_COMPILE_SCOPE);
             }
-            String testWarning = runBuildClasspath(launcher, offline, localRepo, jdtls, projectRoot, classpathDir,
+            String testWarning = runBuildClasspath(launcher, offline, localRepo, jdtls, profiles, projectRoot, classpathDir,
                     MAVEN_TEST_SCOPE);
             if (testWarning != null) {
                 classpathWarnings.add(testWarning);
+                unresolvedScopes.add(MAVEN_TEST_SCOPE);
             }
 
-            return Result.ok(parseMavenModel(projectRoot, effectivePom, classpathDir),
+            return Result.ok(parseMavenModel(projectRoot, effectivePom, classpathDir, unresolvedScopes),
                     classpathWarnings.isEmpty() ? null : String.join(" ", classpathWarnings));
         } catch (IOException | InterruptedException e) {
             if (e instanceof InterruptedException) {
@@ -236,7 +245,7 @@ public final class BuildModelExtractor {
      * non-zero exit, or {@code null} on success.
      */
     private static String runBuildClasspath(Path launcher, boolean offline, Path localRepo, JdtlsSettings jdtls,
-            Path projectRoot, Path classpathDir, String scope) throws IOException, InterruptedException {
+            List<String> profiles, Path projectRoot, Path classpathDir, String scope) throws IOException, InterruptedException {
         // The ${...} expressions are interpolated by Maven per module (NOT the shell — commands run via ProcessBuilder),
         // yielding one file per reactor module under the out-of-tree directory.
         String outputFile = classpathDir.toAbsolutePath()
@@ -245,7 +254,7 @@ public final class BuildModelExtractor {
         // sibling that cannot be resolved offline); the modules that succeed still write their classpath files, and a
         // module whose classpath is missing simply gets an empty classpath (readMavenClasspath), relying on the
         // source-dependency edge for sibling symbols. Returns a warning string on non-zero exit, or null on success.
-        List<String> command = mavenCommand(launcher, offline, localRepo, jdtls,
+        List<String> command = mavenCommand(launcher, offline, localRepo, jdtls, profiles,
                 "dependency:build-classpath", "--fail-never", "-Dmdep.outputFile=" + outputFile, "-DincludeScope=" + scope);
         ProcessResult process = run(command, projectRoot);
         if (process.exitCode() != 0) {
@@ -261,11 +270,17 @@ public final class BuildModelExtractor {
         return "cp-" + groupId + "__" + artifactId + "-" + scope + ".txt";
     }
 
-    private static List<String> mavenCommand(Path launcher, boolean offline, Path localRepo, JdtlsSettings jdtls, String... goals) {
+    private static List<String> mavenCommand(Path launcher, boolean offline, Path localRepo, JdtlsSettings jdtls, List<String> profiles, String... goals) {
         List<String> command = new ArrayList<>();
         command.add(launcher.toString());
         command.add("-q");
         command.add("-B");
+        for (String profile : profiles) {
+            String trimmed = profile == null ? "" : profile.trim();
+            if (!trimmed.isEmpty()) {
+                command.add("-P" + trimmed);
+            }
+        }
         for (String goal : goals) {
             command.add(goal);
         }
@@ -309,7 +324,12 @@ public final class BuildModelExtractor {
                     nullableString(module.get("target")),
                     nullableString(module.get("encoding")),
                     stringList(module.get("dependsOnProjects")),
-                    stringList(module.get("compilerArgs"))
+                    stringList(module.get("compilerArgs")),
+                    // G004: the init script sets classpathUnproven=true for a source set whose compile classpath could not
+                    // be resolved (an unresolvable dependency, an offline included-build substitution, ...). The init
+                    // script ALWAYS emits this field for every Gradle source set, so an absent key only occurs for
+                    // non-Gradle/legacy model payloads; absent/false therefore means proven and keeps classpathProven=true.
+                    !boolValue(module.get("classpathUnproven"))
             );
             byProject.computeIfAbsent(project, key -> new ArrayList<>()).add(sourceSet);
         }
@@ -322,7 +342,11 @@ public final class BuildModelExtractor {
 
     // --- Maven parsing --------------------------------------------------------------------------------------------
 
-    private static BuildModel parseMavenModel(Path projectRoot, Path effectivePom, Path classpathDir) throws IOException {
+    // Package-private so the G003 classpath-completeness unit test can drive it with a crafted effective-POM, an
+    // out-of-tree classpath directory (with missing/empty per-module classpath files), and the set of scopes whose
+    // dependency:build-classpath goal failed to resolve — exactly the inputs the live Maven path would produce.
+    static BuildModel parseMavenModel(Path projectRoot, Path effectivePom, Path classpathDir,
+            Set<String> unresolvedScopes) throws IOException {
         Document document = parseXml(effectivePom);
         List<Element> projectElements = effectiveProjectElements(document);
         // Map each module's artifactId -> its real directory by walking the aggregator POMs' <module> entries (which are
@@ -359,6 +383,15 @@ public final class BuildModelExtractor {
             List<String> compileClasspath = readMavenClasspath(classpathDir, groupId, artifactId, MAVEN_COMPILE_SCOPE);
             List<String> testClasspath = readMavenClasspath(classpathDir, groupId, artifactId, MAVEN_TEST_SCOPE);
 
+            // G003: whether each scope's dependency classpath is PROVEN for this module. It is unproven only when the
+            // scope's build-classpath goal failed globally AND this module actually declares an external (non-reactor,
+            // non-system) dependency that we therefore cannot guarantee was resolved. A module with only reactor-sibling
+            // or system-path dependencies (or none) is still proven: siblings resolve from source via -sourcepath and a
+            // system dependency carries its own absolute path, so a build-classpath failure does not endanger them.
+            boolean declaresExternalDeps = mavenDeclaresExternalDependency(project, reactorArtifactByCoord);
+            boolean compileProven = !(unresolvedScopes.contains(MAVEN_COMPILE_SCOPE) && declaresExternalDeps);
+            boolean testProven = !(unresolvedScopes.contains(MAVEN_TEST_SCOPE) && declaresExternalDeps);
+
             // Primary roots from the effective POM plus any additional roots contributed by the build-helper-maven-plugin
             // (a common way Maven projects add generated/extra source roots). Declared roots are kept even if not yet on
             // disk, so the compiler model reflects the project's configured layout rather than only what currently exists.
@@ -393,7 +426,7 @@ public final class BuildModelExtractor {
             if (!mainSourceRoots.isEmpty()) {
                 sourceSets.add(new BuildModel.ModelSourceSet("main", mainSourceRoots, mainGenerated,
                         mainOutput, compileClasspath, List.of(), annotationProcessorPath, release, source, target, encoding,
-                        reactorDependencies, compilerArgs));
+                        reactorDependencies, compilerArgs, compileProven));
             }
             if (!testSourceRoots.isEmpty()) {
                 // The test compile classpath also needs main's compiled output; main's source root is added to the test
@@ -401,7 +434,7 @@ public final class BuildModelExtractor {
                 // main is built.
                 sourceSets.add(new BuildModel.ModelSourceSet("test", testSourceRoots, testGenerated,
                         testOutput, testClasspath, List.of(), annotationProcessorPath, release, source, target, encoding,
-                        reactorDependencies, compilerArgs));
+                        reactorDependencies, compilerArgs, testProven));
             }
             if (!sourceSets.isEmpty()) {
                 String projectId = textOfChild(project, "artifactId");
@@ -436,6 +469,37 @@ public final class BuildModelExtractor {
             }
         }
         return new ArrayList<>(result);
+    }
+
+    /**
+     * G003: whether this module declares at least one EXTERNAL dependency in its effective POM — a {@code <dependency>}
+     * that is neither a sibling reactor module (matched by {@code groupId:artifactId} in {@code reactorArtifactByCoord},
+     * which resolves from source via -sourcepath) nor a {@code system}-scoped dependency (which carries its own absolute
+     * {@code <systemPath>} and so needs no repository resolution). Only such a dependency makes a failed
+     * {@code dependency:build-classpath} dangerous: its jar may be missing from the classpath the model compiles
+     * against, which can silently corrupt overload resolution / type hierarchy used in semantic planning.
+     */
+    private static boolean mavenDeclaresExternalDependency(Element project, Map<String, String> reactorArtifactByCoord) {
+        Element dependencies = firstChild(project, "dependencies");
+        if (dependencies == null) {
+            return false;
+        }
+        for (Element dependency : childElements(dependencies, "dependency")) {
+            String groupId = textOfChild(dependency, "groupId");
+            String artifactId = textOfChild(dependency, "artifactId");
+            if (groupId == null || artifactId == null) {
+                continue;
+            }
+            if (reactorArtifactByCoord.containsKey(groupId.trim() + ":" + artifactId.trim())) {
+                continue;
+            }
+            String scope = textOfChild(dependency, "scope");
+            if (scope != null && "system".equalsIgnoreCase(scope.trim())) {
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     /** Returns the project elements in an effective-pom output, which is either a single project or a wrapper. */
@@ -1276,6 +1340,13 @@ public final class BuildModelExtractor {
         }
         String text = String.valueOf(value).trim();
         return text.isEmpty() || "null".equals(text) ? null : text;
+    }
+
+    private static boolean boolValue(Object value) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        return value != null && "true".equalsIgnoreCase(String.valueOf(value).trim());
     }
 
     private static List<String> stringList(Object value) {

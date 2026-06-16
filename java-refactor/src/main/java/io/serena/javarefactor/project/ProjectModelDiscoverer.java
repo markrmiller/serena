@@ -5,8 +5,8 @@ import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -48,7 +48,7 @@ public final class ProjectModelDiscoverer {
         BuildModelExtractor extractor = new BuildModelExtractor();
         return (buildKind, projectRoot, config) -> buildKind == BuildKind.GRADLE
                 ? extractor.extractGradle(projectRoot, config.offline(), config.jdtlsSettings())
-                : extractor.extractMaven(projectRoot, config.offline(), null, config.jdtlsSettings());
+                : extractor.extractMaven(projectRoot, config.offline(), null, config.jdtlsSettings(), config.mavenProfiles());
     }
 
     JavaProjectModel discover(Path rawProjectRoot, String configuration) {
@@ -106,6 +106,9 @@ public final class ProjectModelDiscoverer {
     }
 
     private static BuildKind detectBuildKind(Path projectRoot, DiscoveryConfig config) {
+        if (config.explicitModel() != null) {
+            return BuildKind.EXPLICIT;
+        }
         BuildKind forced = forcedBuildKind(config.buildToolMode());
         if (forced != null) {
             return forced;
@@ -145,6 +148,9 @@ public final class ProjectModelDiscoverer {
     }
 
     private static List<SourceSet> discoverExplicit(Path projectRoot, DiscoveryConfig config, List<Path> invalidationFiles, List<String> warnings) {
+        if (config.explicitModel() != null) {
+            return sourceSetsFromBuildModel(config.explicitModel(), projectRoot, config, invalidationFiles);
+        }
         List<Path> roots = new ArrayList<>();
         for (String sourceRoot : config.explicitSourceRoots()) {
             Path root = projectRoot.resolve(sourceRoot).normalize();
@@ -186,44 +192,7 @@ public final class ProjectModelDiscoverer {
             warnings.add(result.warning());
         }
 
-        List<SourceSet> sourceSets = new ArrayList<>();
-        boolean multiModule = result.model().modules().size() > 1;
-        for (BuildModel.Module module : result.model().modules()) {
-            for (BuildModel.ModelSourceSet modelSourceSet : module.sourceSets()) {
-                String name = multiModule ? module.project() + ":" + modelSourceSet.name() : modelSourceSet.name();
-                List<Path> roots = new ArrayList<>();
-                roots.addAll(toPaths(modelSourceSet.srcDirs()));
-                List<Path> generatedRoots = toPaths(modelSourceSet.generatedRoots());
-                roots.addAll(generatedRoots);
-                // Cross-module source edges: each depended reactor/sibling project's `main` source set. Only meaningful
-                // in a multi-module build (where names are qualified as `<module>:<sourceSet>`); a depended project `:a`
-                // (Gradle) or `a` (Maven) maps to the source set named `<project>:main`.
-                List<String> crossModuleDependsOn = new ArrayList<>();
-                if (multiModule) {
-                    for (String dependency : modelSourceSet.dependsOnProjects()) {
-                        crossModuleDependsOn.add(dependency + ":main");
-                    }
-                }
-                SourceSet sourceSet = createSourceSet(
-                        name,
-                        projectRoot,
-                        roots,
-                        toPaths(modelSourceSet.outputDirs()),
-                        generatedRoots,
-                        toPaths(modelSourceSet.classpath()),
-                        toPaths(modelSourceSet.modulePath()),
-                        toPaths(modelSourceSet.annotationProcessorPath()),
-                        new JavaVersions(modelSourceSet.release(), normalizeJavaVersion(modelSourceSet.source()), normalizeJavaVersion(modelSourceSet.target())),
-                        modelSourceSet.encoding(),
-                        config,
-                        invalidationFiles,
-                        crossModuleDependsOn,
-                        modelSourceSet.compilerArgs());
-                if (!sourceSet.javaFiles().isEmpty()) {
-                    sourceSets.add(sourceSet);
-                }
-            }
-        }
+        List<SourceSet> sourceSets = sourceSetsFromBuildModel(result.model(), projectRoot, config, invalidationFiles);
         if (sourceSets.isEmpty()) {
             // The build tool resolved but reported NO Java source sets (e.g. an aggregator pom, a project without the
             // java plugin, or extraction that missed the source sets). Fail CLOSED by default — exactly like an
@@ -245,6 +214,45 @@ public final class ProjectModelDiscoverer {
         return sourceSets;
     }
 
+    private static List<SourceSet> sourceSetsFromBuildModel(BuildModel model, Path projectRoot, DiscoveryConfig config, List<Path> invalidationFiles) {
+        List<SourceSet> sourceSets = new ArrayList<>();
+        boolean multiModule = model.modules().size() > 1;
+        for (BuildModel.Module module : model.modules()) {
+            for (BuildModel.ModelSourceSet modelSourceSet : module.sourceSets()) {
+                String name = multiModule ? module.project() + ":" + modelSourceSet.name() : modelSourceSet.name();
+                List<Path> roots = new ArrayList<>();
+                roots.addAll(resolveAgainst(projectRoot, toPaths(modelSourceSet.srcDirs())));
+                List<Path> generatedRoots = resolveAgainst(projectRoot, toPaths(modelSourceSet.generatedRoots()));
+                List<String> crossModuleDependsOn = new ArrayList<>();
+                if (multiModule) {
+                    for (String dependency : modelSourceSet.dependsOnProjects()) {
+                        crossModuleDependsOn.add(dependency + ":main");
+                    }
+                }
+                SourceSet sourceSet = createSourceSet(
+                        name,
+                        projectRoot,
+                        roots,
+                        resolveAgainst(projectRoot, toPaths(modelSourceSet.outputDirs())),
+                        generatedRoots,
+                        resolveAgainst(projectRoot, toPaths(modelSourceSet.classpath())),
+                        resolveAgainst(projectRoot, toPaths(modelSourceSet.modulePath())),
+                        resolveAgainst(projectRoot, toPaths(modelSourceSet.annotationProcessorPath())),
+                        new JavaVersions(modelSourceSet.release(), normalizeJavaVersion(modelSourceSet.source()), normalizeJavaVersion(modelSourceSet.target())),
+                        modelSourceSet.encoding(),
+                        config,
+                        invalidationFiles,
+                        crossModuleDependsOn,
+                        modelSourceSet.compilerArgs(),
+                        modelSourceSet.classpathProven());
+                if (!sourceSet.javaFiles().isEmpty()) {
+                    sourceSets.add(sourceSet);
+                }
+            }
+        }
+        return sourceSets;
+    }
+
     private static List<SourceSet> discoverConventional(Path projectRoot, DiscoveryConfig config, List<Path> invalidationFiles) {
         return List.of(createSourceSet("main", projectRoot, discoverJavaRoots(projectRoot, config), config, invalidationFiles));
     }
@@ -259,7 +267,12 @@ public final class ProjectModelDiscoverer {
 
     /** Conventional/explicit/plain source set: roots, classpath, and versions all come from {@link DiscoveryConfig}. */
     private static SourceSet createSourceSet(String name, Path projectRoot, List<Path> roots, DiscoveryConfig config, List<Path> invalidationFiles) {
-        List<Path> generatedRoots = List.of(projectRoot.resolve("build/generated/sources/annotationProcessor/java/main"), projectRoot.resolve("target/generated-sources/annotations"));
+        // Only generated roots that exist on disk are kept (mirroring outputDirs below); a plain project that has never
+        // been built reports none, rather than two phantom dirs that would spuriously trip the annotation-processing
+        // safety caveat (generatedSourceRoots non-empty + annotation processing disabled).
+        List<Path> generatedRoots = Stream.of(projectRoot.resolve("build/generated/sources/annotationProcessor/java/main"), projectRoot.resolve("target/generated-sources/annotations"))
+                .filter(Files::isDirectory)
+                .toList();
         // Conventional compiler output directories for the two supported build layouts; only those that exist on disk
         // are kept, so a plain project that has never been built simply reports none (rather than two phantom dirs).
         List<Path> outputDirs = Stream.of(projectRoot.resolve("build/classes/java/main"), projectRoot.resolve("target/classes"))
@@ -279,7 +292,11 @@ public final class ProjectModelDiscoverer {
                 config,
                 invalidationFiles,
                 List.of(),
-                List.of());
+                List.of(),
+                // Conventional/explicit/plain source sets use the config-supplied classpath directly (no build-classpath
+                // resolution step), so there is no "unproven" condition here. (Conventional FALLBACK after a failed
+                // extraction is flagged separately via conventionalFallbackUsed, which refuses apply.)
+                true);
     }
 
     /**
@@ -301,14 +318,23 @@ public final class ProjectModelDiscoverer {
             DiscoveryConfig config,
             List<Path> invalidationFiles,
             List<String> crossModuleDependsOn,
-            List<String> extractedCompilerArgs) {
+            List<String> extractedCompilerArgs,
+            boolean classpathProven) {
         List<Path> existingRoots = roots.stream().map(Path::toAbsolutePath).map(Path::normalize).filter(Files::isDirectory).distinct().sorted().toList();
-        List<Path> javaFiles = collectJavaFiles(projectRoot, existingRoots, config.maxFiles(), config.ignoredMatcher());
+        List<Path> normalizedGeneratedRoots = generatedRoots.stream().map(Path::toAbsolutePath).map(Path::normalize).distinct().sorted().toList();
+        List<Path> analysisRoots = config.generatedSourcesRead()
+                ? Stream.concat(existingRoots.stream(), normalizedGeneratedRoots.stream().filter(Files::isDirectory))
+                        .distinct()
+                        .sorted()
+                        .toList()
+                : existingRoots;
+        List<Path> javaFiles = collectJavaFiles(projectRoot, analysisRoots, config.maxFiles(), config.ignoredMatcher());
         List<ModuleSource> moduleSources = discoverModuleSources(javaFiles);
         boolean modular = !moduleSources.isEmpty();
-        List<Path> classpath = resolveAgainst(projectRoot, rawClasspath);
+        List<Path> lombokJars = resolveAgainst(projectRoot, config.lombokJars());
+        List<Path> classpath = Stream.concat(resolveAgainst(projectRoot, rawClasspath).stream(), lombokJars.stream()).distinct().sorted().toList();
         List<Path> modulePath = resolveAgainst(projectRoot, rawModulePath);
-        List<Path> annotationProcessorPath = resolveAgainst(projectRoot, rawAnnotationProcessorPath);
+        List<Path> annotationProcessorPath = Stream.concat(resolveAgainst(projectRoot, rawAnnotationProcessorPath).stream(), lombokJars.stream()).distinct().sorted().toList();
         // Explicit Serena config overrides win over extracted values; otherwise use what the build tool reported.
         JavaVersions versions = new JavaVersions(
                 config.releaseVersion() != null ? config.releaseVersion() : extractedVersions.releaseVersion(),
@@ -326,7 +352,7 @@ public final class ProjectModelDiscoverer {
                 outputDirs.stream().map(Path::toAbsolutePath).map(Path::normalize).distinct().sorted().toList(),
                 classpath,
                 modulePath,
-                generatedRoots.stream().map(Path::toAbsolutePath).map(Path::normalize).filter(Files::isDirectory).distinct().sorted().toList(),
+                normalizedGeneratedRoots,
                 versions.releaseVersion(),
                 versions.sourceVersion(),
                 versions.targetVersion(),
@@ -337,7 +363,8 @@ public final class ProjectModelDiscoverer {
                 config.allowIncompleteAnalysis(),
                 javacOptions,
                 invalidationFiles,
-                combineDependsOn(name, crossModuleDependsOn)
+                combineDependsOn(name, crossModuleDependsOn),
+                classpathProven
         );
     }
 
@@ -853,6 +880,11 @@ public final class ProjectModelDiscoverer {
             boolean allowIncompleteAnalysis,
             boolean allowConventionalFallback,
             boolean offline,
+            List<String> mavenProfiles,
+            boolean generatedSourcesRead,
+            boolean generatedSourcesEdit,
+            List<Path> lombokJars,
+            BuildModel explicitModel,
             int maxFiles,
             // Optional JDTLS-derived build-tool settings (present only when java_refactor.use_jdtls_settings is enabled
             // and the corresponding Java LS setting is configured); any may be null/absent.
@@ -886,6 +918,11 @@ public final class ProjectModelDiscoverer {
                     readBool(json, "allowIncompleteAnalysis", false),
                     readBool(json, "allowConventionalFallback", false),
                     readBool(json, "offline", false),
+                    readStringList(json, "mavenProfiles"),
+                    readGeneratedSourcesBool(json, "read", true),
+                    readGeneratedSourcesBool(json, "edit", false),
+                    readLombokJars(json),
+                    readExplicitModel(json),
                     readInt(json, "maxFiles", 2000),
                     readString(json, "mavenUserSettings", null),
                     readString(json, "gradleUserHome", null),
@@ -894,6 +931,100 @@ public final class ProjectModelDiscoverer {
                     readNullableStringList(json, "ignoredPatterns"),
                     buildToolMode.conflict()
             );
+        }
+
+        private static BuildModel readExplicitModel(Map<String, Object> json) {
+            Object value = json.get("model");
+            if (!(value instanceof Map<?, ?> modelMap)) {
+                return null;
+            }
+            Object modulesValue = modelMap.get("modules");
+            if (!(modulesValue instanceof List<?> modules)) {
+                return new BuildModel(List.of());
+            }
+            List<BuildModel.Module> parsedModules = new ArrayList<>();
+            for (Object moduleValue : modules) {
+                if (!(moduleValue instanceof Map<?, ?> moduleMap)) {
+                    continue;
+                }
+                Object sourceSetsValue = firstValue(moduleMap, "sourceSets", "source_sets");
+                List<BuildModel.ModelSourceSet> parsedSourceSets = new ArrayList<>();
+                if (sourceSetsValue instanceof List<?> sourceSets) {
+                    for (Object sourceSetValue : sourceSets) {
+                        if (!(sourceSetValue instanceof Map<?, ?> sourceSetMap)) {
+                            continue;
+                        }
+                        parsedSourceSets.add(new BuildModel.ModelSourceSet(
+                                readModelString(sourceSetMap, "name", "main"),
+                                readModelStringList(sourceSetMap, "srcDirs", "src_dirs", "sourceRoots", "source_roots"),
+                                readModelStringList(sourceSetMap, "generatedRoots", "generated_roots"),
+                                readModelStringList(sourceSetMap, "outputDirs", "output_dirs"),
+                                readModelStringList(sourceSetMap, "classpath"),
+                                readModelStringList(sourceSetMap, "modulePath", "module_path"),
+                                readModelStringList(sourceSetMap, "annotationProcessorPath", "annotation_processor_path"),
+                                readModelString(sourceSetMap, "release", null),
+                                readModelString(sourceSetMap, "source", null),
+                                readModelString(sourceSetMap, "target", null),
+                                readModelString(sourceSetMap, "encoding", null),
+                                readModelStringList(sourceSetMap, "dependsOnProjects", "depends_on_projects"),
+                                readModelStringList(sourceSetMap, "compilerArgs", "compiler_args")));
+                    }
+                } else {
+                    // §17.3 flat-module form: each module entry carries sourceRoots/classpath/release directly (no
+                    // nested sourceSets list). Synthesize a single implicit source set named after the module so that
+                    // `modules: [{name: "lib", sourceRoots: [...], release: "17"}]` produces a "lib" source set.
+                    List<String> flatSourceRoots = readModelStringList(moduleMap, "srcDirs", "src_dirs", "sourceRoots", "source_roots");
+                    if (!flatSourceRoots.isEmpty()) {
+                        parsedSourceSets.add(new BuildModel.ModelSourceSet(
+                                "main",
+                                flatSourceRoots,
+                                readModelStringList(moduleMap, "generatedRoots", "generated_roots"),
+                                readModelStringList(moduleMap, "outputDirs", "output_dirs"),
+                                readModelStringList(moduleMap, "classpath"),
+                                readModelStringList(moduleMap, "modulePath", "module_path"),
+                                readModelStringList(moduleMap, "annotationProcessorPath", "annotation_processor_path"),
+                                readModelString(moduleMap, "release", null),
+                                readModelString(moduleMap, "source", null),
+                                readModelString(moduleMap, "target", null),
+                                readModelString(moduleMap, "encoding", null),
+                                readModelStringList(moduleMap, "dependsOnProjects", "depends_on_projects"),
+                                readModelStringList(moduleMap, "compilerArgs", "compiler_args")));
+                    }
+                }
+                // For the flat-module form the user supplies "name" (not "project"); prefer "project" for compat with
+                // the nested-sourceSets form, then fall back to "name" (flat-module), then to "root" (single-module).
+                String moduleProject = firstValue(moduleMap, "project", "name") instanceof String s ? s : "root";
+                parsedModules.add(new BuildModel.Module(moduleProject, parsedSourceSets));
+            }
+            return new BuildModel(parsedModules);
+        }
+
+        private static Object firstValue(Map<?, ?> map, String... keys) {
+            for (String key : keys) {
+                if (map.containsKey(key)) {
+                    return map.get(key);
+                }
+            }
+            return null;
+        }
+
+        private static String readModelString(Map<?, ?> map, String key, String defaultValue) {
+            Object value = map.get(key);
+            return value instanceof String string ? string : defaultValue;
+        }
+
+        private static List<String> readModelStringList(Map<?, ?> map, String... keys) {
+            Object value = firstValue(map, keys);
+            if (!(value instanceof List<?> list)) {
+                return List.of();
+            }
+            List<String> strings = new ArrayList<>();
+            for (Object item : list) {
+                if (item instanceof String string) {
+                    strings.add(string);
+                }
+            }
+            return strings;
         }
 
         /** The effective build-tool mode plus any conflict between the design alias {@code buildToolModel} and {@code buildToolMode}. */
@@ -962,6 +1093,50 @@ public final class ProjectModelDiscoverer {
             return "none";
         }
 
+        private static boolean readGeneratedSourcesBool(Map<String, Object> json, String key, boolean defaultValue) {
+            Object nested = json.get("generated_sources");
+            if (nested instanceof Map<?, ?> map && map.get(key) != null) {
+                return readBoolValue(map.get(key), defaultValue);
+            }
+            Object camelNested = json.get("generatedSources");
+            if (camelNested instanceof Map<?, ?> map && map.get(key) != null) {
+                return readBoolValue(map.get(key), defaultValue);
+            }
+            String flatKey = "generated_sources." + key;
+            if (json.containsKey(flatKey)) {
+                return readBoolValue(json.get(flatKey), defaultValue);
+            }
+            String camelFlatKey = "generatedSources" + key.substring(0, 1).toUpperCase(java.util.Locale.ROOT) + key.substring(1);
+            if (json.containsKey(camelFlatKey)) {
+                return readBoolValue(json.get(camelFlatKey), defaultValue);
+            }
+            return defaultValue;
+        }
+
+        private static List<Path> readLombokJars(Map<String, Object> json) {
+            List<Path> jars = new ArrayList<>();
+            Object single = json.get("lombokJar");
+            if (single instanceof String string && !string.isBlank()) {
+                jars.add(Path.of(string.trim()));
+            }
+            for (String key : List.of("lombokJars", "lombokClasspath")) {
+                for (String entry : readStringList(json, key)) {
+                    jars.add(Path.of(entry));
+                }
+            }
+            return jars.stream().distinct().sorted(Comparator.comparing(Path::toString)).toList();
+        }
+
+        private static boolean readBoolValue(Object value, boolean defaultValue) {
+            if (value instanceof Boolean boolValue) {
+                return boolValue;
+            }
+            if (value instanceof String string) {
+                return Boolean.parseBoolean(string);
+            }
+            return defaultValue;
+        }
+
         private static String readString(Map<String, Object> json, String key, String defaultValue) {
             Object value = json.get(key);
             if (value instanceof String string) {
@@ -1014,14 +1189,7 @@ public final class ProjectModelDiscoverer {
         }
 
         private static boolean readBool(Map<String, Object> json, String key, boolean defaultValue) {
-            Object value = json.get(key);
-            if (value instanceof Boolean boolValue) {
-                return boolValue;
-            }
-            if (value instanceof String string) {
-                return Boolean.parseBoolean(string);
-            }
-            return defaultValue;
+            return json.containsKey(key) ? readBoolValue(json.get(key), defaultValue) : defaultValue;
         }
 
         private static int readInt(Map<String, Object> json, String key, int defaultValue) {

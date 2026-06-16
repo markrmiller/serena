@@ -1,7 +1,5 @@
 import json
-import os
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -794,6 +792,75 @@ def test_sidecar_safe_delete_allows_standalone_unreferenced_method(sidecar_jar: 
 
     assert result["accepted"] is True, result
     assert result["workspaceEdit"]["stats"]["editCount"] == 1
+
+
+def test_sidecar_safe_delete_comments_and_strings_option_blocks_textual_usages(sidecar_jar: Path, tmp_path: Path) -> None:  # noqa: F811
+    src = tmp_path / "src/main/java/ex"
+    src.mkdir(parents=True)
+    (src / "C.java").write_text(
+        """package ex;
+class C {
+    private void helper() {}
+    void run() {
+        // helper is mentioned for humans
+        String value = "helper";
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    without = _preview_safe_delete(sidecar_jar, tmp_path, "src/main/java/ex/C.java", 3, 18)
+    with_comments = _preview_safe_delete(
+        sidecar_jar,
+        tmp_path,
+        "src/main/java/ex/C.java",
+        3,
+        18,
+        search_in_comments_and_strings=True,
+    )
+
+    assert without["accepted"] is True, without
+    assert with_comments["accepted"] is False, with_comments
+    assert with_comments["refusal"]["code"] == "textual_references_exist"
+    references = with_comments["references"]
+    assert len(references) == 2
+    assert {reference["line"] for reference in references} == {5, 6}
+    assert all(reference["relativePath"] == "src/main/java/ex/C.java" for reference in references)
+
+
+def test_sidecar_safe_delete_text_occurrences_option_blocks_non_java_text_usages(sidecar_jar: Path, tmp_path: Path) -> None:  # noqa: F811
+    src = tmp_path / "src/main/java/ex"
+    src.mkdir(parents=True)
+    (src / "C.java").write_text("package ex; class C { private void helper(){} }\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("Document helper before deleting it.\n", encoding="utf-8")
+
+    without = _preview_safe_delete(sidecar_jar, tmp_path, "src/main/java/ex/C.java", 1, 36)
+    with_text = _preview_safe_delete(
+        sidecar_jar,
+        tmp_path,
+        "src/main/java/ex/C.java",
+        1,
+        36,
+        search_for_text_occurrences=True,
+    )
+
+    assert without["accepted"] is True, without
+    assert with_text["accepted"] is False, with_text
+    assert with_text["refusal"]["code"] == "textual_references_exist"
+    assert with_text["references"] == [
+        {
+            "relativePath": "README.md",
+            "path": "README.md",
+            "line": 1,
+            "column": 10,
+            "startOffset": 9,
+            "endOffset": 15,
+            "text": "helper",
+            "containingSymbol": None,
+            "snippet": "Document helper before deleting it.",
+        }
+    ]
 
 
 def test_sidecar_safe_delete_second_type_with_syntax_error_keeps_file(sidecar_jar: Path, tmp_path: Path) -> None:

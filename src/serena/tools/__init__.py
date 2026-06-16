@@ -9,3 +9,4 @@ from .workflow_tools import *
 from .jetbrains_tools import *
 from .query_project_tools import *
 from .java_refactor_tools import *
+from .java_refactor_v2_tools import *

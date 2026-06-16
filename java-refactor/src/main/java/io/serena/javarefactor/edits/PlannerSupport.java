@@ -5,8 +5,8 @@ import io.serena.javarefactor.compiler.*;
 import io.serena.javarefactor.ast.*;
 import io.serena.javarefactor.rename.*;
 import io.serena.javarefactor.safedelete.*;
-import io.serena.javarefactor.move.*;
-import io.serena.javarefactor.inline.*;
+import io.serena.javarefactor.operations.move_member.*;
+import io.serena.javarefactor.operations.inline_method.*;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -50,29 +50,43 @@ public final class PlannerSupport {
         return index < 0 ? name : name.substring(index + 1);
     }
 
-    /** The standard refusal envelope shared by the rename, inline, and move planners. */
+    /**
+     * The fake, all-empty diagnostic delta. This is a conservative PLACEHOLDER for a not-yet-validated preview; it is
+     * never authoritative. {@code ResponseBuilder} treats it as {@link ResponseBuilder.DiagnosticDelta#unvalidated()}
+     * and refuses to emit it as the answer whenever validation is required (every apply). The authoritative delta is
+     * always produced by {@code PreviewDiagnosticValidator}.
+     */
+    public static String emptyDiagnosticDeltaJson() {
+        return previewDiagnosticDeltaJson(List.of());
+    }
+
+    /** A non-authoritative preview placeholder delta (see {@link #emptyDiagnosticDeltaJson()}); warnings are ignored. */
+    public static String previewDiagnosticDeltaJson(List<String> warnings) {
+        return "{\"before\":{\"errors\":[],\"warnings\":[]},"
+                + "\"after\":{\"errors\":[],\"warnings\":[]},"
+                + "\"newErrors\":[],\"resolvedErrors\":[],\"unchangedErrors\":[],"
+                + "\"newWarnings\":[],\"resolvedWarnings\":[],\"unchangedWarnings\":[]}";
+    }
+
+    /**
+     * Shared refusal envelope for the V2 operation planners. Delegates to the one canonical
+     * {@link ResponseBuilder#refusedResult} so {@code mode} reflects the ACTUAL requested mode (not a hard-coded
+     * {@code preview}) and {@code applied} is always {@code false} on a refusal (Blocker 3).
+     */
+    public static String refusalJson(String operation, boolean apply, String code, String message) {
+        return ResponseBuilder.refusedResult(operation, apply, code, message);
+    }
+
+    /**
+     * Legacy preview-only refusal adapter for the V1 planners (semantic rename, inline local/constant) whose planner
+     * entry points produce a preview edit and never carry an operation name or requested-mode flag. Preserves the prior
+     * {@code operation:"unknown"}, {@code mode:"preview"}, {@code applied:false} envelope while still routing through the
+     * one canonical {@link ResponseBuilder#refusedResult} builder.
+     */
     public static String refusalJson(String code, String message) {
-        return "{\"accepted\":false,\"refusal\":{\"code\":" + JsonUtil.quote(code) + ",\"message\":" + JsonUtil.quote(message) + "},\"warnings\":[],\"stats\":{}}";
+        return ResponseBuilder.refusedResult("unknown", false, code, message);
     }
 
-    /**
-     * The safe-delete refusal envelope. Conforms to the V1 safe-delete result shape — {@code canDelete:false} and a
-     * {@code reason} alongside the blocking {@code references[]} — while preserving the shared {@code accepted:false} +
-     * {@code refusal:{code,message}} envelope so existing consumers keep working. {@code reason} mirrors the refusal
-     * message.
-     */
-    public static String refusalJson(String code, String message, String referencesJson) {
-        return "{\"accepted\":false,\"canDelete\":false,\"reason\":" + JsonUtil.quote(message)
-                + ",\"refusal\":{\"code\":" + JsonUtil.quote(code) + ",\"message\":" + JsonUtil.quote(message) + "}"
-                + ",\"references\":" + referencesJson + ",\"warnings\":[],\"stats\":{}}";
-    }
-
-    /**
-     * Model-level safety warnings shared by every accepted operation (rename, safe delete, move, inline). These surface
-     * the cases the safety section requires callers to review before applying: an incomplete classpath (the model
-     * degraded to a conventional, classpath-less layout) and annotation-processing-disabled analysis over a project that
-     * has generated source roots. Returned as warning-only text; the apply path separately gates degraded models.
-     */
     public static List<String> modelSafetyWarnings(JavaProjectModel model) {
         List<String> warnings = new ArrayList<>();
         if (model.conventionalFallbackUsed()) {
@@ -94,6 +108,16 @@ public final class PlannerSupport {
                     + " unresolved diagnostic(s) for this project, so semantic resolution may be incomplete and this "
                     + "preview may miss or misattribute references. Review it carefully; apply is refused unless "
                     + "java_refactor.allow_incomplete_analysis is true.");
+        }
+        // G003: an unproven dependency classpath is surfaced as a model-safety warning on preview (and refuses apply via
+        // Main.modelGateRefusal) so the user sees exactly which module(s) could not have their classpath proven.
+        if (model.classpathUnproven() && !model.allowIncompleteAnalysis()) {
+            warnings.add("Incomplete analysis: the build tool could not prove the dependency classpath for source set(s) "
+                    + String.join(", ", model.unprovenClasspathSourceSets()) + ", so an external dependency may be missing "
+                    + "from the model's compile classpath. javac can look clean on the edited file while overload "
+                    + "resolution or the type hierarchy are corrupted elsewhere, so this preview may miss or misattribute "
+                    + "references. Review it carefully; apply is refused unless java_refactor.allow_incomplete_analysis is "
+                    + "true.");
         }
         return warnings;
     }
