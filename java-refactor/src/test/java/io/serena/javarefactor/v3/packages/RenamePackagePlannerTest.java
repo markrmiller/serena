@@ -1,0 +1,309 @@
+package io.serena.javarefactor.v3.packages;
+
+import io.serena.javarefactor.compiler.FileOverlay;
+import io.serena.javarefactor.compiler.JavacSession;
+import io.serena.javarefactor.project.JavaProjectModel;
+import io.serena.javarefactor.project.SourceSet;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Compile-proofed coverage for the V3 {@link RenamePackagePlanner} (headline §5/§26).
+ *
+ * <p>Each case builds a tiny javac-backed temp project, runs the real planner in preview mode, then reconstructs the
+ * exact post-edit overlay the sidecar would validate (apply the {@code changes[]} text edits and the {@code rename}
+ * file operation) and runs the SAME {@link JavacSession} before/after the project did/does. The accepted case asserts a
+ * REAL before/after diagnostic delta with zero NEW javac errors — the package rename, the moved file's rename op, and
+ * the referencing file's import rewrite all hold together under the compiler.
+ */
+class RenamePackagePlannerTest {
+
+    @Test
+    void renamesPackageMovesFileAndRewritesImportWithZeroNewErrors(@TempDir Path tmp) throws IOException {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("com/acme/app/Service.java", ""
+                + "package com.acme.app;\n"
+                + "public class Service {\n"
+                + "    public int answer() { return 42; }\n"
+                + "}\n");
+        files.put("com/acme/client/Caller.java", ""
+                + "package com.acme.client;\n"
+                + "import com.acme.app.Service;\n"
+                + "public class Caller {\n"
+                + "    public int run() { return new Service().answer(); }\n"
+                + "}\n");
+        // A sibling package sharing the "com.acme.app" prefix must NOT be corrupted by token-boundary-correct rewriting.
+        files.put("com/acme/application/Other.java", ""
+                + "package com.acme.application;\n"
+                + "public class Other {\n"
+                + "    public int n() { return 1; }\n"
+                + "}\n");
+
+        JavaProjectModel model = model(tmp, files);
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("oldPackage", "com.acme.app");
+        fields.put("newPackage", "com.acme.core");
+
+        String json = new RenamePackagePlanner(tmp.toAbsolutePath().normalize(), model).plan(fields, false);
+
+        assertTrue(json.contains("\"accepted\":true"), json);
+        // Moved file rename op: app -> core path under the same source root.
+        assertTrue(json.contains("\"kind\":\"rename\""), json);
+        assertTrue(json.contains("\"oldPath\":\"src/com/acme/app/Service.java\""), json);
+        assertTrue(json.contains("\"newPath\":\"src/com/acme/core/Service.java\""), json);
+        // Package-declaration edit (newText is the bare new package name on the moved file).
+        assertTrue(json.contains("\"newText\":\"com.acme.core\""), json);
+        // Import rewrite in the referencing file: the import statement's package segment becomes com.acme.core.
+        assertImportRewritten(json, "src/com/acme/client/Caller.java", "com.acme.app", "com.acme.core");
+        // The sibling com.acme.application file must carry NO edits at all.
+        assertFalse(json.contains("src/com/acme/application/Other.java"),
+                "sibling package com.acme.application must not be touched: " + json);
+
+        // REAL before/after diagnostic delta: reconstruct the validated overlay and run javac, proving zero NEW errors.
+        JavacSession javac = new JavacSession();
+        JavacSession.DiagnosticReport before = javac.collectDiagnosticReport(
+                model, FileOverlay.fromProtocol(tmp.toAbsolutePath().normalize(), Map.of(), List.of(), List.of()));
+        FileOverlay after = overlayFromPreview(tmp.toAbsolutePath().normalize(), json);
+        JavacSession.DiagnosticReport afterReport = javac.collectDiagnosticReport(model, after);
+
+        assertEquals(List.of(), before.errorStrings(), "baseline project must compile cleanly");
+        List<String> newErrors = difference(afterReport.errorStrings(), before.errorStrings());
+        assertEquals(List.of(), newErrors, "renamePackage must not introduce NEW javac errors");
+        assertEquals(List.of(), afterReport.errorStrings(), "post-rename project must compile cleanly");
+    }
+
+    @Test
+    void refusesPackageCollision(@TempDir Path tmp) throws IOException {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("com/acme/app/Service.java", ""
+                + "package com.acme.app;\n"
+                + "public class Service {\n"
+                + "}\n");
+        // The target package already owns a type with the same simple name as the one being moved.
+        files.put("com/acme/core/Service.java", ""
+                + "package com.acme.core;\n"
+                + "public class Service {\n"
+                + "}\n");
+
+        JavaProjectModel model = model(tmp, files);
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("oldPackage", "com.acme.app");
+        fields.put("newPackage", "com.acme.core");
+
+        String json = new RenamePackagePlanner(tmp.toAbsolutePath().normalize(), model).plan(fields, false);
+        assertTrue(json.contains("\"accepted\":false"), json);
+        assertTrue(json.contains("\"code\":\"package_collision\""), json);
+    }
+
+    @Test
+    void refusesPackageNotFound(@TempDir Path tmp) throws IOException {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("com/acme/other/Thing.java", ""
+                + "package com.acme.other;\n"
+                + "public class Thing {\n"
+                + "}\n");
+
+        JavaProjectModel model = model(tmp, files);
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("oldPackage", "com.acme.app");
+        fields.put("newPackage", "com.acme.core");
+
+        String json = new RenamePackagePlanner(tmp.toAbsolutePath().normalize(), model).plan(fields, false);
+        assertTrue(json.contains("\"accepted\":false"), json);
+        assertTrue(json.contains("\"code\":\"package_not_found\""), json);
+    }
+
+    // ── Overlay reconstruction (mirrors PreviewDiagnosticValidator.overlayFromPreview) ───────────────────────────────
+
+    /** Rebuilds the post-edit overlay from the preview: applies text edits + the rename file op into a changed-files map. */
+    private static FileOverlay overlayFromPreview(Path projectRoot, String json) throws IOException {
+        Map<String, List<int[]>> offsetsByPath = new LinkedHashMap<>();
+        Map<String, List<String>> textsByPath = new LinkedHashMap<>();
+        parseChanges(json, offsetsByPath, textsByPath);
+
+        Map<String, Object> changedFiles = new LinkedHashMap<>();
+        for (String path : offsetsByPath.keySet()) {
+            String content = Files.readString(projectRoot.resolve(path), StandardCharsets.UTF_8);
+            content = applyToContent(content, offsetsByPath.get(path), textsByPath.get(path));
+            changedFiles.put(path, content);
+        }
+
+        List<Object> renamedFiles = new ArrayList<>();
+        for (String[] rename : parseRenames(json)) {
+            String oldPath = rename[0];
+            String newPath = rename[1];
+            // The renamed-to content is the (possibly edited) old-file content.
+            String content = changedFiles.containsKey(oldPath)
+                    ? String.valueOf(changedFiles.get(oldPath))
+                    : Files.readString(projectRoot.resolve(oldPath), StandardCharsets.UTF_8);
+            changedFiles.remove(oldPath);
+            changedFiles.put(newPath, content);
+            Map<String, Object> pair = new LinkedHashMap<>();
+            pair.put("oldPath", oldPath);
+            pair.put("newPath", newPath);
+            renamedFiles.add(pair);
+        }
+        return FileOverlay.fromProtocol(projectRoot, changedFiles, List.of(), renamedFiles);
+    }
+
+    private static String applyToContent(String content, List<int[]> offsets, List<String> texts) {
+        Integer[] order = new Integer[offsets.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, Comparator.comparingInt((Integer index) -> offsets.get(index)[0]).reversed());
+        StringBuilder builder = new StringBuilder(content);
+        for (int index : order) {
+            builder.replace(offsets.get(index)[0], offsets.get(index)[1], texts.get(index));
+        }
+        return builder.toString();
+    }
+
+    private static final Pattern GROUP_PATTERN = Pattern.compile(
+            "\\{\"path\":\"((?:\\\\.|[^\"\\\\])*)\",\"oldSha256\":\"(?:\\\\.|[^\"\\\\])*\",\"edits\":\\[");
+    private static final Pattern EDIT_PATTERN = Pattern.compile(
+            "\\{\"startOffset\":(\\d+),\"endOffset\":(\\d+),\"newText\":\"((?:\\\\.|[^\"\\\\])*)\",\"kind\":\"(?:\\\\.|[^\"\\\\])*\"\\}");
+    private static final Pattern RENAME_PATTERN = Pattern.compile(
+            "\\{\"kind\":\"rename\",\"oldPath\":\"((?:\\\\.|[^\"\\\\])*)\",\"newPath\":\"((?:\\\\.|[^\"\\\\])*)\",\"oldSha256\":\"(?:\\\\.|[^\"\\\\])*\"\\}");
+
+    private static void parseChanges(String json, Map<String, List<int[]>> offsetsByPath, Map<String, List<String>> textsByPath) {
+        int changesIndex = json.indexOf("\"changes\":");
+        String region = changesIndex < 0 ? json : json.substring(changesIndex);
+        Matcher groups = GROUP_PATTERN.matcher(region);
+        List<String> groupPaths = new ArrayList<>();
+        List<Integer> groupStarts = new ArrayList<>();
+        while (groups.find()) {
+            groupPaths.add(unescapeJson(groups.group(1)));
+            groupStarts.add(groups.end());
+        }
+        for (int g = 0; g < groupPaths.size(); g++) {
+            int start = groupStarts.get(g);
+            int end = g + 1 < groupStarts.size()
+                    ? region.lastIndexOf("{\"path\":", groupStarts.get(g + 1))
+                    : region.length();
+            String slice = region.substring(start, Math.max(start, end));
+            Matcher edits = EDIT_PATTERN.matcher(slice);
+            List<int[]> offsets = offsetsByPath.computeIfAbsent(groupPaths.get(g), key -> new ArrayList<>());
+            List<String> texts = textsByPath.computeIfAbsent(groupPaths.get(g), key -> new ArrayList<>());
+            while (edits.find()) {
+                offsets.add(new int[] {Integer.parseInt(edits.group(1)), Integer.parseInt(edits.group(2))});
+                texts.add(unescapeJson(edits.group(3)));
+            }
+        }
+    }
+
+    private static List<String[]> parseRenames(String json) {
+        List<String[]> renames = new ArrayList<>();
+        Matcher matcher = RENAME_PATTERN.matcher(json);
+        while (matcher.find()) {
+            renames.add(new String[] {unescapeJson(matcher.group(1)), unescapeJson(matcher.group(2))});
+        }
+        return renames;
+    }
+
+    private static String unescapeJson(String raw) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (c == '\\' && i + 1 < raw.length()) {
+                char next = raw.charAt(++i);
+                switch (next) {
+                    case 'n' -> out.append('\n');
+                    case 't' -> out.append('\t');
+                    case 'r' -> out.append('\r');
+                    case '"' -> out.append('"');
+                    case '\\' -> out.append('\\');
+                    case '/' -> out.append('/');
+                    case 'u' -> {
+                        out.append((char) Integer.parseInt(raw.substring(i + 1, i + 5), 16));
+                        i += 4;
+                    }
+                    default -> out.append(next);
+                }
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    /** Asserts the referencing file carries an edit replacing {@code oldPackage} with {@code newPackage}. */
+    private static void assertImportRewritten(String json, String relativePath, String oldPackage, String newPackage) {
+        Map<String, List<int[]>> offsetsByPath = new LinkedHashMap<>();
+        Map<String, List<String>> textsByPath = new LinkedHashMap<>();
+        parseChanges(json, offsetsByPath, textsByPath);
+        assertTrue(offsetsByPath.containsKey(relativePath), "expected edits on " + relativePath + ": " + json);
+        assertTrue(textsByPath.get(relativePath).contains(newPackage),
+                "expected an edit on " + relativePath + " whose newText is " + newPackage + ": " + json);
+    }
+
+    private static List<String> difference(List<String> after, List<String> before) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (String diagnostic : before) {
+            counts.merge(diagnostic, 1, Integer::sum);
+        }
+        List<String> result = new ArrayList<>();
+        for (String diagnostic : after) {
+            int count = counts.getOrDefault(diagnostic, 0);
+            if (count > 0) {
+                counts.put(diagnostic, count - 1);
+            } else {
+                result.add(diagnostic);
+            }
+        }
+        return result;
+    }
+
+    // ── Fixture ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    private static JavaProjectModel model(Path root, Map<String, String> files) throws IOException {
+        Path sourceRoot = root.resolve("src");
+        List<Path> javaFiles = new ArrayList<>();
+        for (Map.Entry<String, String> entry : new TreeMap<>(files).entrySet()) {
+            Path javaFile = sourceRoot.resolve(entry.getKey());
+            Files.createDirectories(javaFile.getParent());
+            Files.writeString(javaFile, entry.getValue(), StandardCharsets.UTF_8);
+            javaFiles.add(javaFile);
+        }
+        SourceSet sourceSet = new SourceSet(
+                "main",
+                List.of(sourceRoot),
+                List.copyOf(javaFiles),
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of(),
+                "17",
+                null,
+                null,
+                "UTF-8",
+                false,
+                "none",
+                List.of(),
+                false,
+                List.of("-source", "17", "-target", "17", "-encoding", "UTF-8"),
+                List.of(),
+                List.of());
+        return new JavaProjectModel(
+                root, "test", List.of(sourceSet), List.of(), List.of(), List.of(), false, false, List.of());
+    }
+}

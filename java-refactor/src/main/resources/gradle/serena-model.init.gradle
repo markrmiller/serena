@@ -52,6 +52,20 @@ allprojects { p ->
                     def srcDirsSet = new LinkedHashSet<String>(existingSrcDirs*.absolutePath)
                     srcDirsSet.addAll(generatedRoots)
                     def srcDirs = srcDirsSet as List
+                    // B11 model-first resource roots: the source set's CONFIGURED resource directories
+                    // (sourceSets.<name>.resources.srcDirs), emitted as a SEPARATE field from srcDirs so the Java side
+                    // can carry true resource roots — including a NON-conventional one declared via
+                    // `resources.srcDir('res')` — instead of re-deriving them from the "resources" filename convention.
+                    // Only existing directories are reported (mirroring existingSrcDirs), de-duplicated, order preserved.
+                    def resourceDirs = []
+                    try {
+                        def resourceDirSet = new LinkedHashSet<String>()
+                        ss.resources.srcDirs.findAll { it.exists() }.each { resourceDirSet.add(it.absolutePath) }
+                        resourceDirs = resourceDirSet as List
+                    } catch (Exception ignored) {
+                        // A source set without a resources sourceDirectorySet (or an older Gradle API) reports no resource
+                        // dirs; the Java side then falls back to the "resources" filename convention for this source set.
+                    }
                     def classpath = []
                     // G004: a compile classpath that cannot be resolved (e.g. an unresolvable dependency offline) must NOT
                     // be silently surfaced as an empty-but-proven classpath — that would let a mutating edit proceed against
@@ -153,6 +167,7 @@ allprojects { p ->
                             project                : projectKey,
                             sourceSet              : ss.name,
                             srcDirs                : srcDirs,
+                            resourceDirs           : resourceDirs,
                             generatedRoots         : generatedRoots,
                             outputDirs             : outputDirs,
                             classpath              : classpath,

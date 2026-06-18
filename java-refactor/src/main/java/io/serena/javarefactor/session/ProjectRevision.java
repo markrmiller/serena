@@ -139,6 +139,22 @@ public record ProjectRevision(
         return null;
     }
 
+    /**
+     * A deterministic clean-revision-guard token over every drift-sensitive input — modelHash, the touched-file source
+     * hashes, the invalidation inputs, and the derived model digest — but deliberately EXCLUDING the wall-clock
+     * {@code createdAt}. Two captures of an unchanged project yield byte-identical tokens, so a guard comparing this by
+     * equality passes when nothing drifted and fails the instant any covered input changes. (Comparing {@link #toJson()}
+     * instead would embed {@code createdAt} and reject every apply as stale.)
+     */
+    public String stableToken() throws IOException {
+        StringBuilder builder = new StringBuilder();
+        builder.append("modelHash=").append(modelHash).append('\n');
+        builder.append("derivedModelDigest=").append(derivedModelDigest).append('\n');
+        new TreeMap<>(sourceHashes).forEach((key, value) -> builder.append("src ").append(key).append(' ').append(value).append('\n'));
+        new TreeMap<>(invalidationInputs).forEach((key, value) -> builder.append("inv ").append(key).append(' ').append(value).append('\n'));
+        return sha256(builder.toString());
+    }
+
     /** Serializes the revision for session preview/status payloads. */
     public String toJson() {
         Map<String, String> fields = new java.util.LinkedHashMap<>();

@@ -43,11 +43,18 @@ public record SourceSet(
         // build-model extraction (see BuildModel.ModelSourceSet#classpathProven). An unproven classpath is a first-class
         // model-incompleteness signal that refuses apply via the same gate as javac diagnostics, because it can leave
         // javac "clean" on the edited file while corrupting semantic planning elsewhere.
-        boolean classpathProven
+        boolean classpathProven,
+        // B11 model-first resource roots: the resource directories the build model declared for this source set
+        // (Gradle {@code sourceSets.*.resources.srcDirs}; Maven {@code <build><resources>}/{@code <testResources>}).
+        // These are the AUTHORITATIVE resource roots {@link ResourceRootModel} consumes; a non-conventional resource
+        // directory (e.g. Maven {@code <resource><directory>config</directory>} or Gradle {@code resources.srcDir('res')})
+        // is discovered only because it is carried here. Empty when the model declared none (the resolver then falls
+        // back to the filename convention).
+        List<Path> resourceRoots
 ) {
     /**
      * Backward-compatible constructor for the many call sites (and every proven-classpath source set) that pre-date the
-     * G003 {@code classpathProven} signal: defaults {@code classpathProven} to {@code true}.
+     * G003 {@code classpathProven} signal: defaults {@code classpathProven} to {@code true} and {@code resourceRoots} to empty.
      */
     public SourceSet(String name, List<Path> sourceRoots, List<Path> javaFiles, List<Path> outputDirs,
             List<Path> classpath, List<Path> modulePath, List<Path> generatedRoots, String releaseVersion,
@@ -56,7 +63,21 @@ public record SourceSet(
             List<Path> invalidationFiles, List<String> dependsOn) {
         this(name, sourceRoots, javaFiles, outputDirs, classpath, modulePath, generatedRoots, releaseVersion,
                 sourceVersion, targetVersion, encoding, modular, annotationProcessing, annotationProcessorPath,
-                allowIncompleteAnalysis, javacOptions, invalidationFiles, dependsOn, true);
+                allowIncompleteAnalysis, javacOptions, invalidationFiles, dependsOn, true, List.of());
+    }
+
+    /**
+     * Backward-compatible constructor for call sites that supply {@code classpathProven} (G003) but pre-date the B11
+     * {@code resourceRoots} field: defaults {@code resourceRoots} to empty.
+     */
+    public SourceSet(String name, List<Path> sourceRoots, List<Path> javaFiles, List<Path> outputDirs,
+            List<Path> classpath, List<Path> modulePath, List<Path> generatedRoots, String releaseVersion,
+            String sourceVersion, String targetVersion, String encoding, boolean modular, String annotationProcessing,
+            List<Path> annotationProcessorPath, boolean allowIncompleteAnalysis, List<String> javacOptions,
+            List<Path> invalidationFiles, List<String> dependsOn, boolean classpathProven) {
+        this(name, sourceRoots, javaFiles, outputDirs, classpath, modulePath, generatedRoots, releaseVersion,
+                sourceVersion, targetVersion, encoding, modular, annotationProcessing, annotationProcessorPath,
+                allowIncompleteAnalysis, javacOptions, invalidationFiles, dependsOn, classpathProven, List.of());
     }
 
     public SourceSet {
@@ -70,6 +91,7 @@ public record SourceSet(
         javacOptions = List.copyOf(javacOptions);
         invalidationFiles = List.copyOf(invalidationFiles);
         dependsOn = List.copyOf(dependsOn);
+        resourceRoots = List.copyOf(resourceRoots);
     }
 
     /**
@@ -150,6 +172,10 @@ public record SourceSet(
         fields.put("invalidationFiles", JsonUtil.array(toRelativeStrings(projectRoot, invalidationFiles)));
         fields.put("dependsOn", JsonUtil.array(dependsOn));
         fields.put("classpathUnproven", Boolean.toString(!classpathProven));
+        // B11: include the model-declared resource roots so the serialized model is complete and, because
+        // revisionDigestJson carries every field except javaFiles/classpathUnproven, a resource-root change invalidates
+        // the incremental-apply revision digest (a moved/added/removed resource directory must re-run resource analysis).
+        fields.put("resourceRoots", JsonUtil.array(toRelativeStrings(projectRoot, resourceRoots)));
         return fields;
     }
 

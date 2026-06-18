@@ -1,3 +1,4 @@
+import functools
 import json
 import shutil
 import subprocess
@@ -32,13 +33,70 @@ __all__ = [
     '_write_source_level_divergent_project',
     '_write_two_module_project',
     'file_ops',
+    'javac_supports_release_21',
     'maven_offline_config',
     'maven_offline_repo',
     'run_status',
     'sidecar_jar',
+    'sidecar_java_cmd',
     'text_edits',
     'write_maven_offline_project',
 ]
+
+
+@functools.lru_cache(maxsize=1)
+def javac_supports_release_21() -> bool:
+    """Whether the ambient ``javac`` (the one the sidecar will use) supports ``--release 21``.
+
+    Probes functionally (``javac --release 21 -version``) rather than parsing a version string: JDK 21+ exits 0,
+    JDK 17 exits non-zero ("release version 21 not supported"). Build-model tests that assert release-21 behaviour are
+    skipped when this returns False so a JDK 17 run stays green without weakening coverage on a JDK 21 run.
+    """
+    javac = shutil.which("javac")
+    if javac is None:
+        return False
+    try:
+        proc = subprocess.run([javac, "--release", "21", "-version"], capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _resolve_sidecar_java() -> str:
+    """Return a Java executable able to BOTH run the sidecar and compile the fixtures' source level.
+
+    Two constraints bound the choice:
+
+    * **Run** the sidecar: it is compiled with the Gradle Java 17 toolchain (class file version 61), so the launcher
+      JDK must be >= 17 or it raises ``UnsupportedClassVersionError``.
+    * **Compile** the project under analysis: the sidecar runs an in-process ``javac`` against each source set. With no
+      explicit toolchain pin, Gradle defaults a project's source/target release to the JDK running Gradle, which in this
+      environment is 21 — and ``javac`` from JDK 17 rejects ``-source 21`` with ``invalid source release: 21``.
+
+    A JDK 21 launcher satisfies both (it runs class-version-61 classes and its ``javac`` supports source releases up to
+    21), so prefer it; fall back to JDK 17 (fine for source <= 17 fixtures) and then to whatever ``java`` is on PATH.
+    """
+    candidates = [
+        "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
+        "/usr/lib/jvm/java-21-openjdk-arm64/bin/java",
+        "/usr/lib/jvm/java-21/bin/java",
+        "/usr/lib/jvm/java-17-openjdk-amd64/bin/java",
+        "/usr/lib/jvm/java-17-openjdk-arm64/bin/java",
+        "/usr/lib/jvm/java-17/bin/java",
+    ]
+    import os
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # Fall back: let shutil.which find any java≥17 on PATH.
+    return shutil.which("java") or "java"
+
+
+@pytest.fixture(scope="session")
+def sidecar_java_cmd() -> str:
+    """The Java executable to use when launching the sidecar jar (Java 17 class-file version)."""
+    return _resolve_sidecar_java()
+
 
 @pytest.fixture(scope="module")
 def sidecar_jar() -> Path:
@@ -118,8 +176,8 @@ def maven_offline_config() -> str:
 
 
 
-def run_status(sidecar_jar: Path, project_root: Path, configuration: str = "default", project_data_dir: Path | None = None) -> dict:
-    client = JavaRefactorClient(sidecar_jar)
+def run_status(sidecar_jar: Path, project_root: Path, configuration: str = "default", project_data_dir: Path | None = None, java_command: str | None = None) -> dict:
+    client = JavaRefactorClient(sidecar_jar, java_command=java_command or _resolve_sidecar_java())
     client.start()
     try:
         status = client.initialize(
@@ -209,8 +267,8 @@ def file_ops(workspace_edit: dict) -> list[dict]:
     return ops
 
 
-def _preview_rename(sidecar_jar: Path, project_root: Path, relative_path: str, line: int, column: int, new_name: str) -> dict:
-    client = JavaRefactorClient(sidecar_jar)
+def _preview_rename(sidecar_jar: Path, project_root: Path, relative_path: str, line: int, column: int, new_name: str, java_command: str | None = None) -> dict:
+    client = JavaRefactorClient(sidecar_jar, java_command=java_command or _resolve_sidecar_java())
     client.start()
     try:
         client.initialize(JavaRefactorInitializeParams(project_root=str(project_root), configuration="default"))
@@ -229,8 +287,9 @@ def _preview_safe_delete(
     allow_public_api: bool = False,
     search_in_comments_and_strings: bool = False,
     search_for_text_occurrences: bool = False,
+    java_command: str | None = None,
 ) -> dict:
-    client = JavaRefactorClient(sidecar_jar)
+    client = JavaRefactorClient(sidecar_jar, java_command=java_command or _resolve_sidecar_java())
     client.start()
     try:
         client.initialize(JavaRefactorInitializeParams(project_root=str(project_root), configuration="default"))
@@ -250,8 +309,8 @@ def _preview_safe_delete(
 
 
 
-def _preview_op(sidecar_jar: Path, project_root: Path, operation: str, params: dict) -> dict:
-    client = JavaRefactorClient(sidecar_jar)
+def _preview_op(sidecar_jar: Path, project_root: Path, operation: str, params: dict, java_command: str | None = None) -> dict:
+    client = JavaRefactorClient(sidecar_jar, java_command=java_command or _resolve_sidecar_java())
     client.start()
     try:
         client.initialize(JavaRefactorInitializeParams(project_root=str(project_root), configuration="default"))

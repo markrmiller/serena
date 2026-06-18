@@ -2,6 +2,7 @@ package io.serena.javarefactor.operations.encapsulate_field;
 
 import io.serena.javarefactor.ast.ResolvedTarget;
 import io.serena.javarefactor.ast.SemanticKey;
+import io.serena.javarefactor.compiler.FrameworkEncapsulationReview;
 import io.serena.javarefactor.compiler.SemanticIndex;
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.edits.ResponseBuilder;
@@ -156,10 +157,18 @@ public final class EncapsulateFieldPlanner {
                     style, indent, bodyIndent, staticField, type, getterName, name, generateSetter, setterName, setterTarget);
             semanticEdits.add(new PlannerSupport.TextEdit(file, sourceType.bodyRange().end() - 1, sourceType.bodyRange().end() - 1, accessors, "ENCAPSULATE_FIELD_ACCESSORS"));
             String encapsulateKeyJson = SemanticKey.from(field.element()).toJson();
+            List<String> warnings = new ArrayList<>();
+            warnings.add("V2 encapsulateField resolves the field and same-project references with javac Elements/source positions, refusing unsupported write contexts.");
+            // Framework participation (§16.2/§16.3): exact-FQN-gated review warnings when the encapsulated field carries a
+            // JPA mapping annotation (field-access entity) or a Jackson member binding the new accessors could alter.
+            javax.lang.model.element.Element fieldOwner = field.element().getEnclosingElement();
+            if (fieldOwner instanceof javax.lang.model.element.TypeElement ownerType) {
+                warnings.addAll(FrameworkEncapsulationReview.reviewWarnings(
+                        index, ownerType.getQualifiedName().toString(), field.element().getSimpleName().toString()));
+            }
             return ResponseBuilder.acceptedResult(projectRoot, "encapsulateField", apply,
                     "{\"identity\":" + encapsulateKeyJson + ",\"semanticKey\":" + encapsulateKeyJson + "}",
-                    semanticEdits, java.util.List.of(), List.of(
-                    "V2 encapsulateField resolves the field and same-project references with javac Elements/source positions, refusing unsupported write contexts."),
+                    semanticEdits, java.util.List.of(), warnings,
                     java.util.List.of("field refactor semantic target resolved by javac"), ResponseBuilder.DiagnosticDelta.unvalidated(), false);
             }
         } catch (Refusal refusal) {

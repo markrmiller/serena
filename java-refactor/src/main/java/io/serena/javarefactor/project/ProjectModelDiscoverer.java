@@ -223,6 +223,9 @@ public final class ProjectModelDiscoverer {
                 List<Path> roots = new ArrayList<>();
                 roots.addAll(resolveAgainst(projectRoot, toPaths(modelSourceSet.srcDirs())));
                 List<Path> generatedRoots = resolveAgainst(projectRoot, toPaths(modelSourceSet.generatedRoots()));
+                // B11: the model-declared resource roots, resolved to absolute paths exactly like the source/generated
+                // roots, threaded into the SourceSet so ResourceRootModel discovers them model-first.
+                List<Path> resourceRoots = resolveAgainst(projectRoot, toPaths(modelSourceSet.resourceDirs()));
                 List<String> crossModuleDependsOn = new ArrayList<>();
                 if (multiModule) {
                     for (String dependency : modelSourceSet.dependsOnProjects()) {
@@ -244,7 +247,8 @@ public final class ProjectModelDiscoverer {
                         invalidationFiles,
                         crossModuleDependsOn,
                         modelSourceSet.compilerArgs(),
-                        modelSourceSet.classpathProven());
+                        modelSourceSet.classpathProven(),
+                        resourceRoots);
                 if (!sourceSet.javaFiles().isEmpty()) {
                     sourceSets.add(sourceSet);
                 }
@@ -296,7 +300,10 @@ public final class ProjectModelDiscoverer {
                 // Conventional/explicit/plain source sets use the config-supplied classpath directly (no build-classpath
                 // resolution step), so there is no "unproven" condition here. (Conventional FALLBACK after a failed
                 // extraction is flagged separately via conventionalFallbackUsed, which refuses apply.)
-                true);
+                true,
+                // B11: these source sets carry no model-declared resource roots (no build-model extraction); the resolver
+                // then derives resource roots from the filename convention as the guarded fallback.
+                List.of());
     }
 
     /**
@@ -319,8 +326,12 @@ public final class ProjectModelDiscoverer {
             List<Path> invalidationFiles,
             List<String> crossModuleDependsOn,
             List<String> extractedCompilerArgs,
-            boolean classpathProven) {
+            boolean classpathProven,
+            List<Path> resourceRoots) {
         List<Path> existingRoots = roots.stream().map(Path::toAbsolutePath).map(Path::normalize).filter(Files::isDirectory).distinct().sorted().toList();
+        // B11: normalize/dedup/sort the model-declared resource roots (existence is re-checked by ResourceRootModel,
+        // which only returns directories that exist), mirroring how source/generated roots are normalized.
+        List<Path> normalizedResourceRoots = resourceRoots.stream().map(Path::toAbsolutePath).map(Path::normalize).distinct().sorted().toList();
         List<Path> normalizedGeneratedRoots = generatedRoots.stream().map(Path::toAbsolutePath).map(Path::normalize).distinct().sorted().toList();
         List<Path> analysisRoots = config.generatedSourcesRead()
                 ? Stream.concat(existingRoots.stream(), normalizedGeneratedRoots.stream().filter(Files::isDirectory))
@@ -364,7 +375,8 @@ public final class ProjectModelDiscoverer {
                 javacOptions,
                 invalidationFiles,
                 combineDependsOn(name, crossModuleDependsOn),
-                classpathProven
+                classpathProven,
+                normalizedResourceRoots
         );
     }
 
@@ -967,7 +979,11 @@ public final class ProjectModelDiscoverer {
                                 readModelString(sourceSetMap, "target", null),
                                 readModelString(sourceSetMap, "encoding", null),
                                 readModelStringList(sourceSetMap, "dependsOnProjects", "depends_on_projects"),
-                                readModelStringList(sourceSetMap, "compilerArgs", "compiler_args")));
+                                readModelStringList(sourceSetMap, "compilerArgs", "compiler_args"),
+                                // Explicit/conventional models carry a proven classpath (no build-classpath step); B11
+                                // resource roots are read from an explicit "resourceDirs"/"resource_dirs" field when given.
+                                true,
+                                readModelStringList(sourceSetMap, "resourceDirs", "resource_dirs", "resourceRoots", "resource_roots")));
                     }
                 } else {
                     // §17.3 flat-module form: each module entry carries sourceRoots/classpath/release directly (no
@@ -988,7 +1004,9 @@ public final class ProjectModelDiscoverer {
                                 readModelString(moduleMap, "target", null),
                                 readModelString(moduleMap, "encoding", null),
                                 readModelStringList(moduleMap, "dependsOnProjects", "depends_on_projects"),
-                                readModelStringList(moduleMap, "compilerArgs", "compiler_args")));
+                                readModelStringList(moduleMap, "compilerArgs", "compiler_args"),
+                                true,
+                                readModelStringList(moduleMap, "resourceDirs", "resource_dirs", "resourceRoots", "resource_roots")));
                     }
                 }
                 // For the flat-module form the user supplies "name" (not "project"); prefer "project" for compat with

@@ -7,10 +7,12 @@ import io.serena.javarefactor.edits.*;
 import io.serena.javarefactor.safedelete.*;
 import io.serena.javarefactor.operations.move_member.*;
 import io.serena.javarefactor.operations.inline_method.*;
+import io.serena.javarefactor.v3.resources.*;
 
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.NestingKind;
 import javax.lang.model.element.TypeElement;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -143,10 +145,28 @@ public final class SemanticRenamePlanner {
             // Safety surface (warning-only): incomplete-classpath/annotation-processing caveats, plus a reflection/
             // resource caveat when a type's name changes (Class.forName, ServiceLoader, Spring/XML/serialization, etc.).
             warnings.addAll(PlannerSupport.modelSafetyWarnings(model));
-            if (targetElement instanceof TypeElement) {
+            List<PlannerSupport.TextEdit> resourceEdits = List.of();
+            List<ResourceFileRename> resourceFileRenames = List.of();
+            if (targetElement instanceof TypeElement renamedType) {
                 warnings.add(PlannerSupport.reflectionResourceCaveat("type '" + oldName + "'"));
+                // Precise, exact-FQN-resolved framework string bindings that change with the type's simple name
+                // (JPA entity name in JPQL, Spring default bean name) — surfaced review-required, never auto-rewritten.
+                warnings.addAll(FrameworkRenameReview.reviewWarnings(
+                        index, model.projectRoot(), renamedType.getQualifiedName().toString(), oldName, newName));
+                // EXACT fully-qualified class references in resources (Spring/CDI <bean class=>, JPA persistence.xml
+                // <class>, META-INF/services/*) DO move with a top-level type rename — its FQN changes — so they are
+                // auto-rewritten at HIGH confidence (distinct from the review-only string bindings above). Nested types
+                // are skipped: their resource encoding uses a binary '$' name the FQN-token engine does not match.
+                if (renamedType.getNestingKind() == NestingKind.TOP_LEVEL) {
+                    TypeRenameResourceRewrite rewrite = rewriteResourceClassReferences(
+                            model, renamedType.getQualifiedName().toString(), newName);
+                    resourceEdits = rewrite.edits();
+                    resourceFileRenames = rewrite.fileRenames();
+                    warnings.addAll(rewrite.warnings());
+                }
             }
-            return workspaceEditJson(model.projectRoot(), analysis, references, fileRename, newName, warnings);
+            return workspaceEditJson(model.projectRoot(), analysis, references, fileRename, newName, warnings,
+                    resourceEdits, resourceFileRenames);
         }
     }
 
@@ -164,18 +184,69 @@ public final class SemanticRenamePlanner {
                 .toList();
     }
 
-    private static String workspaceEditJson(Path projectRoot, RefactorAnalysisResult analysis, List<IdentifierSpan> references, FileRename fileRename, String newName, List<String> warnings) throws IOException {
+    /** Resource-layer rewrites (exact-FQN class references + service-loader file renames) for a top-level type rename. */
+    private record TypeRenameResourceRewrite(
+            List<PlannerSupport.TextEdit> edits, List<ResourceFileRename> fileRenames, List<String> warnings) {
+    }
+
+    /**
+     * Rewrites EXACT fully-qualified class references to a renamed top-level type in project resources. A type rename
+     * keeps the package but changes the simple name, so the type's FQN changes ({@code com.acme.Old → com.acme.New});
+     * the unified resource engine (the same {@link ResourcePlanner} behind package rename/move and the {@code resources.*}
+     * SPI) rewrites the string-encoded FQN tokens the compiler never sees — Spring/CDI {@code class="…"} attributes, JPA
+     * {@code <class>…</class>} in persistence.xml, and exact-FQN values in properties/yaml/json — at HIGH confidence
+     * ({@code rewriteExactClassNames}), and renames a {@code META-INF/services/<fqn>} registration whose service-interface
+     * FQN is this type (§15.2). Bare package prefixes and reflective {@code "pkg." + name} strings are NOT touched (the
+     * simple name moved, not a package), so no MEDIUM/package-prefix rewriting is requested.
+     */
+    private static TypeRenameResourceRewrite rewriteResourceClassReferences(
+            JavaProjectModel model, String oldFqn, String newName) throws IOException {
+        int lastDot = oldFqn.lastIndexOf('.');
+        String newFqn = lastDot < 0 ? newName : oldFqn.substring(0, lastDot + 1) + newName;
+        ResourceRenameRequest request = new ResourceRenameRequest(Map.of(oldFqn, newFqn), Map.of(), true, false);
+        ResourceScanScope scope = new ResourceScanScope(true, true, true, true, true);
+        ResourcePlanner.ResourcePlan plan = new ResourcePlanner(model.projectRoot(), model).plan(request, scope);
+
+        List<PlannerSupport.TextEdit> edits = new ArrayList<>();
+        for (ResourceEdit edit : plan.edits()) {
+            edits.add(new PlannerSupport.TextEdit(edit.file(), edit.startOffset(), edit.endOffset(), edit.newText(),
+                    "RESOURCE_REFERENCE:" + edit.confidence().name()));
+        }
+        List<String> warnings = new ArrayList<>(plan.warnings());
+        for (ResourceFileRename rename : plan.fileRenames()) {
+            warnings.add("ServiceLoader registration '" + relative(model.projectRoot(), rename.from())
+                    + "' names the renamed service interface and was renamed to '"
+                    + relative(model.projectRoot(), rename.to()) + "' (§15.2).");
+        }
+        return new TypeRenameResourceRewrite(edits, plan.fileRenames(), warnings);
+    }
+
+    private static String workspaceEditJson(Path projectRoot, RefactorAnalysisResult analysis, List<IdentifierSpan> references, FileRename fileRename, String newName, List<String> warnings,
+            List<PlannerSupport.TextEdit> resourceEdits, List<ResourceFileRename> resourceFileRenames) throws IOException {
         // Every reference (including the declaration's own span) is rewritten in place under its CURRENT path. For a
         // top-level type rename the declaration file is renamed by the file operation AFTER these text edits are staged,
-        // so the edits target the old path and the rename moves the already-edited content to the new path.
-        List<PlannerSupport.TextEdit> edits = references.stream()
+        // so the edits target the old path and the rename moves the already-edited content to the new path. Resource
+        // edits (string-encoded FQN tokens in non-Java files) are appended verbatim — they carry their own file/offsets.
+        List<PlannerSupport.TextEdit> edits = new ArrayList<>(references.stream()
                 .map(span -> new PlannerSupport.TextEdit(span.file(), span.startOffset(), span.endOffset(), newName,
                         span.startOffset() == analysis.target().span().startOffset() && span.file().equals(analysis.target().span().file())
                                 ? "DECLARATION" : "REFERENCE"))
-                .toList();
+                .toList());
+        edits.addAll(resourceEdits);
         String changes = PlannerSupport.changesJson(projectRoot, edits);
-        String fileOperations = fileRename == null ? "[]" : "[" + PlannerSupport.renameFileOp(projectRoot, fileRename.oldPath(), fileRename.newPath()) + "]";
-        long touchedFileCount = references.stream().map(IdentifierSpan::file).distinct().count();
+
+        List<String> fileOps = new ArrayList<>();
+        if (fileRename != null) {
+            fileOps.add(PlannerSupport.renameFileOp(projectRoot, fileRename.oldPath(), fileRename.newPath()));
+        }
+        for (ResourceFileRename rename : resourceFileRenames) {
+            fileOps.add(PlannerSupport.renameFileOp(projectRoot,
+                    relative(projectRoot, rename.from()), relative(projectRoot, rename.to())));
+        }
+        String fileOperations = "[" + String.join(",", fileOps) + "]";
+
+        long touchedFileCount = edits.stream().map(PlannerSupport.TextEdit::file).distinct().count();
+        int fileOperationCount = fileOps.size();
         String warningsJson = warnings.stream().map(JsonUtil::quote).collect(Collectors.joining(",", "[", "]"));
         return "{"
                 + "\"accepted\":true,"
@@ -185,9 +256,9 @@ public final class SemanticRenamePlanner {
                 + "\"fileOperations\":" + fileOperations + ","
                 + "\"warnings\":" + warningsJson + ","
                 + "\"preconditions\":[\"post-javac validation required before apply\"],"
-                + "\"stats\":{\"editCount\":" + references.size() + ",\"fileOperationCount\":" + (fileRename == null ? 0 : 1) + ",\"touchedFileCount\":" + touchedFileCount + "}"
+                + "\"stats\":{\"editCount\":" + edits.size() + ",\"fileOperationCount\":" + fileOperationCount + ",\"touchedFileCount\":" + touchedFileCount + "}"
                 + "},"
-                + "\"stats\":{\"editCount\":" + references.size() + ",\"fileOperationCount\":" + (fileRename == null ? 0 : 1) + "}"
+                + "\"stats\":{\"editCount\":" + edits.size() + ",\"fileOperationCount\":" + fileOperationCount + "}"
                 + "}";
     }
 

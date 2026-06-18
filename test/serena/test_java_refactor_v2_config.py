@@ -103,19 +103,19 @@ def test_from_dict_none_yields_defaults() -> None:
 
 
 def test_unknown_top_level_v2_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"Unknown java_refactor v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown java_refactor config key"):
         JavaRefactorV2Config.from_dict({"bogus": 1})
 
 
 def test_unknown_nested_v2_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"Unknown sessions v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown sessions config key"):
         JavaRefactorV2Config.from_dict({"sessions": {"bogus_key": 1}})
 
 
 def test_unknown_key_rejected_via_java_refactor_config_from_dict() -> None:
     # The strict schema is enforced through the full JavaRefactorConfig.from_dict YAML-load path, not only the
     # standalone dataclass.
-    with pytest.raises(ValueError, match=r"Unknown change_signature v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown change_signature config key"):
         JavaRefactorConfig.from_dict({"v2": {"change_signature": {"typo": True}}})
 
 
@@ -280,7 +280,7 @@ def test_per_domain_round_trip_introduce_field() -> None:
 
 
 def test_unknown_introduce_field_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"Unknown introduce_field v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown introduce_field config key"):
         JavaRefactorV2Config.from_dict({"introduce_field": {"bogus": True}})
 
 
@@ -318,7 +318,7 @@ def test_formatting_use_external_formatter_must_be_bool() -> None:
 
 
 def test_unknown_formatting_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"Unknown formatting v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown formatting config key"):
         JavaRefactorV2Config.from_dict({"formatting": {"bogus": True}})
 
 
@@ -434,7 +434,7 @@ def test_style_defaults_when_absent() -> None:
 
 
 def test_unknown_style_key_rejected() -> None:
-    with pytest.raises(ValueError, match=r"Unknown style v2 config key"):
+    with pytest.raises(ValueError, match=r"Unknown style config key"):
         JavaRefactorV2Config.from_dict({"style": {"bogus_style_key": True}})
 
 

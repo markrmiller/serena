@@ -56,6 +56,9 @@ public final class Main {
     private final ExtractionCache extractionCache = new ExtractionCache();
     private final RefactorSessionManager sessionManager = new RefactorSessionManager();
     private final PreviewDiagnosticValidator previewDiagnosticValidator = new PreviewDiagnosticValidator();
+    // V3 transformation-workspace registry (refactor-feature-plan-V3.md §1.1). Lazily built on first transformation.*
+    // request because it needs projectRoot (only known after initialize) and the injected sidecar callbacks.
+    private io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager transformationWorkspaceManager;
 
     private Main() {
         this.initialized = false;
@@ -243,6 +246,20 @@ public final class Main {
 
     private static int intValue(Object value) {
         return value instanceof Number number ? number.intValue() : 0;
+    }
+
+    /**
+     * Returns the first positively-valued integer found in {@code map} under any of {@code keys}, or {@code defaultValue}
+     * when none of the keys are present or the stored value is not a positive number.
+     */
+    private static int positiveIntOrDefault(Map<?, ?> map, int defaultValue, String... keys) {
+        for (String key : keys) {
+            Object raw = map.get(key);
+            if (raw instanceof Number n && n.intValue() > 0) {
+                return n.intValue();
+            }
+        }
+        return defaultValue;
     }
 
     /** The plan's workspaceEdit preconditions, surfaced as the top-level contract array (empty when none). */
@@ -505,6 +522,15 @@ public final class Main {
         }
     }
 
+    /**
+     * The non-Java rewrite policy (module-info/resource/reflective handling, §5.4/§5.5) for the v3 package planners,
+     * resolved from {@code java_refactor.v3.packages}/{@code java_refactor.v3.resources}. An absent/foreign config
+     * yields {@link io.serena.javarefactor.v3.packages.PackageRewritePolicy#defaults()}.
+     */
+    private io.serena.javarefactor.v3.packages.PackageRewritePolicy packageRewritePolicy() {
+        return io.serena.javarefactor.v3.packages.PackageRewritePolicy.fromConfig(effectiveConfigurationMap());
+    }
+
     private static Map<?, ?> operationConfig(Map<String, Object> config, String operation) {
         return switch (operation) {
             case "changeSignature", "introduceParameter" -> mapValue(config, "change_signature", "changeSignature");
@@ -515,6 +541,9 @@ public final class Main {
             case "encapsulateField" -> mapValue(config, "encapsulate_field", "encapsulateField");
             case "inlineMethod" -> mapValue(config, "inline_method", "inlineMethod");
             case "introduceField" -> mapValue(config, "introduce_field", "introduceField");
+            case "renamePackage" -> mapValue(config, "rename_package", "renamePackage");
+            case "movePackage" -> mapValue(config, "move_package", "movePackage");
+            case "moveSourceRoot" -> mapValue(config, "move_source_root", "moveSourceRoot");
             default -> Map.of();
         };
     }
@@ -523,7 +552,8 @@ public final class Main {
     // (semanticRename/safeDelete/moveTopLevelType/inlineLocalVariable/inlineConstant) are intentionally excluded.
     private static final java.util.Set<String> V2_OPERATIONS = java.util.Set.of(
             "inlineMethod", "changeSignature", "introduceParameter", "moveStaticMember", "moveInstanceMethod",
-            "pullUpMember", "pushDownMember", "extractMethod", "extractInterface", "introduceField", "encapsulateField");
+            "pullUpMember", "pushDownMember", "extractMethod", "extractInterface", "introduceField", "encapsulateField",
+            "renamePackage", "movePackage", "moveSourceRoot");
 
     private static boolean isV2Operation(String operation) {
         return V2_OPERATIONS.contains(operation);
@@ -567,6 +597,117 @@ public final class Main {
         return refusalJson("operation_disabled",
                 "Java refactor operation '" + operation + "' is disabled by configuration "
                         + "(java_refactor.v2.enabled or the operation's enabled flag is false).");
+    }
+
+    // ── B14: V3 dispatch capability gate (refactor-feature-plan-V3.md §20) ────────────────────────────────────────────
+    // The dedicated V3 JSON-RPC methods (transformation.*, deletion.*, classRefactor.*, conversions.*, inlineRefactor.*,
+    // recipes.*, resources.*, frameworks.*, impact.facts) reach their planners directly and therefore bypass the
+    // preview/apply operationEnabled() gate. Without this gate, a project that disables a V3 op (or all of V3) via
+    // java_refactor.v3 config would still have the op run. Each method maps to its §20 config section + per-op enable
+    // flag; the global java_refactor.v3.enabled flag overrides every section.
+
+    /** A V3 method's config gate: the v3 sub-section and the per-op boolean flag (null -> the section's own "enabled"). */
+    private record V3Gate(String section, String flag) {}
+
+    private static final Map<String, V3Gate> V3_DISPATCH_GATES = Map.ofEntries(
+            Map.entry("transformation.createWorkspace", new V3Gate("transformations", null)),
+            Map.entry("transformation.preview", new V3Gate("transformations", null)),
+            Map.entry("transformation.apply", new V3Gate("transformations", null)),
+            Map.entry("transformation.cancel", new V3Gate("transformations", null)),
+            Map.entry("transformation.list", new V3Gate("transformations", null)),
+            Map.entry("transformation.report", new V3Gate("transformations", null)),
+            Map.entry("deletion.propagateSafeDelete", new V3Gate("deletion", "propagate_enabled")),
+            Map.entry("deletion.findDeadCode", new V3Gate("deletion", null)),
+            Map.entry("classRefactor.extractClass", new V3Gate("class_refactors", "extract_class_enabled")),
+            Map.entry("classRefactor.extractSuperclass", new V3Gate("class_refactors", "extract_superclass_enabled")),
+            Map.entry("classRefactor.replaceInheritanceWithDelegation",
+                    new V3Gate("class_refactors", "replace_inheritance_with_delegation_enabled")),
+            Map.entry("conversions.anonymousToLambda", new V3Gate("conversions", "anonymous_to_lambda_enabled")),
+            Map.entry("conversions.lambdaToMethodReference",
+                    new V3Gate("conversions", "lambda_to_method_reference_enabled")),
+            Map.entry("inlineRefactor.deepInlineMethod", new V3Gate("inline", "deep_inline_enabled")),
+            Map.entry("recipes.scanMigrationOpportunities", new V3Gate("recipes", null)),
+            Map.entry("recipes.applyRecipe", new V3Gate("recipes", null)),
+            Map.entry("resources.findReferences", new V3Gate("resources", null)),
+            Map.entry("resources.planEdits", new V3Gate("resources", null)),
+            Map.entry("frameworks.detect", new V3Gate("frameworks", null)),
+            Map.entry("frameworks.findReferences", new V3Gate("frameworks", null)),
+            Map.entry("frameworks.participate", new V3Gate("frameworks", null)),
+            Map.entry("graph.build", new V3Gate("transformations", null)),
+            Map.entry("impact.facts", new V3Gate(null, null)));
+
+    /**
+     * Returns a canonical {@code operation_disabled} refusal when {@code method} is a dispatched V3 op disabled by the
+     * effective {@code java_refactor.v3} configuration, or {@code null} when the op may proceed. Default/empty/foreign
+     * config and an absent v3 block leave every op enabled (these ship enabled by default), matching the V2 gate's
+     * "unset never disables" semantics. The global {@code v3.enabled} flag overrides every section; a per-op flag (or the
+     * section's own {@code enabled}) disables just that op.
+     */
+    private String v3DispatchGateRefusal(String method) {
+        String configPath = v3DisablingFlag(method);
+        return configPath == null ? null : v3DisabledRefusalJson(method, configPath);
+    }
+
+    /** True when {@code operation} is one of the dedicated V3 dispatch methods (those in {@link #V3_DISPATCH_GATES}). */
+    private static boolean isV3DispatchOperation(String operation) {
+        return V3_DISPATCH_GATES.containsKey(operation);
+    }
+
+    /** True when a dispatched V3 op is not disabled by the effective {@code java_refactor.v3} configuration. */
+    private boolean v3OperationEnabled(String method) {
+        return v3DisablingFlag(method) == null;
+    }
+
+    /**
+     * Returns the dotted config path of the flag that disables a dispatched V3 op (e.g.
+     * {@code java_refactor.v3.enabled} or {@code java_refactor.v3.deletion.propagate_enabled}), or {@code null} when the
+     * op may proceed. Default/empty/foreign config and an absent v3 block leave every op enabled (these ship enabled by
+     * default), matching the V2 gate's "unset never disables" semantics. The global {@code v3.enabled} flag overrides
+     * every section; a per-op flag (or the section's own {@code enabled}) disables just that op.
+     */
+    private String v3DisablingFlag(String method) {
+        V3Gate gate = V3_DISPATCH_GATES.get(method);
+        if (gate == null) {
+            return null;
+        }
+        Map<String, Object> config = effectiveConfigurationMap();
+        if (config.isEmpty()) {
+            return null;
+        }
+        Map<?, ?> v3 = v3ConfigSection(config);
+        if (v3.isEmpty()) {
+            return null;
+        }
+        if (v3.containsKey("enabled") && !boolValue(v3.get("enabled"), true)) {
+            return "java_refactor.v3.enabled";
+        }
+        if (gate.section() != null) {
+            Object sectionValue = v3.get(gate.section());
+            Map<?, ?> section = sectionValue instanceof Map<?, ?> map ? map : Map.of();
+            String flag = gate.flag() != null ? gate.flag() : "enabled";
+            if (section.containsKey(flag) && !boolValue(section.get(flag), true)) {
+                return "java_refactor.v3." + gate.section() + "." + flag;
+            }
+        }
+        return null;
+    }
+
+    /** Navigates the effective config to the {@code java_refactor.v3} block (snake_case or camelCase), or empty. */
+    private static Map<?, ?> v3ConfigSection(Map<String, Object> config) {
+        Object javaRefactor = config.get("java_refactor");
+        if (!(javaRefactor instanceof Map<?, ?>)) {
+            javaRefactor = config.get("javaRefactor");
+        }
+        if (!(javaRefactor instanceof Map<?, ?> javaRefactorMap)) {
+            return Map.of();
+        }
+        Object v3 = javaRefactorMap.get("v3");
+        return v3 instanceof Map<?, ?> v3Map ? v3Map : Map.of();
+    }
+
+    private String v3DisabledRefusalJson(String method, String configPath) {
+        return refusalJson("operation_disabled",
+                "Java refactor V3 operation '" + method + "' is disabled by configuration (" + configPath + " is false).");
     }
 
     /**
@@ -619,6 +760,12 @@ public final class Main {
         String v2NormalizationRefusal = normalizeV2SessionRequest(fields);
         if (v2NormalizationRefusal != null) {
             return response(id, v2NormalizationRefusal);
+        }
+        // B14: capability-gate every dedicated V3 JSON-RPC method against java_refactor.v3 config before dispatch, so a
+        // disabled-by-config V3 op cannot run merely because it bypasses the preview/apply operationEnabled() gate.
+        String v3GateRefusal = v3DispatchGateRefusal(method);
+        if (v3GateRefusal != null) {
+            return response(id, v3GateRefusal);
         }
         switch (method) {
             case "initialize":
@@ -681,6 +828,18 @@ public final class Main {
                         // workspaceEdit. A refused validation result is returned as-is (never downgraded into an apply).
                         operationJson = downgradeV2DirectApply(operationJson);
                     }
+                    // B1/B2: the package-relocation ops (renamePackage, movePackage, moveSourceRoot) can each emit a §6.3
+                    // build-file rewrite (and, for resources, resource edits), so they must carry the canonical §1.1
+                    // impact + §14.3 risk envelope like every other V3 op that touches non-Java files. The generic
+                    // operation path does not augment, so apply it here; augment is a no-op when impact/risk are already
+                    // present or the result is not an accepted workspace edit. Augmenting also makes a planner result with
+                    // resourceScanIncomplete:true (or a non-empty analysisIncomplete riskFact) flow through classifyRisk
+                    // to "needs_review", so the Python apply gate blocks SAFE auto-apply for an incomplete-scan package op.
+                    if ("renamePackage".equals(operation)
+                            || "movePackage".equals(operation)
+                            || "moveSourceRoot".equals(operation)) {
+                        operationJson = CanonicalEnvelope.augment(operationJson);
+                    }
                     return response(id, operationJson);
                 }
                 return response(id, refactorResultJson(applyRequested, operation));
@@ -706,9 +865,76 @@ public final class Main {
                 return response(id, semanticAnalysisJson(fields, false));
             case "scanReferences":
                 return response(id, semanticAnalysisJson(fields, true));
+            case "transformation.createWorkspace":
+                return response(id, CanonicalEnvelope.augment(transformationCreateWorkspaceJson(fields)));
+            case "transformation.preview":
+                return response(id, CanonicalEnvelope.augment(transformationWorkspaceCall(fields, "preview")));
+            case "transformation.apply":
+                return response(id, CanonicalEnvelope.augment(transformationApplyJson(fields)));
+            case "transformation.cancel":
+                return response(id, transformationWorkspaceCall(fields, "cancel"));
+            case "transformation.list":
+                return response(id, transformationListJson());
+            case "transformation.report":
+                return response(id, CanonicalEnvelope.augmentReadOnly(transformationWorkspaceCall(fields, "report")));
+            case "deletion.propagateSafeDelete":
+                return response(id, CanonicalEnvelope.augment(propagateSafeDeleteJson(fields)));
+            case "deletion.findDeadCode":
+                return response(id, CanonicalEnvelope.augmentReadOnly(findDeadCodeJson(fields)));
+            case "classRefactor.extractClass":
+                return response(id, CanonicalEnvelope.augment(extractClassJson(fields)));
+            case "classRefactor.extractSuperclass":
+                return response(id, CanonicalEnvelope.augment(extractSuperclassJson(fields)));
+            case "classRefactor.replaceInheritanceWithDelegation":
+                return response(id, CanonicalEnvelope.augment(replaceInheritanceWithDelegationJson(fields)));
+            case "conversions.anonymousToLambda":
+                return response(id, CanonicalEnvelope.augment(anonymousToLambdaJson(fields)));
+            case "conversions.lambdaToMethodReference":
+                return response(id, CanonicalEnvelope.augment(lambdaToMethodReferenceJson(fields)));
+            case "inlineRefactor.deepInlineMethod":
+                return response(id, CanonicalEnvelope.augment(deepInlineMethodJson(fields)));
+            case "recipes.scanMigrationOpportunities":
+                return response(id, CanonicalEnvelope.augmentReadOnly(scanMigrationOpportunitiesJson(fields)));
+            case "recipes.applyRecipe":
+                return response(id, CanonicalEnvelope.augment(applyRecipeJson(fields)));
+            case "resources.findReferences":
+                return response(id, findResourceReferencesJson(fields));
+            case "resources.planEdits":
+                return response(id, planResourceEditsJson(fields));
+            case "frameworks.detect":
+                return response(id, detectFrameworksJson(fields));
+            case "frameworks.findReferences":
+                return response(id, findFrameworkReferencesJson(fields));
+            case "frameworks.participate":
+                return response(id, participateFrameworksJson(fields));
+            case "graph.build":
+                return response(id, CanonicalEnvelope.augmentReadOnly(graphBuildJson(fields)));
+            case "graph.buildCount":
+                // Diagnostic-only observability hook for the F-GRAPH caching/invalidation test: returns how many times
+                // the unified TransformationGraph has been materialized (advances on a cache MISS, stays flat on a HIT).
+                // Reads a static counter; carries no model state and mutates nothing.
+                return response(id, "{\"accepted\":true,\"builds\":"
+                        + io.serena.javarefactor.v3.graph.GraphInvalidation.buildCount() + "}");
+            case "graph.incrementalUpdateCount":
+                // Diagnostic-only observability hook for the R05 incremental-maintenance test: returns how many times a
+                // new revision was served by an INCREMENTAL update (re-extracting only the affected files) rather than a
+                // full rebuild. Advances on an incremental cache miss; stays flat on a HIT or a full rebuild. Reads a
+                // static counter; carries no model state and mutates nothing.
+                return response(id, "{\"accepted\":true,\"incrementalUpdates\":"
+                        + io.serena.javarefactor.v3.graph.GraphInvalidation.incrementalUpdateCount() + "}");
+            case "impact.facts":
+                return response(id, impactFactsJson(fields));
+            case "reachabilityGraph.buildCount":
+                // Diagnostic-only observability hook for the G-CACHE hit/miss test: returns how many times the
+                // ReachabilityGraph has been walked (advances on a cache MISS, stays flat on a HIT). Reads a static
+                // counter; carries no model state and mutates nothing.
+                return response(id, "{\"accepted\":true,\"builds\":"
+                        + io.serena.javarefactor.compiler.ReachabilityGraph.buildInvocationCount() + "}");
             case "shutdown":
                 shutdownRequested = true;
                 FileManagerPool.INSTANCE.invalidate();
+                io.serena.javarefactor.compiler.ReachabilityGraphCache.INSTANCE.invalidate();
+                io.serena.javarefactor.v3.graph.GraphInvalidation.INSTANCE.invalidate();
                 return response(id, "{\"shutdown\":true}");
             default:
                 return error(id, "unsupported method: " + method);
@@ -735,6 +961,9 @@ public final class Main {
             case "extractInterface" -> extractInterfaceJson(fields, apply);
             case "introduceField" -> introduceFieldJson(fields, apply);
             case "encapsulateField" -> encapsulateFieldJson(fields, apply);
+            case "renamePackage" -> renamePackageJson(fields, apply);
+            case "movePackage" -> movePackageJson(fields, apply);
+            case "moveSourceRoot" -> moveSourceRootJson(fields, apply);
             default -> null;
         };
     }
@@ -1132,7 +1361,8 @@ public final class Main {
             "semanticRename", "safeDelete", "moveTopLevelType", "inlineLocalVariable", "inlineConstant",
             "inlineMethod", "refactorSessions", "moveStaticMember", "moveInstanceMethod", "extractInterface",
             "introduceField", "encapsulateField", "changeSignature", "introduceParameter",
-            "pullUpMember", "pushDownMember", "extractMethod", "rename"
+            "pullUpMember", "pushDownMember", "extractMethod", "rename", "renamePackage", "movePackage",
+            "moveSourceRoot"
             );
 
     private static boolean operationReady(String operation) {
@@ -1164,13 +1394,55 @@ public final class Main {
             new CapabilitySpec("extractMethod", "beta", "Extract a zero-output or single-output complete-statement selection, or a complete expression, into a new method with scope-aware unique names; refuses multi-output selections, control-flow-exit (return/break/continue) selections, and non-extractable selections."),
             new CapabilitySpec("extractInterface", "beta", "Extract public instance methods into a new interface and add implements, preserving covariant/generic signatures with import transfer."),
             new CapabilitySpec("introduceField", "beta", "Extract an initializer to a private final field with javac scope-bound qualification; refuses checked-exception and non-eligible initializers per the field policy."),
-            new CapabilitySpec("encapsulateField", "beta", "Generate JavaBean accessors and route direct reads/writes through them; refuses accessor collisions and always refuses compound-assignment and increment/decrement usages."));
+            new CapabilitySpec("encapsulateField", "beta", "Generate JavaBean accessors and route direct reads/writes through them; refuses accessor collisions and always refuses compound-assignment and increment/decrement usages."),
+            new CapabilitySpec("renamePackage", "beta", "Rename a package across the project: rewrite package declarations, move files to the new package directory under the same source root, and update imports and fully-qualified references; refuses target-package simple-name collisions, non-editable targets, and an unknown source package (subpackages are not renamed)."),
+            new CapabilitySpec("movePackage", "beta", "Move a package and (by default) its subpackages to a target package, optionally under a different configured source root: rewrite package declarations, relocate files, and update imports and fully-qualified references; refuses destination simple-name collisions, non-editable or unknown targets, and an unknown source package."),
+            new CapabilitySpec("moveSourceRoot", "beta", "Relocate Java source files from one configured source root to another while keeping their package declarations unchanged, optionally restricted to specific packages: emits file moves only, leaving fully-qualified names and imports untouched. When the target is not an already-configured source root and rewriteBuildFiles=true, also emits an additive, parse-verified build-file registration of the target root (Gradle sourceSets srcDir, or Maven build-helper-maven-plugin add-source/add-test-source). Refuses an unknown source or target root, a destination file collision, a non-editable target, and a genuinely unsupported build-file shape (build_file_rewrite_unsupported)."));
+
+    // F1: every dedicated V3 dispatch method (the keys of V3_DISPATCH_GATES) is enumerated in the public capability
+    // contract so the advertised surface matches what the sidecar actually dispatches. These ship as "experimental"
+    // and report status "preview" until their finding (F2/F4-F13) lands and promotes them into READY_OPERATIONS;
+    // capabilityStatus reports "disabled" for any that the effective java_refactor.v3 config gates off. Descriptions
+    // state the real, currently-implemented behaviour of each dispatched method.
+    private static final List<CapabilitySpec> V3_DISPATCH_CAPABILITY_SPECS = List.of(
+            new CapabilitySpec("transformation.createWorkspace", "experimental", "Open a revision-guarded V3 transformation workspace for a canonical refactor operation."),
+            new CapabilitySpec("transformation.preview", "experimental", "Compute the preview workspace edit and impact report for a staged V3 transformation."),
+            new CapabilitySpec("transformation.apply", "experimental", "Apply a previewed V3 transformation under full project-revision guarding."),
+            new CapabilitySpec("transformation.cancel", "experimental", "Discard a staged V3 transformation workspace."),
+            new CapabilitySpec("transformation.list", "experimental", "List the live V3 transformation workspaces for the session."),
+            new CapabilitySpec("transformation.report", "experimental", "Return the impact report for a staged V3 transformation."),
+            new CapabilitySpec("deletion.propagateSafeDelete", "experimental", "Safe-delete a symbol and propagate cleanup (imports, empty packages, resource/bean entries) across the project."),
+            new CapabilitySpec("deletion.findDeadCode", "experimental", "Scan for unreferenced project symbols as dead-code candidates."),
+            new CapabilitySpec("classRefactor.extractClass", "experimental", "Extract selected members into a new class with their dependency closure and back-references."),
+            new CapabilitySpec("classRefactor.extractSuperclass", "experimental", "Extract members into a new superclass and rebase the source type onto it."),
+            new CapabilitySpec("classRefactor.replaceInheritanceWithDelegation", "experimental", "Replace a superclass with a delegate field and forwarding methods."),
+            new CapabilitySpec("conversions.anonymousToLambda", "experimental", "Convert eligible anonymous classes to lambda expressions."),
+            new CapabilitySpec("conversions.lambdaToMethodReference", "experimental", "Convert eligible lambda expressions to method references."),
+            new CapabilitySpec("inlineRefactor.deepInlineMethod", "experimental", "Inline a method transitively across its call graph where provably safe."),
+            new CapabilitySpec("recipes.scanMigrationOpportunities", "experimental", "Scan the project for declarative migration-recipe opportunities."),
+            new CapabilitySpec("recipes.applyRecipe", "experimental", "Apply a declarative migration recipe across the project."),
+            new CapabilitySpec("resources.findReferences", "experimental", "Find references to a type or package inside scanned non-Java resources."),
+            new CapabilitySpec("resources.planEdits", "experimental", "Plan safe in-place resource rewrites and file renames for moved types/packages."),
+            new CapabilitySpec("frameworks.detect", "experimental", "Detect frameworks (Spring/JPA/Jackson/JUnit) participating in the project."),
+            new CapabilitySpec("frameworks.findReferences", "experimental", "Find framework-mediated references (annotations/config) to a symbol."),
+            new CapabilitySpec("frameworks.participate", "experimental", "Let framework plugins participate in a symbol change: veto safe-deletes, validate metadata, contribute resource edits/warnings, and add reachability roots."),
+            new CapabilitySpec("graph.build", "experimental", "Build the cached, revision-keyed transformation graph (build layout, Java symbols, type hierarchy, calls, resource references, tests) for the project."),
+            new CapabilitySpec("impact.facts", "experimental", "Return structured impact facts (semantic/resource/test/API/risk) for a planned operation."));
+
+    /** The full advertised capability registry: the V2/V1 specs followed by every dedicated V3 dispatch method. */
+    private static final List<CapabilitySpec> ALL_CAPABILITY_SPECS = buildAllCapabilitySpecs();
+
+    private static List<CapabilitySpec> buildAllCapabilitySpecs() {
+        java.util.List<CapabilitySpec> all = new java.util.ArrayList<>(CAPABILITY_SPECS);
+        all.addAll(V3_DISPATCH_CAPABILITY_SPECS);
+        return List.copyOf(all);
+    }
 
     /** Public V2 contract map: operation name -> string lifecycle level (stable/beta/experimental). */
     private String capabilitiesJson() {
         StringBuilder sb = new StringBuilder("{");
-        for (int i = 0; i < CAPABILITY_SPECS.size(); i++) {
-            CapabilitySpec spec = CAPABILITY_SPECS.get(i);
+        for (int i = 0; i < ALL_CAPABILITY_SPECS.size(); i++) {
+            CapabilitySpec spec = ALL_CAPABILITY_SPECS.get(i);
             if (i > 0) {
                 sb.append(",");
             }
@@ -1182,8 +1454,8 @@ public final class Main {
     /** Sibling metadata map: operation name -> {level,status,description}, carrying the richer readiness detail. */
     private String capabilityDetailsJson() {
         StringBuilder sb = new StringBuilder("{");
-        for (int i = 0; i < CAPABILITY_SPECS.size(); i++) {
-            CapabilitySpec spec = CAPABILITY_SPECS.get(i);
+        for (int i = 0; i < ALL_CAPABILITY_SPECS.size(); i++) {
+            CapabilitySpec spec = ALL_CAPABILITY_SPECS.get(i);
             if (i > 0) {
                 sb.append(",");
             }
@@ -1194,11 +1466,15 @@ public final class Main {
 
     /**
      * Resolves the truthful capability status with precedence disabled > not-ready > supported. A V2 op disabled by
-     * config reports "disabled"; an op whose V2 hard requirements are not yet implemented reports "preview"; otherwise
-     * "supported". V1 stable ops are always "supported" (not gated by the V2 enable flag or readiness registry).
+     * config reports "disabled"; a dedicated V3 dispatch op disabled by the java_refactor.v3 config also reports
+     * "disabled"; an op whose hard requirements are not yet implemented (it is not in READY_OPERATIONS) reports
+     * "preview"; otherwise "supported". V1 stable ops are always "supported" (not gated by any enable flag).
      */
     private String capabilityStatus(String operation) {
         if (isV2Operation(operation) && !operationEnabled(operation)) {
+            return "disabled";
+        }
+        if (isV3DispatchOperation(operation) && !v3OperationEnabled(operation)) {
             return "disabled";
         }
         return operationReady(operation) ? "supported" : "preview";
@@ -1810,6 +2086,314 @@ public final class Main {
         }
     }
 
+    private String renamePackageJson(Map<String, Object> fields, boolean apply) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before renaming a package.");
+        }
+        String oldPackage = str(fields, "oldPackage");
+        String newPackage = str(fields, "newPackage");
+        if (oldPackage == null || oldPackage.isBlank() || newPackage == null || newPackage.isBlank()) {
+            return refusalJson("malformed_rename_package", "renamePackage requires oldPackage and newPackage.");
+        }
+        JavaProjectModel projectModel = discoverSemanticPlanningModel(fields);
+        String gateRefusal = modelGateRefusal(projectModel, apply);
+        if (gateRefusal != null) {
+            return gateRefusal;
+        }
+        try {
+            return new io.serena.javarefactor.v3.packages.RenamePackagePlanner(
+                    java.nio.file.Path.of(projectRoot), projectModel,
+                    packageRewritePolicy().withRequestOverrides(fields)).plan(fields, apply);
+        } catch (Exception e) {
+            return refusalJson("rename_package_failed", e.getMessage());
+        }
+    }
+
+    private String movePackageJson(Map<String, Object> fields, boolean apply) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before moving a package.");
+        }
+        String sourcePackage = str(fields, "sourcePackage");
+        String targetPackage = str(fields, "targetPackage");
+        if (sourcePackage == null || sourcePackage.isBlank() || targetPackage == null || targetPackage.isBlank()) {
+            return refusalJson("malformed_move_package", "movePackage requires sourcePackage and targetPackage.");
+        }
+        JavaProjectModel projectModel = discoverSemanticPlanningModel(fields);
+        String gateRefusal = modelGateRefusal(projectModel, apply);
+        if (gateRefusal != null) {
+            return gateRefusal;
+        }
+        try {
+            return new io.serena.javarefactor.v3.packages.MovePackagePlanner(
+                    java.nio.file.Path.of(projectRoot), projectModel,
+                    packageRewritePolicy().withRequestOverrides(fields)).plan(fields, apply);
+        } catch (Exception e) {
+            return refusalJson("move_package_failed", e.getMessage());
+        }
+    }
+
+    private String moveSourceRootJson(Map<String, Object> fields, boolean apply) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before moving a source root.");
+        }
+        String sourceRoot = str(fields, "sourceRoot");
+        String targetSourceRoot = str(fields, "targetSourceRoot");
+        if (sourceRoot == null || sourceRoot.isBlank() || targetSourceRoot == null || targetSourceRoot.isBlank()) {
+            return refusalJson("malformed_move_source_root",
+                    "moveSourceRoot requires sourceRoot and targetSourceRoot.");
+        }
+        JavaProjectModel projectModel = discoverSemanticPlanningModel(fields);
+        String gateRefusal = modelGateRefusal(projectModel, apply);
+        if (gateRefusal != null) {
+            return gateRefusal;
+        }
+        // §6.2 step 5/6: thread the preserve_package_names mode explicitly into the planner. When false, the planner
+        // recomputes each moved file's package from the directory mapping and runs the package-rename logic
+        // (declarations, imports, FQNs, module-info, resources); when true (default) it keeps declarations untouched.
+        fields.put("preservePackageNames", bool(fields, "preservePackageNames", true));
+        try {
+            return new io.serena.javarefactor.v3.packages.MoveSourceRootPlanner(
+                    java.nio.file.Path.of(projectRoot), projectModel,
+                    packageRewritePolicy().withRequestOverrides(fields)).plan(fields, apply);
+        } catch (Exception e) {
+            return refusalJson("move_source_root_failed", e.getMessage());
+        }
+    }
+
+    // ---- V3 transformation.* protocol (refactor-feature-plan-V3.md §1.1) ----
+
+    /**
+     * Lazily builds the transformation-workspace manager, wiring the sidecar-internal callbacks (model discovery, the
+     * package-private diagnostic validator, project-revision capture) it cannot reach itself. Returns null when the
+     * sidecar is not yet initialized.
+     */
+    private io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager transformationManager() {
+        if (transformationWorkspaceManager != null) {
+            return transformationWorkspaceManager;
+        }
+        if (!initialized || projectRoot == null) {
+            return null;
+        }
+        java.nio.file.Path root = java.nio.file.Path.of(projectRoot);
+        // Read java_refactor.v3.transformations config (§20 defaults: maxOpenWorkspaces=8, ttlMinutes=60).
+        Map<?, ?> transformationsConfig = Map.of();
+        Map<?, ?> v3 = v3ConfigSection(effectiveConfigurationMap());
+        if (v3.get("transformations") instanceof Map<?, ?> txConfig) {
+            transformationsConfig = txConfig;
+        }
+        int maxOpen = positiveIntOrDefault(transformationsConfig, 8, "max_open_workspaces", "maxOpenWorkspaces");
+        long ttlMinutes = positiveIntOrDefault(transformationsConfig, 60, "ttl_minutes", "ttlMinutes");
+
+        io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepPlanner stepPlanner =
+                (operation, arguments) -> planTransformationStep(operation, arguments);
+
+        io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.PreviewBuilder previewBuilder =
+                (semanticTargetJson, edits, fileOperations, warnings) -> {
+                    try {
+                        return ResponseBuilder.acceptedResult(
+                                root,
+                                "transformation",
+                                false,
+                                semanticTargetJson,
+                                edits,
+                                fileOperations,
+                                warnings,
+                                java.util.List.of("Composed transformation workspace; the after-state is javac-validated "
+                                        + "before the preview is accepted."),
+                                ResponseBuilder.DiagnosticDelta.unvalidated(),
+                                false);
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                };
+
+        io.serena.javarefactor.v3.transformation.TransformationValidator validator =
+                (operation, previewJson) -> {
+                    JavaProjectModel model = discoverSemanticPlanningModel(java.util.Map.of());
+                    return previewDiagnosticValidator.validate(operation, previewJson, model, false);
+                };
+
+        io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.RevisionCapturer revisionCapturer =
+                touchedRelativePaths -> {
+                    try {
+                        JavaProjectModel model = discoverSemanticPlanningModel(java.util.Map.of());
+                        // stableToken (not toJson) so the guard compares only drift-sensitive inputs, never the
+                        // wall-clock createdAt — otherwise every apply would be rejected as stale.
+                        return ProjectRevision.capture(model, touchedRelativePaths).stableToken();
+                    } catch (Exception e) {
+                        // A capture failure must not silently weaken the clean-revision guard: return null so apply's
+                        // own null-check treats the revision as unavailable rather than equal.
+                        return null;
+                    }
+                };
+
+        io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.ModelSupplier modelSupplier =
+                () -> {
+                    try {
+                        return discoverSemanticPlanningModel(java.util.Map.of());
+                    } catch (Exception e) {
+                        // A discovery failure must yield a structured impact-report refusal, not a crash: return null so
+                        // report() emits the impact_report_model_unavailable refusal.
+                        return null;
+                    }
+                };
+
+        transformationWorkspaceManager = new io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager(
+                root, maxOpen, ttlMinutes, stepPlanner, previewBuilder, validator, revisionCapturer, modelSupplier);
+        return transformationWorkspaceManager;
+    }
+
+    /**
+     * Runs one named V3 operation planner against {@code arguments}, returning its structured {@link
+     * io.serena.javarefactor.v3.transformation.TransformationStep} or the canonical refusal JSON the planner produced
+     * (model-gate refusal, malformed input, or a planner precondition refusal).
+     */
+    @SuppressWarnings("unchecked")
+    private io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult planTransformationStep(
+            String operation, Map<String, Object> arguments) {
+        JavaProjectModel projectModel = discoverSemanticPlanningModel(arguments);
+        String gateRefusal = modelGateRefusal(projectModel, false);
+        if (gateRefusal != null) {
+            return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.refused(gateRefusal);
+        }
+        java.nio.file.Path root = java.nio.file.Path.of(projectRoot);
+        try {
+            io.serena.javarefactor.v3.transformation.TransformationStep step = switch (operation) {
+                case "renamePackage" -> new io.serena.javarefactor.v3.packages.RenamePackagePlanner(
+                        root, projectModel, packageRewritePolicy().withRequestOverrides(arguments)).planStep(arguments);
+                case "movePackage" -> new io.serena.javarefactor.v3.packages.MovePackagePlanner(
+                        root, projectModel, packageRewritePolicy().withRequestOverrides(arguments)).planStep(arguments);
+                case "moveSourceRoot" -> new io.serena.javarefactor.v3.packages.MoveSourceRootPlanner(
+                        root, projectModel, packageRewritePolicy().withRequestOverrides(arguments)).planStep(arguments);
+                case "anonymousToLambda" -> new io.serena.javarefactor.v3.conversions.AnonymousToLambdaPlanner(
+                        root, projectModel).planStep(arguments);
+                case "lambdaToMethodReference" -> new io.serena.javarefactor.v3.conversions.LambdaToMethodReferencePlanner(
+                        root, projectModel).planStep(arguments);
+                case "deepInlineMethod" -> new io.serena.javarefactor.v3.inline.DeepInlineMethodPlanner(
+                        root, projectModel).planStep(injectV3InlineDefaults(arguments));
+                case "extractClass" -> new io.serena.javarefactor.v3.classops.ExtractClassPlanner(
+                        root, projectModel).planStep(arguments);
+                case "extractSuperclass" -> new io.serena.javarefactor.v3.classops.ExtractSuperclassPlanner(
+                        root, projectModel).planStep(arguments);
+                case "replaceInheritanceWithDelegation" ->
+                        new io.serena.javarefactor.v3.classops.ReplaceInheritanceWithDelegationPlanner(
+                                root, projectModel).planStep(arguments);
+                case "propagateSafeDelete" -> new io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner()
+                        .planStep(projectModel, parseDeletionRoots(arguments.get("roots")),
+                                new io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.Options(
+                                        bool(arguments, "deletePrivateOnly", true),
+                                        bool(arguments, "includeTests", false),
+                                        bool(arguments, "includeResources", true),
+                                        (int) lng(arguments, "maxCascadeDepth", 5)));
+                default -> null;
+            };
+            if (step == null) {
+                return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.refused(
+                        refusalJson("unsupported_transformation_operation",
+                                "Operation '" + operation + "' is not a supported transformation operation."));
+            }
+            return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.of(step);
+        } catch (io.serena.javarefactor.shared.ProjectPathResolver.Violation violation) {
+            // A path-resolution refusal (e.g. relativePath escapes the project root) carries its own canonical code.
+            return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.refused(
+                    refusalJson(violation.code(), violation.getMessage()));
+        } catch (RuntimeException refusalCarrier) {
+            // The planners encode precondition refusals via an internal Refusal RuntimeException that planStep does not
+            // catch. When it carries a canonical registry code (CodedRefusal), surface that exact code (e.g.
+            // package_not_found); otherwise an unexpected runtime fault degrades to a generic <operation>_failed.
+            String code = refusalCarrier instanceof io.serena.javarefactor.v3.packages.CodedRefusal coded
+                    ? coded.code()
+                    : operation + "_failed";
+            return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.refused(
+                    refusalJson(code, String.valueOf(refusalCarrier.getMessage())));
+        } catch (java.io.IOException e) {
+            return io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.StepResult.refused(
+                    refusalJson(operation + "_failed", e.getMessage()));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private String transformationCreateWorkspaceJson(Map<String, Object> fields) {
+        var manager = transformationManager();
+        if (manager == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before creating a transformation workspace.");
+        }
+        String goal = str(fields, "goal");
+        java.util.List<io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.OperationRequest> requests =
+                new java.util.ArrayList<>();
+        // A single operation is given at top level ({operation, arguments}); a batch is given as operations:[{...}].
+        Object operationsList = fields.get("operations");
+        if (operationsList instanceof java.util.List<?> list) {
+            for (Object element : list) {
+                if (element instanceof Map<?, ?> entry) {
+                    requests.add(operationRequestOf((Map<String, Object>) entry));
+                }
+            }
+        } else {
+            String operation = str(fields, "operation");
+            if (operation == null || operation.isBlank()) {
+                return refusalJson("transformation_no_operations",
+                        "transformation.createWorkspace requires an operation (or operations[]).");
+            }
+            // normalizeV2SessionRequest already flattened the single op's nested `arguments` envelope onto the
+            // top-level field map (and removed the `arguments` key), so the planner arguments ARE the flat fields.
+            // (The operations[] batch path above keeps reading each entry's nested `arguments`, which is not flattened.)
+            requests.add(new io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.OperationRequest(
+                    operation, fields));
+        }
+        return manager.createWorkspace(goal, requests, System.currentTimeMillis());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.OperationRequest operationRequestOf(
+            Map<String, Object> entry) {
+        String operation = entry.get("operation") instanceof String s ? s : null;
+        Map<String, Object> arguments = entry.get("arguments") instanceof Map<?, ?> map
+                ? (Map<String, Object>) map
+                : java.util.Map.of();
+        return new io.serena.javarefactor.v3.transformation.TransformationWorkspaceManager.OperationRequest(
+                operation, arguments);
+    }
+
+    private String transformationApplyJson(Map<String, Object> fields) {
+        var manager = transformationManager();
+        if (manager == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before applying a transformation workspace.");
+        }
+        String workspaceId = str(fields, "workspaceId");
+        if (workspaceId == null || workspaceId.isBlank()) {
+            return refusalJson("workspace_not_found", "transformation.apply requires a workspaceId.");
+        }
+        String expectedRevision = str(fields, "expectedProjectRevision");
+        return manager.apply(workspaceId, expectedRevision, System.currentTimeMillis());
+    }
+
+    private String transformationWorkspaceCall(Map<String, Object> fields, String kind) {
+        var manager = transformationManager();
+        if (manager == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before using a transformation workspace.");
+        }
+        String workspaceId = str(fields, "workspaceId");
+        if (workspaceId == null || workspaceId.isBlank()) {
+            return refusalJson("workspace_not_found", "transformation." + kind + " requires a workspaceId.");
+        }
+        long now = System.currentTimeMillis();
+        return switch (kind) {
+            case "preview" -> manager.preview(workspaceId, now);
+            case "cancel" -> manager.cancel(workspaceId, now);
+            case "report" -> manager.report(workspaceId, now);
+            default -> refusalJson("unsupported_method", "unsupported transformation call: " + kind);
+        };
+    }
+
+    private String transformationListJson() {
+        var manager = transformationManager();
+        if (manager == null) {
+            return refusalJson("not_initialized", "Sidecar must be initialized before listing transformation workspaces.");
+        }
+        return manager.list(System.currentTimeMillis());
+    }
+
     private String moveTopLevelTypeJson(Map<String, Object> fields, boolean apply) {
         if (!initialized || projectRoot == null) {
             return refusalJson("not_initialized", "Sidecar must be initialized before moving a top-level type.");
@@ -1897,11 +2481,25 @@ public final class Main {
         List<String> compilerWarnings = diagnostics.warningStrings();
         JavaProjectModel validated = unvalidated.withCompilerDiagnostics(compilerErrors);
         List<String> errors = validated.errors();
+        // Static-validation layer 7 (§18.1.7) + resolution half of framework validation (§18.3): EXACT class references in
+        // resources that this edit leaves dangling (a removed/renamed-away FQN still named by an unrewritten resource).
+        // Edit-scoped and exact, so it never false-positives on library or unchanged types. Surfaced as its own field and
+        // reflected in `ready` (the op-level not-ready signal). It is deliberately NOT folded into compilerErrors: the
+        // apply gate's baseline-vs-staged delta is for hard javac breakage only, whereas a dangling free-text resource
+        // reference (e.g. an XML bean class for a deleted type) is a review finding the caller decides how to act on —
+        // safe-delete, for one, accepts the deletion and surfaces the reference as a warning rather than blocking.
+        List<String> resourceFindings = io.serena.javarefactor.v3.validation.ResourceReferenceValidation.findings(
+                unvalidated,
+                mapField(fields, "changedFiles"),
+                listField(fields, "deletedFiles"),
+                listField(fields, "renamedFiles"));
+        boolean ready = errors.isEmpty() && resourceFindings.isEmpty();
         StringBuilder json = new StringBuilder();
-        json.append("{\"accepted\":true,\"ready\":").append(errors.isEmpty()).append(',');
+        json.append("{\"accepted\":true,\"ready\":").append(ready).append(',');
         json.append("\"errors\":").append(JsonUtil.array(errors)).append(',');
         json.append("\"compilerErrors\":").append(JsonUtil.array(compilerErrors)).append(',');
         json.append("\"compilerWarnings\":").append(JsonUtil.array(compilerWarnings)).append(',');
+        json.append("\"resourceFindings\":").append(JsonUtil.array(resourceFindings)).append(',');
         json.append("\"warnings\":").append(JsonUtil.array(validated.warnings())).append('}');
         return json.toString();
     }
@@ -1914,6 +2512,613 @@ public final class Main {
     @SuppressWarnings("unchecked")
     private static List<Object> listField(Map<String, Object> fields, String key) {
         return fields.get(key) instanceof List<?> value ? (List<Object>) value : List.of();
+    }
+
+    /**
+     * V3 propagating safe delete (refactor-feature-plan-V3.md §7.1–§7.4). Builds the graph-shaped {@code deletePlan}
+     * plus a removing {@code workspaceEdit}, then runs it through the authoritative before/after javac validator so a
+     * cascade that would not compile is refused. The sidecar never mutates files — Python's transactional applier owns
+     * apply — so validation always runs in preview (workspaceEdit-preserving) mode.
+     */
+    private String propagateSafeDeleteJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before deletion.propagateSafeDelete.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: absent-only injection of java_refactor.v3.deletion defaults; an explicit request value always wins.
+        fields = injectV3DeletionDefaults(fields);
+        List<io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec> roots =
+                parseDeletionRoots(fields.get("roots"));
+        io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.Options options =
+                new io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.Options(
+                        bool(fields, "deletePrivateOnly", true),
+                        bool(fields, "includeTests", false),
+                        bool(fields, "includeResources", true),
+                        (int) lng(fields, "maxCascadeDepth", 5));
+        try {
+            String planJson = new io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner()
+                    .plan(model, roots, options);
+            if (!accepted(planJson) || !bool(fields, "validate", true)) {
+                return planJson;
+            }
+            return previewDiagnosticValidator.validate("propagateSafeDelete", planJson, model, false);
+        } catch (IOException error) {
+            return refusalJson("deletion_failed", "Propagating safe delete failed: " + error.getMessage());
+        }
+    }
+
+    /** V3 dead-code scan (refactor-feature-plan-V3.md §7.5): produces candidates only and never mutates files. */
+    private String findDeadCodeJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before deletion.findDeadCode.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: absent-only injection of java_refactor.v3.deletion defaults; an explicit request value always wins.
+        fields = injectV3DeletionDefaults(fields);
+        io.serena.javarefactor.v3.deletion.DeadCodeAnalyzer.Options options =
+                new io.serena.javarefactor.v3.deletion.DeadCodeAnalyzer.Options(
+                        bool(fields, "includeTests", false),
+                        str(fields, "publicApiPolicy", "keep"),
+                        str(fields, "scope", "project"));
+        try {
+            return new io.serena.javarefactor.v3.deletion.DeadCodeAnalyzer().analyze(model, options);
+        } catch (IOException error) {
+            return refusalJson("dead_code_failed", "Dead-code analysis failed: " + error.getMessage());
+        }
+    }
+
+    /** V3 extract class (refactor-feature-plan-V3.md §8): pulls selected members into a new collaborator class. */
+    private String extractClassJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before classRefactor.extractClass.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: absent-only injection of java_refactor.v3.class_refactors defaults; explicit request values win.
+        fields = injectV3ClassRefactorDefaults(fields);
+        String planJson = new io.serena.javarefactor.v3.classops.ExtractClassPlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("extractClass", planJson, model, false);
+    }
+
+    /** V3 extract superclass (refactor-feature-plan-V3.md §9): hoists common members into a new superclass. */
+    private String extractSuperclassJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before classRefactor.extractSuperclass.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: absent-only injection of java_refactor.v3.class_refactors defaults; explicit request values win.
+        fields = injectV3ClassRefactorDefaults(fields);
+        String planJson = new io.serena.javarefactor.v3.classops.ExtractSuperclassPlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("extractSuperclass", planJson, model, false);
+    }
+
+    /** V3 replace inheritance with delegation (refactor-feature-plan-V3.md §10). */
+    private String replaceInheritanceWithDelegationJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized",
+                    "initialize must be called before classRefactor.replaceInheritanceWithDelegation.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: absent-only injection of java_refactor.v3.class_refactors defaults; explicit request values win.
+        fields = injectV3ClassRefactorDefaults(fields);
+        String planJson = new io.serena.javarefactor.v3.classops.ReplaceInheritanceWithDelegationPlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("replaceInheritanceWithDelegation", planJson, model, false);
+    }
+
+    /** V3 convert anonymous class to lambda (refactor-feature-plan-V3.md §12). */
+    private String anonymousToLambdaJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before conversions.anonymousToLambda.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        String planJson = new io.serena.javarefactor.v3.conversions.AnonymousToLambdaPlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("convertAnonymousToLambda", planJson, model, false);
+    }
+
+    /** V3 convert lambda to method reference (refactor-feature-plan-V3.md §13). */
+    private String lambdaToMethodReferenceJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized",
+                    "initialize must be called before conversions.lambdaToMethodReference.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        String planJson = new io.serena.javarefactor.v3.conversions.LambdaToMethodReferencePlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("convertLambdaToMethodReference", planJson, model, false);
+    }
+
+    /** V3 generalized (multi-statement) inline method (refactor-feature-plan-V3.md §11). */
+    private String deepInlineMethodJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before inlineRefactor.deepInlineMethod.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // Inject maxCallSites from java_refactor.v3.inline.max_call_sites as an absent-only default so the planner's
+        // intField("maxCallSites", DEFAULT_MAX_CALL_SITES) picks up the configured limit when the caller does not supply
+        // an explicit per-request override.
+        fields = injectV3InlineDefaults(fields);
+        String planJson = new io.serena.javarefactor.v3.inline.DeepInlineMethodPlanner(
+                java.nio.file.Path.of(projectRoot), model).plan(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("deepInlineMethod", planJson, model, false);
+    }
+
+    /**
+     * Absent-only injection of V3 inline config defaults into the request fields for
+     * {@code inlineRefactor.deepInlineMethod}. Reads {@code java_refactor.v3.inline.max_call_sites} and, when the
+     * caller did not supply {@code maxCallSites} on the request, adds it so the planner's intField default is the
+     * configured value rather than the hard-coded fallback.
+     */
+    private Map<String, Object> injectV3InlineDefaults(Map<String, Object> fields) {
+        if (fields.containsKey("maxCallSites")) {
+            return fields;
+        }
+        Map<String, Object> config = effectiveConfigurationMap();
+        if (config.isEmpty()) {
+            return fields;
+        }
+        Map<?, ?> v3 = v3ConfigSection(config);
+        Object inlineSection = v3.get("inline");
+        Map<?, ?> inline = inlineSection instanceof Map<?, ?> map ? map : Map.of();
+        Object maxCallSites = inline.get("max_call_sites");
+        if (maxCallSites == null) {
+            maxCallSites = inline.get("maxCallSites");
+        }
+        if (maxCallSites == null) {
+            return fields;
+        }
+        Map<String, Object> effective = new LinkedHashMap<>(fields);
+        effective.put("maxCallSites", maxCallSites);
+        return effective;
+    }
+
+    /**
+     * The {@code java_refactor.v3.<section>} sub-map (snake_case or camelCase key), or empty when the config has no V3
+     * block or no such section. Mirrors {@link #v3ConfigSection(Map)} but descends one level further to a named section.
+     */
+    private Map<?, ?> v3Section(String snakeKey, String camelKey) {
+        Map<String, Object> config = effectiveConfigurationMap();
+        if (config.isEmpty()) {
+            return Map.of();
+        }
+        Map<?, ?> v3 = v3ConfigSection(config);
+        Object section = v3.get(snakeKey);
+        if (!(section instanceof Map<?, ?>)) {
+            section = v3.get(camelKey);
+        }
+        return section instanceof Map<?, ?> map ? map : Map.of();
+    }
+
+    /**
+     * Absent-only injection of V3 deletion config defaults ({@code java_refactor.v3.deletion}) into the request fields
+     * for {@code deletion.propagateSafeDelete} and {@code deletion.findDeadCode}. An explicit per-request value always
+     * wins; only an unset field receives the configured default. Reads {@code include_tests_default},
+     * {@code max_cascade_depth}, and {@code public_api_policy} (snake_case or camelCase) so the handlers' hard-coded
+     * fallbacks become the configured values rather than fixed constants.
+     */
+    private Map<String, Object> injectV3DeletionDefaults(Map<String, Object> fields) {
+        Map<?, ?> deletion = v3Section("deletion", "deletion");
+        if (deletion.isEmpty()) {
+            return fields;
+        }
+        Map<String, Object> effective = new LinkedHashMap<>(fields);
+        copyDefault(effective, deletion, "includeTests", "include_tests_default", "includeTestsDefault",
+                "include_tests", "includeTests");
+        copyDefault(effective, deletion, "maxCascadeDepth", "max_cascade_depth", "maxCascadeDepth");
+        copyDefault(effective, deletion, "publicApiPolicy", "public_api_policy", "publicApiPolicy");
+        return effective;
+    }
+
+    /**
+     * Absent-only injection of V3 class-refactor config defaults ({@code java_refactor.v3.class_refactors}) into the
+     * request fields for {@code classRefactor.*}. An explicit per-request value always wins. Reads
+     * {@code leave_delegates_default} → {@code leaveDelegateMethods} and {@code allow_public_api_change} →
+     * {@code confirmPublicApiChange} (snake_case or camelCase), so the configured policy seeds the planners' field reads
+     * when the caller did not supply an explicit override.
+     */
+    private Map<String, Object> injectV3ClassRefactorDefaults(Map<String, Object> fields) {
+        Map<?, ?> classRefactors = v3Section("class_refactors", "classRefactors");
+        if (classRefactors.isEmpty()) {
+            return fields;
+        }
+        Map<String, Object> effective = new LinkedHashMap<>(fields);
+        copyDefault(effective, classRefactors, "leaveDelegateMethods", "leave_delegates_default",
+                "leaveDelegatesDefault", "leave_delegate_methods", "leaveDelegateMethods");
+        copyDefault(effective, classRefactors, "confirmPublicApiChange", "allow_public_api_change",
+                "allowPublicApiChange", "confirm_public_api_change", "confirmPublicApiChange");
+        return effective;
+    }
+
+    /**
+     * Enforces the {@code java_refactor.v3.recipes} source policy at the handler level (the planner does not see config):
+     * a built-in recipe ({@code recipeId}) is refused when {@code builtins_enabled=false}, and an inline user-supplied
+     * recipe ({@code recipe} object) is refused when {@code allow_user_recipes=false}. Returns a structured refusal JSON
+     * when the request's recipe source is disabled, or {@code null} when it may proceed. An absent flag (the shipped
+     * default) leaves the source enabled, matching the "unset never disables" semantics of the V3 gates.
+     */
+    private String recipeSourceRefusal(Map<String, Object> fields) {
+        Map<?, ?> recipes = v3Section("recipes", "recipes");
+        if (recipes.isEmpty()) {
+            return null;
+        }
+        Object recipeId = fields.get("recipeId");
+        boolean usesBuiltin = recipeId != null && !recipeId.toString().isBlank();
+        boolean usesInline = !usesBuiltin && fields.get("recipe") instanceof Map<?, ?>;
+        if (usesBuiltin && recipes.containsKey("builtins_enabled")
+                && !boolValue(recipes.get("builtins_enabled"), true)) {
+            return refusalJson("operation_disabled",
+                    "Built-in migration recipes are disabled by configuration "
+                            + "(java_refactor.v3.recipes.builtins_enabled is false).");
+        }
+        if (usesInline && recipes.containsKey("allow_user_recipes")
+                && !boolValue(recipes.get("allow_user_recipes"), true)) {
+            return refusalJson("operation_disabled",
+                    "User-supplied migration recipes are disabled by configuration "
+                            + "(java_refactor.v3.recipes.allow_user_recipes is false).");
+        }
+        return null;
+    }
+
+    /** V3 scan for API-migration opportunities (refactor-feature-plan-V3.md §14): preview-only, no edits. */
+    private String scanMigrationOpportunitiesJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized",
+                    "initialize must be called before recipes.scanMigrationOpportunities.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: enforce java_refactor.v3.recipes source policy (builtins_enabled / allow_user_recipes).
+        String recipeRefusal = recipeSourceRefusal(fields);
+        if (recipeRefusal != null) {
+            return recipeRefusal;
+        }
+        return new io.serena.javarefactor.v3.recipes.RecipeEngine(java.nio.file.Path.of(projectRoot), model).scan(fields);
+    }
+
+    /** V3 apply an API-migration recipe (refactor-feature-plan-V3.md §14): javac-validated workspaceEdit preview. */
+    private String applyRecipeJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before recipes.applyRecipe.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // B01: enforce java_refactor.v3.recipes source policy (builtins_enabled / allow_user_recipes).
+        String recipeRefusal = recipeSourceRefusal(fields);
+        if (recipeRefusal != null) {
+            return recipeRefusal;
+        }
+        String planJson = new io.serena.javarefactor.v3.recipes.RecipeEngine(
+                java.nio.file.Path.of(projectRoot), model).apply(fields);
+        if (!accepted(planJson) || !bool(fields, "validate", true)) {
+            return planJson;
+        }
+        return previewDiagnosticValidator.validate("applyRecipe", planJson, model, false);
+    }
+
+    /**
+     * V3 resource-reference SPI (refactor-feature-plan-V3.md §15): read-only scan for references to a Java type/package
+     * in non-Java resource files. No edits are produced, so there is nothing to diagnostic-validate.
+     */
+    private String findResourceReferencesJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before resources.findReferences.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        return new io.serena.javarefactor.v3.resources.ResourceReferenceScanner(
+                java.nio.file.Path.of(projectRoot), model, graphCacheLimits().maxResourceFileBytes())
+                .findReferences(fields);
+    }
+
+    /**
+     * V3 resource SPI (refactor-feature-plan-V3.md §15, "planEdits" half): plans the SAFE in-place resource edits and
+     * file renames for a set of moved types/packages, using the same unified {@link
+     * io.serena.javarefactor.v3.resources.ResourcePlanner} the package rename/move planners drive internally.
+     */
+    private String planResourceEditsJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before resources.planEdits.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        return new io.serena.javarefactor.v3.resources.ResourceEditPlanner(
+                java.nio.file.Path.of(projectRoot), model, graphCacheLimits().maxResourceFileBytes())
+                .planEdits(fields);
+    }
+
+    /**
+     * V3 framework SPI (refactor-feature-plan-V3.md §16): read-only detection of which frameworks are present, by exact
+     * compiler-resolved annotation facts. No edits are produced.
+     */
+    private String detectFrameworksJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before frameworks.detect.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        return new io.serena.javarefactor.v3.frameworks.FrameworkScanner(
+                java.nio.file.Path.of(projectRoot), model).detect(fields);
+    }
+
+    /**
+     * V3 framework SPI (refactor-feature-plan-V3.md §16): read-only scan for framework-significant references to a target
+     * type (its framework-annotated declaration/members, and framework annotations naming it). No edits are produced.
+     */
+    private String findFrameworkReferencesJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before frameworks.findReferences.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        return new io.serena.javarefactor.v3.frameworks.FrameworkScanner(
+                java.nio.file.Path.of(projectRoot), model).findReferences(fields);
+    }
+
+    /**
+     * V3 framework SPI (refactor-feature-plan-V3.md §16): the transformation-participant half. Given a pending change
+     * ({@code changeKind} one of {@code safeDelete}/{@code renameType}/{@code renamePackage}/{@code deadCodeScan}, with
+     * an optional {@code target} and {@code newName}), runs every framework plugin's
+     * {@code participate(SymbolChange, TransformationContext)} hook and returns the merged contribution: deletion
+     * vetoes ({@code blocks}), review-required {@code warnings}, framework-owned {@code resourceEdits} descriptions, and
+     * the reachability {@code roots} the frameworks contribute. Read-only: produces no file edits itself (the planner
+     * seams fold these contributions into their plans).
+     */
+    private String participateFrameworksJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before frameworks.participate.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        String changeKind = str(fields, "changeKind", "");
+        String target = str(fields, "target", "");
+        String newName = str(fields, "newName", "");
+        io.serena.javarefactor.v3.frameworks.SymbolChange change = switch (changeKind) {
+            case "safeDelete" -> io.serena.javarefactor.v3.frameworks.SymbolChange.safeDelete(target);
+            case "renameType" -> io.serena.javarefactor.v3.frameworks.SymbolChange.renameType(target, newName);
+            case "renamePackage" -> io.serena.javarefactor.v3.frameworks.SymbolChange.renamePackage(target, newName);
+            case "deadCodeScan" -> io.serena.javarefactor.v3.frameworks.SymbolChange.deadCodeScan();
+            default -> null;
+        };
+        if (change == null) {
+            return refusalJson("framework_change_unrecognized",
+                    "changeKind must be one of safeDelete, renameType, renamePackage, deadCodeScan.");
+        }
+        try {
+            io.serena.javarefactor.v3.frameworks.FrameworkParticipationCoordinator.Result result =
+                    new io.serena.javarefactor.v3.frameworks.FrameworkParticipationCoordinator()
+                            .participate(model, change);
+            StringBuilder blocks = new StringBuilder("[");
+            boolean first = true;
+            for (io.serena.javarefactor.v3.frameworks.FrameworkParticipation.Block block : result.blocks()) {
+                if (!first) {
+                    blocks.append(",");
+                }
+                first = false;
+                blocks.append("{\"symbol\":").append(JsonUtil.quote(block.symbol()))
+                        .append(",\"reason\":").append(JsonUtil.quote(block.reason())).append("}");
+            }
+            blocks.append("]");
+            // B07: alongside the human-readable resourceEdits descriptions, emit the STRUCTURED framework resource edits
+            // so a caller can apply the CONCRETE, parse-verified TextEdits the coordinator proved (Spring <bean class>,
+            // exact dotted FQN tokens, JPA persistence.xml/orm.xml <class>) and distinguish them from the manual-review
+            // markers that still require human attention. Each entry names its target resource, kind, and disposition; a
+            // concrete entry additionally carries the {path, startOffset, endOffset, newText} of the proven edit.
+            StringBuilder frameworkResourceEdits = new StringBuilder("[");
+            boolean firstEdit = true;
+            for (io.serena.javarefactor.v3.frameworks.FrameworkResourceEdit edit : result.resourceEdits()) {
+                if (!firstEdit) {
+                    frameworkResourceEdits.append(",");
+                }
+                firstEdit = false;
+                frameworkResourceEdits.append("{\"targetResource\":").append(JsonUtil.quote(edit.targetResource()))
+                        .append(",\"kind\":").append(JsonUtil.quote(edit.kind().name()))
+                        .append(",\"manualReviewRequired\":").append(edit.manualReviewRequired())
+                        .append(",\"description\":").append(JsonUtil.quote(edit.description()));
+                io.serena.javarefactor.edits.PlannerSupport.TextEdit textEdit = edit.textEdit();
+                if (textEdit != null) {
+                    frameworkResourceEdits.append(",\"textEdit\":{\"path\":")
+                            .append(JsonUtil.quote(PlannerSupport.relative(
+                                    java.nio.file.Path.of(projectRoot).toAbsolutePath().normalize(), textEdit.file())))
+                            .append(",\"startOffset\":").append(textEdit.startOffset())
+                            .append(",\"endOffset\":").append(textEdit.endOffset())
+                            .append(",\"newText\":").append(JsonUtil.quote(textEdit.newText()))
+                            .append(",\"kind\":").append(JsonUtil.quote(textEdit.kind())).append("}");
+                }
+                frameworkResourceEdits.append("}");
+            }
+            frameworkResourceEdits.append("]");
+            return "{"
+                    + "\"accepted\":true,"
+                    + "\"operation\":\"participateFrameworks\","
+                    + "\"changeKind\":" + JsonUtil.quote(changeKind) + ","
+                    + "\"blocks\":" + blocks + ","
+                    + "\"warnings\":" + JsonUtil.array(result.warnings()) + ","
+                    + "\"resourceEdits\":" + JsonUtil.array(result.frameworkBoundaryChanges()) + ","
+                    + "\"frameworkResourceEdits\":" + frameworkResourceEdits + ","
+                    + "\"roots\":" + JsonUtil.array(result.roots()) + ","
+                    + "\"stats\":{\"blocks\":" + result.blocks().size()
+                    + ",\"warnings\":" + result.warnings().size()
+                    + ",\"resourceEdits\":" + result.resourceEdits().size()
+                    + ",\"roots\":" + result.roots().size() + "}"
+                    + "}";
+        } catch (IOException error) {
+            return refusalJson("framework_participate_failed",
+                    "Framework participation failed: " + error.getMessage());
+        }
+    }
+
+    /**
+     * Stateless impact fact-sheet (refactor-feature-plan-V3.md §G011): given a list of touched project-relative paths,
+     * emits source-root classification, the top-level types declared in those files, all incoming semantic references to
+     * those types (split by main/test source set), and resource-file references. Never mutates files.
+     */
+    private String impactFactsJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before impact.facts.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        // Parse touchedPaths: accept a single string or a JSON array of strings.
+        Object raw = fields.get("touchedPaths");
+        List<String> touchedPaths = new java.util.ArrayList<>();
+        if (raw instanceof String s) {
+            touchedPaths.add(s);
+        } else if (raw instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof String p) {
+                    touchedPaths.add(p);
+                }
+            }
+        }
+        try {
+            return new io.serena.javarefactor.compiler.ImpactFactsAnalyzer().analyze(model, touchedPaths);
+        } catch (java.io.IOException error) {
+            return refusalJson("impact_facts_failed", "Impact analysis failed: " + error.getMessage());
+        }
+    }
+
+    /**
+     * Builds (or returns the cached) unified V3 {@link io.serena.javarefactor.v3.graph.TransformationGraph} for the
+     * current project revision (refactor-feature-plan-V3.md §1.2/§3). The graph composes the build layout, Java symbols,
+     * type hierarchy, call graph, provider-backed resource references, and test graph from the real compiler/build/
+     * resource models, and is cached per revision by {@link io.serena.javarefactor.v3.graph.GraphInvalidation} so the
+     * impact/delete/report consumers share one materialization. Never mutates files.
+     */
+    private String graphBuildJson(Map<String, Object> fields) {
+        if (!initialized || projectRoot == null) {
+            return refusalJson("not_initialized", "initialize must be called before graph.build.");
+        }
+        JavaProjectModel model = discoverSemanticPlanningModel(fields);
+        String gate = modelGateRefusal(model, false);
+        if (gate != null) {
+            return gate;
+        }
+        try {
+            return io.serena.javarefactor.v3.graph.GraphInvalidation.INSTANCE.get(model, graphCacheLimits()).toJson();
+        } catch (java.io.IOException error) {
+            return refusalJson("graph_build_failed", "Transformation graph build failed: " + error.getMessage());
+        }
+    }
+
+    /**
+     * Resolves the configurable transformation-graph cache + resource-scan limits from the effective
+     * {@code java_refactor.v3.graph} config block (R05 acceptance #2). An absent/empty block yields the defaults.
+     */
+    private io.serena.javarefactor.v3.graph.GraphCacheLimits graphCacheLimits() {
+        Map<?, ?> v3 = v3ConfigSection(effectiveConfigurationMap());
+        Object graph = v3.get("graph");
+        Map<?, ?> graphConfig = graph instanceof Map<?, ?> map ? map : Map.of();
+        return io.serena.javarefactor.v3.graph.GraphCacheLimits.fromGraphConfig(graphConfig);
+    }
+
+    private static List<io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec> parseDeletionRoots(
+            Object rootsValue) {
+        List<io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec> roots =
+                new java.util.ArrayList<>();
+        if (rootsValue instanceof String symbol) {
+            roots.add(io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec.ofSymbol(symbol));
+            return roots;
+        }
+        if (!(rootsValue instanceof List<?> list)) {
+            return roots;
+        }
+        for (Object item : list) {
+            if (item instanceof String symbol) {
+                roots.add(io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec.ofSymbol(symbol));
+            } else if (item instanceof Map<?, ?> map) {
+                Object symbol = map.get("symbol");
+                if (symbol instanceof String symbolText && !symbolText.isBlank()) {
+                    roots.add(io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec
+                            .ofSymbol(symbolText));
+                    continue;
+                }
+                Object relativePath = map.get("relativePath");
+                Object line = map.get("line");
+                Object column = map.get("column");
+                if (relativePath instanceof String path && line instanceof Number lineNumber
+                        && column instanceof Number columnNumber) {
+                    roots.add(io.serena.javarefactor.v3.deletion.PropagatingSafeDeletePlanner.RootSpec
+                            .ofPosition(path, lineNumber.intValue(), columnNumber.intValue()));
+                }
+            }
+        }
+        return roots;
     }
 
     private JavaProjectModel discoverSemanticPlanningModel(Map<String, Object> fields) {

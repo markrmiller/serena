@@ -60,6 +60,48 @@ public final class ChangeSignaturePlanner {
         }
     }
 
+    /**
+     * Structured result of planning a {@code changeMethodSignature} recipe rule (F13): the declaration / override-group /
+     * call-site / javadoc {@link PlannerSupport.TextEdit}s and warnings, or a structured refusal (code + message). The
+     * operation's own refusal is returned as data — never thrown across the package boundary — so the recipe engine can
+     * surface it honestly.
+     */
+    public record RecipeSignaturePlan(boolean refused, String refusalCode, String refusalMessage,
+                                      List<PlannerSupport.TextEdit> edits, List<String> warnings) {
+        public RecipeSignaturePlan {
+            edits = edits == null ? List.of() : List.copyOf(edits);
+            warnings = warnings == null ? List.of() : List.copyOf(warnings);
+        }
+    }
+
+    /**
+     * F13: plans a {@code changeMethodSignature} recipe rule against an already-open whole-project {@code index}, producing
+     * the exact declaration / override-group / call-site / javadoc edits the standalone change-signature operation emits —
+     * so the recipe engine's {@code changeMethodSignature} kind is a real compiler-backed signature change, not a
+     * documented refusal. {@code fields} carries {@code line} (1-based, of the resolved declaration; supplied by the
+     * recipe engine from the rule's owner/name/paramTypes) plus the desired-signature fields
+     * ({@code parameters}/{@code newName}/{@code newReturnType}/{@code confirmPublicApi}/…). The caller's
+     * PreviewDiagnosticValidator javac-validates the merged workspaceEdit, so this reuses the open index for a single
+     * compiler pass instead of opening its own.
+     */
+    public RecipeSignaturePlan planRecipeSignatureChange(SemanticIndex index, Path file, String relativePath, Map<String, Object> fields) {
+        try {
+            String source = SourceText.read(model, file);
+            ResolvedTarget verified = SemanticTargetGate.require(index, relativePath, fields);
+            MethodMatch declaration = selectedDeclaration(index, file, source, intField(fields, "line"), verified);
+            SemanticTargetGate.confirmSelection(verified, declaration.semantic().element());
+            List<ParameterSpec> desired = fields.containsKey("parameters") ? desiredParameters(fields, declaration) : declaration.parameters();
+            ChangePlan plan = planSignature(index, source, file, declaration, fields, desired);
+            return new RecipeSignaturePlan(false, null, null, plan.edits(), plan.warnings());
+        } catch (SignatureRefusal refusal) {
+            return new RecipeSignaturePlan(true, refusal.code(), refusal.getMessage(), List.of(), List.of());
+        } catch (SemanticTargetGate.Refused refused) {
+            return new RecipeSignaturePlan(true, refused.code(), refused.getMessage(), List.of(), List.of());
+        } catch (Exception error) {
+            return new RecipeSignaturePlan(true, "change_signature_failed", error.getMessage(), List.of(), List.of());
+        }
+    }
+
     public String introduceParameter(Map<String, Object> fields, boolean apply) {
         try {
             Path file = sourceFile(fields);

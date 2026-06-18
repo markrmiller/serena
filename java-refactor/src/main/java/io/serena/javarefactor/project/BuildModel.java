@@ -57,7 +57,14 @@ public record BuildModel(List<Module> modules) {
             // hierarchy) elsewhere, so the discoverer promotes this to a first-class model-incompleteness signal that
             // refuses apply (independent of javac diagnostics). Gradle and EXPLICIT/conventional source sets are always
             // proven (Gradle hard-fails extraction on a non-zero exit; conventional fallback refuses apply separately).
-            boolean classpathProven
+            boolean classpathProven,
+            // B11 model-first resource roots: the resource directories the build model declared for this source set,
+            // read DIRECTLY from the build tool (Gradle {@code sourceSets.*.resources.srcDirs} emitted as the init
+            // script's {@code resourceDirs} JSON field; Maven {@code <build><resources>}/{@code <testResources>}
+            // {@code <directory>} entries). Kept SEPARATE from {@code srcDirs} (which carries java/generated roots) so a
+            // non-conventional resource directory survives to {@link SourceSet#resourceRoots()} and is discovered by
+            // {@link ResourceRootModel} model-first. Empty for legacy/explicit payloads that declare no resource dirs.
+            List<String> resourceDirs
     ) {
         // Backward-compatible constructor: callers that pre-date the G003 classpathProven signal (and every source set
         // whose classpath IS proven — Gradle, explicit models) construct with classpathProven=true.
@@ -65,7 +72,17 @@ public record BuildModel(List<Module> modules) {
                 List<String> classpath, List<String> modulePath, List<String> annotationProcessorPath, String release,
                 String source, String target, String encoding, List<String> dependsOnProjects, List<String> compilerArgs) {
             this(name, srcDirs, generatedRoots, outputDirs, classpath, modulePath, annotationProcessorPath, release,
-                    source, target, encoding, dependsOnProjects, compilerArgs, true);
+                    source, target, encoding, dependsOnProjects, compilerArgs, true, List.of());
+        }
+
+        // Backward-compatible constructor for callers that supply classpathProven (G003) but pre-date the B11
+        // resourceDirs field: resource dirs default to empty.
+        ModelSourceSet(String name, List<String> srcDirs, List<String> generatedRoots, List<String> outputDirs,
+                List<String> classpath, List<String> modulePath, List<String> annotationProcessorPath, String release,
+                String source, String target, String encoding, List<String> dependsOnProjects, List<String> compilerArgs,
+                boolean classpathProven) {
+            this(name, srcDirs, generatedRoots, outputDirs, classpath, modulePath, annotationProcessorPath, release,
+                    source, target, encoding, dependsOnProjects, compilerArgs, classpathProven, List.of());
         }
 
         ModelSourceSet {
@@ -77,6 +94,7 @@ public record BuildModel(List<Module> modules) {
             annotationProcessorPath = List.copyOf(annotationProcessorPath);
             dependsOnProjects = List.copyOf(dependsOnProjects);
             compilerArgs = List.copyOf(compilerArgs);
+            resourceDirs = List.copyOf(resourceDirs);
         }
     }
 }

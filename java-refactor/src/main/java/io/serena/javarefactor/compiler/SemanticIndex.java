@@ -17,6 +17,7 @@ import com.sun.source.tree.ExpressionStatementTree;
 import com.sun.source.tree.ContinueTree;
 import com.sun.source.tree.BreakTree;
 import com.sun.source.tree.CatchTree;
+import com.sun.source.tree.AnnotationTree;
 import com.sun.source.tree.ClassTree;
 import com.sun.source.tree.CompilationUnitTree;
 import com.sun.source.tree.CompoundAssignmentTree;
@@ -4557,6 +4558,23 @@ public final class SemanticIndex implements AutoCloseable {
         return null;
     }
 
+    /**
+     * Whether a type with the given canonical FQN already exists in the project's element universe (a declared source
+     * type or a classpath type). Used by class-extraction planners (refactor-feature-plan-V3.md §8) to preflight a
+     * target-type collision and emit an operation-specific refusal, rather than letting the new type silently clash.
+     */
+    public boolean typeExists(String fqn) {
+        if (fqn == null || fqn.isBlank()) {
+            return false;
+        }
+        for (CompilerTask task : allTasks()) {
+            if (task.elements.getTypeElement(fqn) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public SemanticMethod selectedMethod(Path file, int oneBasedLine, String nameHint) {
         Path normalized = file.toAbsolutePath().normalize();
         for (CompilerTask task : allTasks()) {
@@ -5748,6 +5766,751 @@ public final class SemanticIndex implements AutoCloseable {
         }
 
         return new InstanceMoveFacts(true, usesSuper[0], synchronizedOnReceiver[0], thisEscapes[0], typeParameterDependency[0]);
+    }
+
+    /**
+     * The instance fields and instance methods OF THE METHOD'S OWN DECLARING TYPE that the method body references,
+     * resolved from javac symbol bindings (never source text), so an Extract Class can compute the dependency closure of
+     * a moved method (refactor-feature-plan-V3.md §8.3 step 3). A reference to a member the move does NOT also carry is a
+     * blocking dependency (the new collaborator could not see it); a reference to another selected member is satisfied
+     * inside the collaborator. Static members are excluded (they remain reachable through the origin type), as are locals,
+     * parameters, and members of any other type (their enclosing element is not the source type). {@code resolved()} is
+     * false when the tree cannot be analyzed; callers must fail closed.
+     */
+    public record MemberDependencies(boolean resolved, Set<String> instanceFields, Set<String> instanceMethods) {
+        static MemberDependencies unresolved() {
+            return new MemberDependencies(false, Set.of(), Set.of());
+        }
+    }
+
+    public MemberDependencies memberDependencies(SemanticMethod method) {
+        if (method == null || !(method.element() instanceof ExecutableElement executable)) {
+            return MemberDependencies.unresolved();
+        }
+        if (!(executable.getEnclosingElement() instanceof TypeElement sourceType)) {
+            return MemberDependencies.unresolved();
+        }
+        CompilerTask task = taskFor(method.file());
+        if (task == null) {
+            return MemberDependencies.unresolved();
+        }
+        TreePath methodPath = task.trees.getPath(executable);
+        if (methodPath == null || !(methodPath.getLeaf() instanceof MethodTree)) {
+            return MemberDependencies.unresolved();
+        }
+        Set<String> fields = new java.util.LinkedHashSet<>();
+        Set<String> methods = new java.util.LinkedHashSet<>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitIdentifier(IdentifierTree node, Void unused) {
+                classifyMemberDependency(task.trees.getElement(getCurrentPath()), sourceType, fields, methods);
+                return super.visitIdentifier(node, unused);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Void unused) {
+                classifyMemberDependency(task.trees.getElement(getCurrentPath()), sourceType, fields, methods);
+                return super.visitMemberSelect(node, unused);
+            }
+        }.scan(methodPath, null);
+        return new MemberDependencies(true, fields, methods);
+    }
+
+    private static void classifyMemberDependency(Element element, TypeElement sourceType, Set<String> fields,
+            Set<String> methods) {
+        if (element == null || element.getModifiers().contains(Modifier.STATIC)) {
+            return;
+        }
+        if (!sourceType.equals(element.getEnclosingElement())) {
+            return;
+        }
+        if (element.getKind() == ElementKind.FIELD) {
+            fields.add(element.getSimpleName().toString());
+        } else if (element.getKind() == ElementKind.METHOD) {
+            methods.add(element.getSimpleName().toString());
+        }
+    }
+
+    /**
+     * The plan for relocating constructor-injected fields (those without a declaration initializer) out of
+     * {@code sourceType} during an Extract Class (refactor-feature-plan-V3.md §8.3 step 6). Supports only the canonical,
+     * provably-safe dependency-injection shape: the type declares exactly one constructor, and every
+     * {@code injectedFieldName} is assigned there exactly once by a top-level {@code this.field = <param>;} (or
+     * {@code field = <param>;}) statement whose right-hand side is a plain reference to one of that constructor's
+     * parameters. Anything else — no constructor, multiple constructors, a missing/duplicated assignment, or an
+     * initializer expression whose evaluation order cannot be preserved — yields a refusal (§8.4 "rely on initialization
+     * order that cannot be preserved"); the engine never rewrites a constructor it cannot prove safe.
+     */
+    public record ConstructorInjectionPlan(
+            boolean resolved,
+            String refusalCode,
+            String refusalMessage,
+            List<long[]> assignmentSpansToRemove,
+            List<String> constructorArguments,
+            int delegateInitOffset) {
+
+        static ConstructorInjectionPlan refused(String code, String message) {
+            return new ConstructorInjectionPlan(true, code, message, List.of(), List.of(), -1);
+        }
+
+        static ConstructorInjectionPlan unresolved() {
+            return new ConstructorInjectionPlan(false, null, null, List.of(), List.of(), -1);
+        }
+
+        public boolean refused() {
+            return refusalCode != null;
+        }
+    }
+
+    public ConstructorInjectionPlan planConstructorInjection(SemanticType sourceType, List<String> injectedFieldNames) {
+        if (sourceType == null || !(sourceType.element() instanceof TypeElement owner)) {
+            return ConstructorInjectionPlan.unresolved();
+        }
+        CompilerTask task = taskFor(sourceType.file());
+        if (task == null) {
+            return ConstructorInjectionPlan.unresolved();
+        }
+        List<ExecutableElement> constructors = new ArrayList<>();
+        for (Element enclosed : owner.getEnclosedElements()) {
+            if (enclosed instanceof ExecutableElement executable
+                    && executable.getKind() == ElementKind.CONSTRUCTOR
+                    && task.trees.getPath(executable) != null) {
+                // A synthetic default constructor has no source tree and is skipped (handled as the "no constructor" case).
+                constructors.add(executable);
+            }
+        }
+        if (constructors.isEmpty()) {
+            return ConstructorInjectionPlan.refused("extract_class_no_constructor_to_inject",
+                    "Field(s) " + injectedFieldNames + " have no initializer and the source declares no constructor to supply them.");
+        }
+        if (constructors.size() > 1) {
+            return ConstructorInjectionPlan.refused("extract_class_multiple_constructors",
+                    "Constructor-injected field extraction requires exactly one source constructor; found " + constructors.size() + ".");
+        }
+        ExecutableElement constructor = constructors.get(0);
+        TreePath ctorPath = task.trees.getPath(constructor);
+        if (ctorPath == null || !(ctorPath.getLeaf() instanceof MethodTree ctorTree) || ctorTree.getBody() == null) {
+            return ConstructorInjectionPlan.unresolved();
+        }
+        CompilationUnitTree unit = ctorPath.getCompilationUnit();
+        CharSequence source = sourceByPath.get(pathOf(unit));
+        if (source == null) {
+            return ConstructorInjectionPlan.unresolved();
+        }
+        Set<String> parameterNames = new java.util.HashSet<>();
+        for (VariableElement parameter : constructor.getParameters()) {
+            parameterNames.add(parameter.getSimpleName().toString());
+        }
+        Map<String, long[]> removalByField = new java.util.HashMap<>();
+        Map<String, String> argByField = new java.util.HashMap<>();
+        for (com.sun.source.tree.StatementTree statement : ctorTree.getBody().getStatements()) {
+            if (!(statement instanceof ExpressionStatementTree exprStmt)
+                    || !(exprStmt.getExpression() instanceof AssignmentTree assignment)) {
+                continue;
+            }
+            String fieldName = assignedFieldName(assignment.getVariable(), task, ctorPath, owner);
+            if (fieldName == null || !injectedFieldNames.contains(fieldName)) {
+                continue;
+            }
+            ExpressionTree rhs = stripParens(assignment.getExpression());
+            if (!(rhs instanceof IdentifierTree rhsId) || !parameterNames.contains(rhsId.getName().toString())) {
+                return ConstructorInjectionPlan.refused("extract_class_constructor_init_not_simple",
+                        "Field '" + fieldName + "' is not initialized directly from a constructor parameter; its"
+                                + " initialization order cannot be preserved in the collaborator.");
+            }
+            if (removalByField.containsKey(fieldName)) {
+                return ConstructorInjectionPlan.refused("extract_class_field_assigned_multiple_times",
+                        "Field '" + fieldName + "' is assigned more than once in the constructor.");
+            }
+            long start = task.positions.getStartPosition(unit, exprStmt);
+            long end = task.positions.getEndPosition(unit, exprStmt);
+            if (start < 0 || end < start) {
+                return ConstructorInjectionPlan.unresolved();
+            }
+            removalByField.put(fieldName, wholeLineSpan(source, (int) start, (int) end));
+            argByField.put(fieldName, rhsId.getName().toString());
+        }
+        List<long[]> removals = new ArrayList<>();
+        List<String> arguments = new ArrayList<>();
+        for (String field : injectedFieldNames) {
+            if (!removalByField.containsKey(field)) {
+                return ConstructorInjectionPlan.refused("extract_class_field_not_constructor_assigned",
+                        "Field '" + field + "' has no initializer and is not assigned from a constructor parameter; it"
+                                + " cannot be relocated into the collaborator.");
+            }
+            removals.add(removalByField.get(field));
+            arguments.add(argByField.get(field));
+        }
+        long bodyEnd = task.positions.getEndPosition(unit, ctorTree.getBody());
+        if (bodyEnd <= 0) {
+            return ConstructorInjectionPlan.unresolved();
+        }
+        return new ConstructorInjectionPlan(true, null, null, removals, arguments, (int) bodyEnd - 1);
+    }
+
+    public record SuperclassConstructorPlan(
+            boolean resolved,
+            String refusalCode,
+            String refusalMessage,
+            List<long[]> assignmentSpansToRemove,
+            List<String> superArguments,
+            int superInsertOffset) {
+
+        static SuperclassConstructorPlan refused(String code, String message) {
+            return new SuperclassConstructorPlan(true, code, message, List.of(), List.of(), -1);
+        }
+
+        static SuperclassConstructorPlan unresolved() {
+            return new SuperclassConstructorPlan(false, null, null, List.of(), List.of(), -1);
+        }
+
+        public boolean refused() {
+            return refusalCode != null;
+        }
+    }
+
+    /**
+     * Plans hoisting constructor-assigned (initializer-less) fields up into a generated superclass constructor. For the
+     * single source constructor of {@code type}, every field in {@code hoistedFieldNames} must be assigned exactly once
+     * from a plain constructor parameter (mirroring {@link #planConstructorInjection}). Returns, for this class, the
+     * assignment statements to delete and the argument list for a synthesized {@code super(...)} call to be inserted as
+     * the first body statement (at {@code superInsertOffset}). Refuses — never silently no-ops — when the constructor
+     * shape cannot be faithfully reproduced (no/multiple constructors, an existing explicit {@code super(...)}/
+     * {@code this(...)} chain, a non-parameter initializer, or a field assigned zero or many times).
+     */
+    public SuperclassConstructorPlan planSuperclassConstructorPropagation(SemanticType type, List<String> hoistedFieldNames) {
+        if (type == null || !(type.element() instanceof TypeElement owner)) {
+            return SuperclassConstructorPlan.unresolved();
+        }
+        CompilerTask task = taskFor(type.file());
+        if (task == null) {
+            return SuperclassConstructorPlan.unresolved();
+        }
+        List<ExecutableElement> constructors = new ArrayList<>();
+        for (Element enclosed : owner.getEnclosedElements()) {
+            if (enclosed instanceof ExecutableElement executable
+                    && executable.getKind() == ElementKind.CONSTRUCTOR
+                    && task.trees.getPath(executable) != null) {
+                constructors.add(executable);
+            }
+        }
+        if (constructors.isEmpty()) {
+            return SuperclassConstructorPlan.refused("extract_superclass_no_constructor_to_propagate",
+                    "Field(s) " + hoistedFieldNames + " have no initializer and " + type.qualifiedName()
+                            + " declares no constructor to supply them.");
+        }
+        if (constructors.size() > 1) {
+            return SuperclassConstructorPlan.refused("extract_superclass_multiple_constructors",
+                    "Constructor-propagated superclass extraction requires exactly one constructor per class; "
+                            + type.qualifiedName() + " has " + constructors.size() + ".");
+        }
+        ExecutableElement constructor = constructors.get(0);
+        TreePath ctorPath = task.trees.getPath(constructor);
+        if (ctorPath == null || !(ctorPath.getLeaf() instanceof MethodTree ctorTree) || ctorTree.getBody() == null) {
+            return SuperclassConstructorPlan.unresolved();
+        }
+        CompilationUnitTree unit = ctorPath.getCompilationUnit();
+        CharSequence source = sourceByPath.get(pathOf(unit));
+        if (source == null) {
+            return SuperclassConstructorPlan.unresolved();
+        }
+        List<? extends com.sun.source.tree.StatementTree> statements = ctorTree.getBody().getStatements();
+        if (!statements.isEmpty() && statements.get(0) instanceof ExpressionStatementTree first
+                && first.getExpression() instanceof MethodInvocationTree call
+                && call.getMethodSelect() instanceof IdentifierTree selector
+                && (selector.getName().contentEquals("super") || selector.getName().contentEquals("this"))
+                && sourceStartsWithToken(source, task.positions.getStartPosition(unit, call),
+                        selector.getName().toString())) {
+            // A real, source-present super(...)/this(...) chain. javac inserts a *synthetic* super() into every
+            // constructor lacking an explicit chain; that synthetic node carries the constructor's position (not NOPOS),
+            // so the only reliable test is whether the source text at that offset literally begins with the token —
+            // otherwise every plain constructor would be wrongly refused here.
+            return SuperclassConstructorPlan.refused("extract_superclass_constructor_has_explicit_chain",
+                    type.qualifiedName() + "'s constructor already chains to " + selector.getName()
+                            + "(...); a generated super(...) call cannot be inserted ahead of it.");
+        }
+        Set<String> parameterNames = new java.util.HashSet<>();
+        for (VariableElement parameter : constructor.getParameters()) {
+            parameterNames.add(parameter.getSimpleName().toString());
+        }
+        Map<String, long[]> removalByField = new java.util.HashMap<>();
+        Map<String, String> argByField = new java.util.HashMap<>();
+        for (com.sun.source.tree.StatementTree statement : statements) {
+            if (!(statement instanceof ExpressionStatementTree exprStmt)
+                    || !(exprStmt.getExpression() instanceof AssignmentTree assignment)) {
+                continue;
+            }
+            String fieldName = assignedFieldName(assignment.getVariable(), task, ctorPath, owner);
+            if (fieldName == null || !hoistedFieldNames.contains(fieldName)) {
+                continue;
+            }
+            ExpressionTree rhs = stripParens(assignment.getExpression());
+            if (!(rhs instanceof IdentifierTree rhsId) || !parameterNames.contains(rhsId.getName().toString())) {
+                return SuperclassConstructorPlan.refused("extract_superclass_constructor_init_not_simple",
+                        "Field '" + fieldName + "' in " + type.qualifiedName() + " is not initialized directly from a"
+                                + " constructor parameter; its initialization cannot be hoisted to the superclass.");
+            }
+            if (removalByField.containsKey(fieldName)) {
+                return SuperclassConstructorPlan.refused("extract_superclass_field_assigned_multiple_times",
+                        "Field '" + fieldName + "' is assigned more than once in " + type.qualifiedName() + "'s constructor.");
+            }
+            long start = task.positions.getStartPosition(unit, exprStmt);
+            long end = task.positions.getEndPosition(unit, exprStmt);
+            if (start < 0 || end < start) {
+                return SuperclassConstructorPlan.unresolved();
+            }
+            removalByField.put(fieldName, wholeLineSpan(source, (int) start, (int) end));
+            argByField.put(fieldName, rhsId.getName().toString());
+        }
+        List<long[]> removals = new ArrayList<>();
+        List<String> arguments = new ArrayList<>();
+        for (String field : hoistedFieldNames) {
+            if (!removalByField.containsKey(field)) {
+                return SuperclassConstructorPlan.refused("extract_superclass_field_not_constructor_assigned",
+                        "Field '" + field + "' has no initializer and is not assigned from a constructor parameter in "
+                                + type.qualifiedName() + "; it cannot be hoisted to the superclass.");
+            }
+            removals.add(removalByField.get(field));
+            arguments.add(argByField.get(field));
+        }
+        long bodyStart = task.positions.getStartPosition(unit, ctorTree.getBody());
+        if (bodyStart < 0) {
+            return SuperclassConstructorPlan.unresolved();
+        }
+        return new SuperclassConstructorPlan(true, null, null, removals, arguments, (int) bodyStart + 1);
+    }
+
+    /** True when {@code source} at {@code offset} literally begins with {@code token} as a whole word. */
+    private static boolean sourceStartsWithToken(CharSequence source, long offset, String token) {
+        if (source == null || offset < 0 || offset + token.length() > source.length()) {
+            return false;
+        }
+        for (int i = 0; i < token.length(); i++) {
+            if (source.charAt((int) offset + i) != token.charAt(i)) {
+                return false;
+            }
+        }
+        int after = (int) offset + token.length();
+        return after >= source.length() || !Character.isJavaIdentifierPart(source.charAt(after));
+    }
+
+    /**
+     * Compiler-backed adaptation plan for <b>Replace Inheritance With Delegation</b> (refactor-feature-plan-V3.md §10.2
+     * steps 6–7). Describes how to make the delegate field carry the subclass's former super-construction and how to
+     * re-target {@code super.x}/{@code super.m(...)} accesses at the delegate.
+     *
+     * <ul>
+     *   <li>{@code fieldHasInitializer} — when true the delegate field can be initialized inline ({@code = new Base()})
+     *       because no constructor explicitly chains to {@code super(args)}; when false the field is declared without an
+     *       initializer and assigned inside the adapted constructors.</li>
+     *   <li>{@code superCallSpans}/{@code superCallArguments} — for each explicit {@code super(args);} statement, the
+     *       whole-statement span to replace and the verbatim argument source to feed into {@code new Base(args)}.</li>
+     *   <li>{@code implicitInsertOffsets} — body-start offsets of constructors that relied on the synthetic no-arg
+     *       {@code super()} and therefore must assign the delegate themselves (only populated when the field has no inline
+     *       initializer).</li>
+     *   <li>{@code superMemberSpans} — spans of the {@code super} receiver token in {@code super.member}/
+     *       {@code super.method(...)} accesses, to be rewritten to the delegate field name.</li>
+     * </ul>
+     */
+    public record DelegationAdaptationPlan(
+            boolean resolved,
+            String refusalCode,
+            String refusalMessage,
+            boolean fieldHasInitializer,
+            List<long[]> superCallSpans,
+            List<String> superCallArguments,
+            List<Integer> implicitInsertOffsets,
+            List<long[]> superMemberSpans,
+            List<long[]> overrideAnnotationSpans) {
+
+        static DelegationAdaptationPlan refused(String code, String message) {
+            return new DelegationAdaptationPlan(
+                    true, code, message, false, List.of(), List.of(), List.of(), List.of(), List.of());
+        }
+
+        static DelegationAdaptationPlan unresolved() {
+            return new DelegationAdaptationPlan(
+                    false, null, null, false, List.of(), List.of(), List.of(), List.of(), List.of());
+        }
+
+        public boolean refused() {
+            return refusalCode != null;
+        }
+    }
+
+    /**
+     * Plans the constructor- and {@code super}-access adaptations needed to convert {@code subclass extends Base} into a
+     * delegating class. Walks the subclass's source constructors to translate explicit {@code super(args)} chaining into
+     * delegate construction, and scans the whole class body for {@code super.member}/{@code super.method(...)} accesses
+     * that must be redirected to the delegate. Refuses — never silently no-ops — when a constructor cannot construct the
+     * delegate faithfully.
+     */
+    public DelegationAdaptationPlan planDelegationAdaptation(SemanticType subclass, boolean baseHasNoArgConstructor) {
+        if (subclass == null || !(subclass.element() instanceof TypeElement owner)) {
+            return DelegationAdaptationPlan.unresolved();
+        }
+        CompilerTask task = taskFor(subclass.file());
+        if (task == null) {
+            return DelegationAdaptationPlan.unresolved();
+        }
+        TreePath classPath = task.trees.getPath(owner);
+        if (classPath == null || !(classPath.getLeaf() instanceof ClassTree classTree)) {
+            return DelegationAdaptationPlan.unresolved();
+        }
+        CompilationUnitTree unit = classPath.getCompilationUnit();
+        CharSequence source = sourceByPath.get(pathOf(unit));
+        if (source == null) {
+            return DelegationAdaptationPlan.unresolved();
+        }
+
+        List<long[]> superCallSpans = new ArrayList<>();
+        List<String> superCallArguments = new ArrayList<>();
+        List<Integer> pendingImplicitOffsets = new ArrayList<>();
+        boolean hasExplicitSuper = false;
+
+        for (Tree member : classTree.getMembers()) {
+            if (!(member instanceof MethodTree methodTree) || methodTree.getReturnType() != null
+                    || methodTree.getBody() == null) {
+                continue; // only constructors (returnType == null) with a body
+            }
+            if (task.positions.getStartPosition(unit, methodTree) < 0) {
+                continue; // synthetic default constructor — covered by the inline field initializer
+            }
+            List<? extends StatementTree> statements = methodTree.getBody().getStatements();
+            StatementTree first = statements.isEmpty() ? null : statements.get(0);
+            if (first instanceof ExpressionStatementTree exprStmt
+                    && exprStmt.getExpression() instanceof MethodInvocationTree call
+                    && call.getMethodSelect() instanceof IdentifierTree selector
+                    && sourceStartsWithToken(source, task.positions.getStartPosition(unit, call),
+                            selector.getName().toString())) {
+                if (selector.getName().contentEquals("this")) {
+                    continue; // delegate is assigned transitively by the target constructor
+                }
+                if (selector.getName().contentEquals("super")) {
+                    long stmtStart = task.positions.getStartPosition(unit, exprStmt);
+                    long stmtEnd = task.positions.getEndPosition(unit, exprStmt);
+                    if (stmtStart < 0 || stmtEnd < stmtStart) {
+                        return DelegationAdaptationPlan.unresolved();
+                    }
+                    StringBuilder args = new StringBuilder();
+                    List<? extends ExpressionTree> callArgs = call.getArguments();
+                    for (int i = 0; i < callArgs.size(); i++) {
+                        long argStart = task.positions.getStartPosition(unit, callArgs.get(i));
+                        long argEnd = task.positions.getEndPosition(unit, callArgs.get(i));
+                        if (argStart < 0 || argEnd < argStart) {
+                            return DelegationAdaptationPlan.unresolved();
+                        }
+                        if (i > 0) {
+                            args.append(", ");
+                        }
+                        args.append(source.subSequence((int) argStart, (int) argEnd));
+                    }
+                    superCallSpans.add(new long[] {stmtStart, stmtEnd});
+                    superCallArguments.add(args.toString());
+                    hasExplicitSuper = true;
+                    continue;
+                }
+            }
+            long bodyStart = task.positions.getStartPosition(unit, methodTree.getBody());
+            if (bodyStart < 0) {
+                return DelegationAdaptationPlan.unresolved();
+            }
+            pendingImplicitOffsets.add((int) bodyStart + 1);
+        }
+
+        boolean fieldHasInitializer = !hasExplicitSuper;
+        List<Integer> implicitInsertOffsets = new ArrayList<>();
+        if (!fieldHasInitializer) {
+            if (!baseHasNoArgConstructor && !pendingImplicitOffsets.isEmpty()) {
+                return DelegationAdaptationPlan.refused("replace_inheritance_constructor_unanalyzable",
+                        subclass.qualifiedName() + " has a constructor that does not chain to super(...), but the base"
+                                + " class has no accessible no-argument constructor to build the delegate from.");
+            }
+            implicitInsertOffsets.addAll(pendingImplicitOffsets);
+        }
+
+        List<long[]> superMemberSpans = new ArrayList<>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Void unused) {
+                if (node.getExpression() instanceof IdentifierTree id && id.getName().contentEquals("super")) {
+                    long start = task.positions.getStartPosition(unit, id);
+                    long end = task.positions.getEndPosition(unit, id);
+                    if (start >= 0 && end > start && sourceStartsWithToken(source, start, "super")) {
+                        superMemberSpans.add(new long[] {start, end});
+                    }
+                }
+                return super.visitMemberSelect(node, unused);
+            }
+        }.scan(classPath, null);
+
+        // Removing the superclass invalidates any @Override that overrode a base method (the only retained supertype is
+        // Object). Strip @Override from subclass methods that, after the base is gone, no longer override anything Object
+        // provides — leaving it would produce "method does not override ... a supertype".
+        List<long[]> overrideAnnotationSpans =
+                collectStaleOverrideAnnotations(owner, classTree, task, unit, source);
+
+        return new DelegationAdaptationPlan(true, null, null, fieldHasInitializer,
+                superCallSpans, superCallArguments, implicitInsertOffsets, superMemberSpans, overrideAnnotationSpans);
+    }
+
+    /**
+     * Returns the simple name of the first {@code protected} member (field or method) of {@code baseElement}'s
+     * superclass chain that {@code subclass}'s body references, or {@code null} when there is no such dependency
+     * (refactor-feature-plan-V3.md §10.3, "subclass depends on protected fields"). Protected access is granted through
+     * inheritance, so once {@code extends Base} is severed a reference to such a member through the delegate instance —
+     * or unqualified through inheritance — would no longer compile; this is the genuinely-unrepresentable hazard the
+     * planner refuses on rather than emitting an edit that fails javac validation. Public members are fine (a forwarder
+     * or the delegate re-exposes them); private members are not inherited and so are never a dependency.
+     */
+    public String firstProtectedSuperclassDependency(SemanticType subclass, TypeElement baseElement) {
+        if (subclass == null || baseElement == null || !(subclass.element() instanceof TypeElement owner)) {
+            return null;
+        }
+        CompilerTask task = taskFor(subclass.file());
+        if (task == null) {
+            return null;
+        }
+        TreePath classPath = task.trees.getPath(owner);
+        if (classPath == null || !(classPath.getLeaf() instanceof ClassTree)) {
+            return null;
+        }
+        CompilationUnitTree unit = classPath.getCompilationUnit();
+        String[] found = new String[1];
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitIdentifier(IdentifierTree node, Void unused) {
+                inspect(getCurrentPath());
+                return super.visitIdentifier(node, unused);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Void unused) {
+                inspect(getCurrentPath());
+                return super.visitMemberSelect(node, unused);
+            }
+
+            private void inspect(TreePath path) {
+                if (found[0] != null || path == null) {
+                    return;
+                }
+                Element element = task.trees.getElement(path);
+                if (element == null) {
+                    return;
+                }
+                ElementKind kind = element.getKind();
+                if (kind != ElementKind.FIELD && kind != ElementKind.METHOD) {
+                    return;
+                }
+                if (!element.getModifiers().contains(Modifier.PROTECTED)) {
+                    return; // public members re-expose fine; private members are not inherited
+                }
+                Element enclosing = element.getEnclosingElement();
+                if (!(enclosing instanceof TypeElement declaringType) || declaringType.equals(owner)) {
+                    return; // a member the subclass itself declares is not an inherited dependency
+                }
+                if (isSuperclassChainMember(declaringType, baseElement)) {
+                    found[0] = element.getSimpleName().toString();
+                }
+            }
+        }.scan(classPath, null);
+        return found[0];
+    }
+
+    /**
+     * Returns the simple name of the first subclass method that overrides a method of {@code baseElement}'s superclass
+     * chain AND whose body invokes {@code super.method(...)} (refactor-feature-plan-V3.md §10.3, "subclass overrides
+     * methods that call super"), or {@code null} when there is no such method. This is a genuinely unrepresentable
+     * hazard the planner refuses on directly: replacing inheritance turns the override into an ordinary method while
+     * its {@code super.method(...)} call would be retargeted at the delegate — but the base instance the delegate holds
+     * dispatches its OWN methods internally (not the former override), so any self-/template-call semantics the override
+     * participated in are silently lost. Detecting it here (rather than leaving it to the after-edit javac backstop)
+     * makes the refusal specific and design-named.
+     */
+    public String firstOverrideThatCallsSuper(SemanticType subclass, TypeElement baseElement) {
+        if (subclass == null || baseElement == null || !(subclass.element() instanceof TypeElement owner)) {
+            return null;
+        }
+        CompilerTask task = taskFor(subclass.file());
+        if (task == null) {
+            return null;
+        }
+        TreePath classPath = task.trees.getPath(owner);
+        if (classPath == null || !(classPath.getLeaf() instanceof ClassTree classTree)) {
+            return null;
+        }
+        CompilationUnitTree unit = classPath.getCompilationUnit();
+        for (Tree member : classTree.getMembers()) {
+            if (!(member instanceof MethodTree methodTree) || methodTree.getReturnType() == null
+                    || methodTree.getBody() == null) {
+                continue; // methods with a body only (constructors have a null return type)
+            }
+            Element resolved = task.trees.getElement(task.trees.getPath(unit, methodTree));
+            if (!(resolved instanceof ExecutableElement method) || method.getKind() != ElementKind.METHOD) {
+                continue;
+            }
+            if (!overridesBaseChainMethod(method, baseElement, owner)) {
+                continue;
+            }
+            boolean[] callsSuper = new boolean[1];
+            new TreeScanner<Void, Void>() {
+                @Override
+                public Void visitMethodInvocation(MethodInvocationTree node, Void unused) {
+                    if (node.getMethodSelect() instanceof MemberSelectTree select
+                            && select.getExpression() instanceof IdentifierTree id
+                            && id.getName().contentEquals("super")) {
+                        callsSuper[0] = true;
+                    }
+                    return super.visitMethodInvocation(node, unused);
+                }
+            }.scan(methodTree.getBody(), null);
+            if (callsSuper[0]) {
+                return method.getSimpleName().toString();
+            }
+        }
+        return null;
+    }
+
+    /** Whether {@code method} overrides a method declared anywhere on {@code baseElement}'s (non-Object) superclass chain. */
+    private boolean overridesBaseChainMethod(ExecutableElement method, TypeElement baseElement, TypeElement owner) {
+        for (TypeElement current = baseElement; current != null; ) {
+            if (current.getQualifiedName().contentEquals("java.lang.Object")) {
+                return false;
+            }
+            if (overridesAnyMethodOf(method, current, owner)) {
+                return true;
+            }
+            TypeMirror superMirror = current.getSuperclass();
+            current = superMirror != null && superMirror.getKind() == TypeKind.DECLARED
+                    && ((javax.lang.model.type.DeclaredType) superMirror).asElement() instanceof TypeElement next
+                    ? next : null;
+        }
+        return false;
+    }
+
+    /** Whether {@code declaringType} is {@code baseElement} or one of its (non-Object) superclass-chain ancestors. */
+    private static boolean isSuperclassChainMember(TypeElement declaringType, TypeElement baseElement) {
+        for (TypeElement current = baseElement; current != null; ) {
+            if (current.equals(declaringType)) {
+                return true;
+            }
+            if (current.getQualifiedName().contentEquals("java.lang.Object")) {
+                return false;
+            }
+            TypeMirror superMirror = current.getSuperclass();
+            current = superMirror != null && superMirror.getKind() == TypeKind.DECLARED
+                    && ((javax.lang.model.type.DeclaredType) superMirror).asElement() instanceof TypeElement next
+                    ? next : null;
+        }
+        return false;
+    }
+
+    /** Spans of {@code @Override} annotations (with trailing whitespace) on methods that override only the removed base. */
+    private List<long[]> collectStaleOverrideAnnotations(
+            TypeElement owner, ClassTree classTree, CompilerTask task, CompilationUnitTree unit, CharSequence source) {
+        List<long[]> spans = new ArrayList<>();
+        TypeElement objectType = elements.getTypeElement("java.lang.Object");
+        for (Tree member : classTree.getMembers()) {
+            if (!(member instanceof MethodTree methodTree) || methodTree.getReturnType() == null) {
+                continue; // methods only (constructors cannot carry @Override)
+            }
+            Element resolved = task.trees.getElement(task.trees.getPath(unit, methodTree));
+            if (!(resolved instanceof ExecutableElement method) || method.getKind() != ElementKind.METHOD) {
+                continue;
+            }
+            if (objectType != null && overridesAnyMethodOf(method, objectType, owner)) {
+                continue; // still a valid override of an Object method after the base is removed
+            }
+            for (AnnotationTree annotation : methodTree.getModifiers().getAnnotations()) {
+                if (!"java.lang.Override".contentEquals(annotationQualifiedName(annotation, task, unit))) {
+                    continue;
+                }
+                long start = task.positions.getStartPosition(unit, annotation);
+                long end = task.positions.getEndPosition(unit, annotation);
+                if (start < 0 || end < start) {
+                    continue;
+                }
+                int consumed = (int) end;
+                while (consumed < source.length() && (source.charAt(consumed) == ' ' || source.charAt(consumed) == '\t')) {
+                    consumed++;
+                }
+                if (consumed < source.length() && source.charAt(consumed) == '\r') {
+                    consumed++;
+                }
+                if (consumed < source.length() && source.charAt(consumed) == '\n') {
+                    consumed++;
+                }
+                spans.add(new long[] {start, consumed});
+            }
+        }
+        return spans;
+    }
+
+    private boolean overridesAnyMethodOf(ExecutableElement method, TypeElement supertype, TypeElement owner) {
+        for (Element enclosed : supertype.getEnclosedElements()) {
+            if (enclosed instanceof ExecutableElement candidate && candidate.getKind() == ElementKind.METHOD
+                    && elements.overrides(method, candidate, owner)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String annotationQualifiedName(AnnotationTree annotation, CompilerTask task, CompilationUnitTree unit) {
+        Element element = task.trees.getElement(task.trees.getPath(unit, annotation.getAnnotationType()));
+        if (element instanceof TypeElement type) {
+            return type.getQualifiedName().toString();
+        }
+        return annotation.getAnnotationType().toString();
+    }
+
+    /** Resolves {@code this.field = ...} / {@code field = ...} on the left of an assignment to the owner field's name. */
+    private static String assignedFieldName(ExpressionTree lhs, CompilerTask task, TreePath ctorPath, TypeElement owner) {
+        ExpressionTree target = stripParens(lhs);
+        Tree resolveNode;
+        if (target instanceof MemberSelectTree select) {
+            if (!(stripParens(select.getExpression()) instanceof IdentifierTree receiver)
+                    || !receiver.getName().contentEquals("this")) {
+                return null;
+            }
+            resolveNode = select;
+        } else if (target instanceof IdentifierTree) {
+            resolveNode = target;
+        } else {
+            return null;
+        }
+        TreePath path = com.sun.source.util.TreePath.getPath(ctorPath, resolveNode);
+        if (path == null) {
+            return null;
+        }
+        Element element = task.trees.getElement(path);
+        if (element != null && element.getKind() == ElementKind.FIELD && owner.equals(element.getEnclosingElement())) {
+            return element.getSimpleName().toString();
+        }
+        return null;
+    }
+
+    /** Half-open {@code [from, to)} span covering the whole physical line(s) of {@code [start, end)} (leading indentation
+     * through the trailing newline) so removing a statement leaves no blank residue. */
+    private static long[] wholeLineSpan(CharSequence source, int start, int end) {
+        int from = start;
+        while (from > 0 && source.charAt(from - 1) != '\n') {
+            from--;
+        }
+        for (int i = from; i < start; i++) {
+            if (!Character.isWhitespace(source.charAt(i))) {
+                from = start; // not pure indentation; keep only the statement itself
+                break;
+            }
+        }
+        int to = end;
+        while (to < source.length() && source.charAt(to) != '\n' && Character.isWhitespace(source.charAt(to))) {
+            to++;
+        }
+        if (to < source.length() && source.charAt(to) == '\n') {
+            to++;
+        }
+        return new long[] {from, to};
     }
 
     private static ExpressionTree stripParens(ExpressionTree expression) {

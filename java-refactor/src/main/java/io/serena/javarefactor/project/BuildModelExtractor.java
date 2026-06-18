@@ -329,7 +329,11 @@ public final class BuildModelExtractor {
                     // be resolved (an unresolvable dependency, an offline included-build substitution, ...). The init
                     // script ALWAYS emits this field for every Gradle source set, so an absent key only occurs for
                     // non-Gradle/legacy model payloads; absent/false therefore means proven and keeps classpathProven=true.
-                    !boolValue(module.get("classpathUnproven"))
+                    !boolValue(module.get("classpathUnproven")),
+                    // B11: the source set's configured resource directories, emitted by the init script as `resourceDirs`
+                    // (ss.resources.srcDirs). Carried separately from srcDirs so ResourceRootModel discovers a
+                    // non-conventional resource dir (resources.srcDir('res')) model-first. Absent on legacy payloads.
+                    stringList(module.get("resourceDirs"))
             );
             byProject.computeIfAbsent(project, key -> new ArrayList<>()).add(sourceSet);
         }
@@ -398,6 +402,15 @@ public final class BuildModelExtractor {
             List<String> mainSourceRoots = dedup(prependIfDir(mainRoot), mavenBuildHelperSources(project, moduleDir, "add-source"));
             List<String> testSourceRoots = dedup(prependIfDir(testRoot), mavenBuildHelperSources(project, moduleDir, "add-test-source"));
 
+            // B11 model-first resource roots: the module's declared resource directories from the effective POM
+            // (<build><resources><resource><directory>) for main and (<build><testResources><testResource><directory>)
+            // for test. Read directly from the build model so a NON-conventional directory (e.g.
+            // <resource><directory>config</directory>) is discovered, rather than re-derived from the "resources"
+            // filename convention. When the POM declares none, Maven's conventional src/main/resources (and
+            // src/test/resources) is used as the model-declared default so the convention need never be relied on.
+            List<String> mainResourceRoots = mavenResourceRoots(project, moduleDir, "resources", "resource", "src/main/resources");
+            List<String> testResourceRoots = mavenResourceRoots(project, moduleDir, "testResources", "testResource", "src/test/resources");
+
             // Generated roots: the maven-compiler-plugin's annotation-processor output directory (declared by convention,
             // or relocated via <generatedSourcesDirectory>), the configured output directories of known code-generation
             // plugins (protobuf/OpenAPI/JAXB/ANTLR/jOOQ/Avro/QueryDSL/...) which may live outside the conventional parent,
@@ -426,7 +439,7 @@ public final class BuildModelExtractor {
             if (!mainSourceRoots.isEmpty()) {
                 sourceSets.add(new BuildModel.ModelSourceSet("main", mainSourceRoots, mainGenerated,
                         mainOutput, compileClasspath, List.of(), annotationProcessorPath, release, source, target, encoding,
-                        reactorDependencies, compilerArgs, compileProven));
+                        reactorDependencies, compilerArgs, compileProven, mainResourceRoots));
             }
             if (!testSourceRoots.isEmpty()) {
                 // The test compile classpath also needs main's compiled output; main's source root is added to the test
@@ -434,7 +447,7 @@ public final class BuildModelExtractor {
                 // main is built.
                 sourceSets.add(new BuildModel.ModelSourceSet("test", testSourceRoots, testGenerated,
                         testOutput, testClasspath, List.of(), annotationProcessorPath, release, source, target, encoding,
-                        reactorDependencies, compilerArgs, testProven));
+                        reactorDependencies, compilerArgs, testProven, testResourceRoots));
             }
             if (!sourceSets.isEmpty()) {
                 String projectId = textOfChild(project, "artifactId");
@@ -593,6 +606,40 @@ public final class BuildModelExtractor {
             }
         }
         return moduleDir.resolve(fallback).normalize();
+    }
+
+    /**
+     * B11 model-first resource roots: the module's declared resource directories from the effective POM, read DIRECTLY
+     * from the build model (not derived from the {@code resources} filename convention). For main scope this reads
+     * {@code <build><resources><resource><directory>}; for test scope {@code <build><testResources><testResource><directory>}
+     * ({@code containerElement}/{@code itemElement} select which). A {@code <directory>} is resolved against the module
+     * directory and reported whether or not it currently exists on disk, so the model reflects the project's CONFIGURED
+     * layout — this is what lets a non-conventional directory such as {@code <directory>config</directory>} be discovered.
+     * When the POM declares no resources for the scope, the conventional {@code src/main/resources}
+     * (or {@code src/test/resources}) is returned as the model-declared default. Order preserved, de-duplicated.
+     */
+    private static List<String> mavenResourceRoots(Element project, Path moduleDir, String containerElement,
+            String itemElement, String conventionalFallback) {
+        LinkedHashSet<String> roots = new LinkedHashSet<>();
+        Element build = firstChild(project, "build");
+        if (build != null) {
+            for (Element container : childElements(build, containerElement)) {
+                for (Element item : childElements(container, itemElement)) {
+                    String directory = textOfChild(item, "directory");
+                    if (directory != null && !directory.isBlank() && !directory.contains("${")) {
+                        Path path = Path.of(directory.trim());
+                        roots.add((path.isAbsolute() ? path : moduleDir.resolve(directory.trim())).normalize().toString());
+                    }
+                }
+            }
+        }
+        if (roots.isEmpty()) {
+            // The effective POM declared no resources for this scope, so Maven's conventional resource directory is the
+            // model-declared default. Reporting it here (rather than leaving the model empty) keeps discovery model-first:
+            // ResourceRootModel consumes this set and never has to fall back to the filename convention for Maven.
+            roots.add(moduleDir.resolve(conventionalFallback).normalize().toString());
+        }
+        return new ArrayList<>(roots);
     }
 
     private static List<String> readMavenClasspath(Path classpathDir, String groupId, String artifactId, String scope) {

@@ -1309,8 +1309,22 @@ replaceAnnotation
 replaceImport
 removeAnnotation
 addAnnotation
-changeMethodSignature
 ```
+
+> **A compiler-backed structural rule kind (F13 — approved revision of this section).** `changeMethodSignature`
+> is a *structural* declaration change (re-order/add/remove/retype parameters and optional rename, with cascading
+> call-site and override rewrites), not a text-template replacement. An earlier draft deferred it from the recipe
+> engine and refused it; that was deliberately revised — the engine now supports it as a first-class rule kind that
+> still never degrades a structural edit into a textual one. `RecipeParser` parses a `changeMethodSignature` rule
+> into a `SignatureChangeRule` and delegates to the *same* dedicated structural change-signature operation (V1/V2
+> `changeMethodSignature`) used directly: it resolves the overload via javac, rewrites the declaration and every
+> call site through the compiler, and the merged edits pass the sidecar's before/after javac delta validator
+> (`diagnosticDeltaValidated`). The operation's own refusals surface verbatim — e.g. a public method without
+> confirmation yields `PUBLIC_API_CONFIRMATION_REQUIRED`, never a generic recipe refusal — so the capability can
+> never silently no-op. Proof: live-sidecar tests `test_recipe_apply_change_method_signature` (declaration +
+> call-site rewrite, javac-validated) and `test_recipe_change_signature_refusal_passthrough` (public-API refusal
+> passthrough) in `test_java_refactor_v3_recipe_engine_protocol.py`. A *genuinely* unknown rule kind is still
+> refused with `recipe_unknown_rule_kind` via `RecipeParser`'s default branch.
 
 ## 14.2 Recipe engine algorithm
 
@@ -1376,6 +1390,20 @@ public interface ResourceReferenceProvider {
     List<ResourceEdit> planEdits(ResourceReference reference, SymbolChange change);
 }
 ```
+
+> **Shipped scope — both halves of this SPI are live.** The read-only `findReferences` half is surfaced as the
+> independently-callable `resources.findReferences` protocol op (the live interface is `ResourceReferenceProvider`
+> with `id()`/`supports(Path)`/`findReferences(Path, String, ResourceQuery)`). The `planEdits` method above —
+> resource providers owning edit planning in response to a `SymbolChange` — is **implemented and live** via
+> `ResourceEditPlanner`: providers attach a confidence, an edit kind, and an offset to each proposed edit, and a
+> `ResourceApplyPolicy` governs application — HIGH-confidence edits are auto-applied, MEDIUM-confidence edits are
+> previewed unless configured to apply, and LOW-confidence edits are never auto-applied. This coexists with the
+> package rename/move planners' `rewrite_resources` policy, which rewrites exact fully-qualified names in scanned
+> resource files (see §5.5, `ResourceRewriter`, and the sidecar tests
+> `test_sidecar_{rename,move}_package_*rewrite*resource*`). The framework SPI in §16 is likewise fully wired:
+> `frameworks.detect`/`frameworks.findReferences` provide read-only facts, and framework participation
+> (`participate(SymbolChange, TransformationContext)`) is live via `FrameworkParticipationCoordinator`, joined into
+> the deletion and package planner paths.
 
 Reference model:
 
@@ -1478,6 +1506,19 @@ public interface FrameworkPlugin {
     List<TransformationStep> participate(SymbolChange change, TransformationContext context);
 }
 ```
+
+> **Shipped scope — the full SPI is live.** The read-only detection half ships as `frameworks.detect` (which
+> frameworks are present, with annotation-count evidence) and `frameworks.findReferences` (framework-significant
+> references to a target type), both backed by exact compiler-resolved annotation facts (never package-name
+> heuristics). The `participate(...)` method above — letting a plugin contribute `TransformationStep`s to a
+> rename/delete — is **implemented and live**: `FrameworkPlugin` declares `participate(SymbolChange,
+> TransformationContext)` and it is wired into the deletion and package planner paths through
+> `FrameworkParticipationCoordinator`. Consequently the per-plugin **"Participate in"** lists and **"Rewrite …"**
+> rules in §16.1–§16.4 below describe behavior the current build emits: the Spring/JPA/Jackson/JUnit rules
+> block-delete framework-managed types, contribute resource edits/warnings, validate metadata, and treat test
+> methods as roots — always making deletion *more* conservative, never more aggressive. Framework participation
+> coexists with the package planners' `rewrite_resources` resource path (§15). Detection rules (the **"Detect"**
+> lists) are shipped.
 
 ## 16.1 Spring plugin
 
@@ -1809,7 +1850,7 @@ Deliverables:
 * workspace/session composition
 * workspace-level preview/apply/cancel
 * workspace-level project revision guard
-* impact report skeleton
+* impact report (fully computed, five-section)
 
 Acceptance criteria:
 
@@ -1825,8 +1866,8 @@ Deliverables:
 
 * `TransformationGraphBuilder`
 * Java symbol graph
-* resource graph skeleton
-* build graph skeleton
+* resource reference graph (provider-backed, exact FQN)
+* build graph (maven/gradle/plain, module-info)
 * graph invalidation
 
 Acceptance criteria:

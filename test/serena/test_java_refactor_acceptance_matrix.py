@@ -834,12 +834,14 @@ V2_FULL_DESIGN_REQUIREMENTS: dict[str, list[tuple[str, str]]] = {
 
 EXPECTED_V2_REFUSAL_CODES = {
     'AMBIGUOUS_OVERLOAD_AFTER_MOVE',
+    'BUILD_FILE_UPDATE_REQUIRED',
     'PUBLIC_API_CONFIRMATION_REQUIRED',
     'accessor_collision',
     'ambiguous_member_selection',
     'argument_mismatch',
     'assigned_outside_declaration',
     'body_analysis_unbindable',
+    'build_file_rewrite_unsupported',
     'call_site_ambiguous',
     'call_site_not_found',
     'checked_exception_initializer',
@@ -877,6 +879,11 @@ EXPECTED_V2_REFUSAL_CODES = {
     'local_variable_capture',
     'lombok_managed_source_refused',
     'make_static_unsupported',
+    'malformed_move_package',
+    'malformed_move_source_root',
+    'malformed_rename_package',
+    'package_split_across_modules',
+    'source_root_not_found',
     'max_call_sites_exceeded',
     'member_not_found',
     'method_body_unsupported',
@@ -891,18 +898,22 @@ EXPECTED_V2_REFUSAL_CODES = {
     'missing_selection',
     'missing_target_type',
     'missing_target_types',
+    'move_package_failed',
     'multi_declarator_field_unsupported',
     'no_supported_members',
     'non_constant_initializer',
     'non_editable_target',
     'overloaded_method_body_unbound',
     'override_method_unsupported',
+    'package_collision',
+    'package_not_found',
     'path_outside_project',
     'private_type_unsupported',
     'public_api_confirmation_required',
     'receiver_substitution_unsupported',
     'record_component_unsupported',
     'recursive_body_unsupported',
+    'rename_package_failed',
     'selection_not_extractable',
     'selection_out_of_range',
     'serialization_impact',
@@ -922,6 +933,7 @@ EXPECTED_V2_REFUSAL_CODES = {
     'target_not_type',
     'target_parameter_not_found',
     'type_parameter_unsupported',
+    'unparseable_source',
     'unresolved_moved_signature',
     'unresolved_type',
     'unsafe_argument',
@@ -939,6 +951,371 @@ EXPECTED_V2_REFUSAL_CODES = {
 }
 
 ACCEPTANCE_MATRIX["V2 full semantic requirements"] = V2_FULL_DESIGN_REQUIREMENTS
+
+
+# refactor-feature-plan-V3.md §26 acceptance criteria. Every V3 capability the platform claims must map, by exact
+# name, to at least one behavior-asserting test (positive edit and/or precise refusal). The generic guards below
+# (rows-map-to-existing-tests, workflow-runs-every-file, asserts-behavior-not-mere-existence) then hold these rows to
+# the same standard as the V1/V2 rows, so the §26 table cannot silently rot. Both the high-level sidecar op tests
+# (`test_java_refactor_sidecar_v3_*`) and the thin-protocol forwarder tests (`test_java_refactor_v3_*_protocol`) are
+# mapped: the former prove the capability end to end through the workspace engine, the latter pin the JSON contract.
+V3_RENAME_PACKAGE = "test/serena/test_java_refactor_sidecar_v3_package_rename.py"
+V3_MOVE_PACKAGE = "test/serena/test_java_refactor_sidecar_v3_package_move.py"
+V3_SOURCE_ROOT_MOVE = "test/serena/test_java_refactor_sidecar_v3_source_root_move.py"
+V3_SAFE_DELETE = "test/serena/test_java_refactor_sidecar_v3_safe_delete.py"
+V3_EXTRACT_INLINE = "test/serena/test_java_refactor_sidecar_v3_extract_inline.py"
+V3_CONVERSIONS = "test/serena/test_java_refactor_sidecar_v3_conversions.py"
+V3_RECIPES = "test/serena/test_java_refactor_sidecar_v3_recipes.py"
+V3_PKG_MOD_RES = "test/serena/test_java_refactor_sidecar_v3_package_module_resources.py"
+V3_DELETION_PROTO = "test/serena/test_java_refactor_v3_deletion_protocol.py"
+V3_CLASS_REFACTOR_PROTO = "test/serena/test_java_refactor_v3_class_refactor_protocol.py"
+V3_DEEP_INLINE_PROTO = "test/serena/test_java_refactor_v3_deep_inline_protocol.py"
+V3_CONVERSIONS_PROTO = "test/serena/test_java_refactor_v3_conversions_protocol.py"
+V3_RECIPE_ENGINE_PROTO = "test/serena/test_java_refactor_v3_recipe_engine_protocol.py"
+V3_RESOURCE_SPI_PROTO = "test/serena/test_java_refactor_v3_resource_spi_protocol.py"
+V3_FRAMEWORK_SPI_PROTO = "test/serena/test_java_refactor_v3_framework_spi_protocol.py"
+V3_IMPACT_FACTS_PROTO = "test/serena/test_java_refactor_v3_impact_facts_protocol.py"
+V3_GRAPH_PROTO = "test/serena/test_java_refactor_v3_graph_protocol.py"
+V3_SIDECAR_FACTS = "test/serena/test_java_refactor_v3_sidecar_facts.py"
+V3_TOOLS = "test/serena/test_java_refactor_v3_tools.py"
+V3_TRANSFORMATION_PROTO = "test/serena/test_java_refactor_v3_transformation_protocol.py"
+V3_WORKSPACE = "test/serena/test_java_refactor_v3_workspace.py"
+
+V3_ACCEPTANCE_CRITERIA: dict[str, list[tuple[str, str]]] = {
+    "Rename package": [
+        (V3_RENAME_PACKAGE, "test_sidecar_rename_package_basic_moves_file_and_rewrites_references"),
+        (V3_RENAME_PACKAGE, "test_sidecar_rename_package_refuses_collision_with_existing_target_type"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_rewrites_module_info_directive"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_rewrites_resource_fqcn_and_warns_on_reflection"),
+    ],
+    "Move package": [
+        (V3_MOVE_PACKAGE, "test_sidecar_move_package_moves_package_and_subpackage_with_validated_delta"),
+        (V3_MOVE_PACKAGE, "test_sidecar_move_package_excludes_subpackages_when_requested"),
+        (V3_MOVE_PACKAGE, "test_sidecar_move_package_refuses_collision_with_existing_target_type"),
+        (V3_SOURCE_ROOT_MOVE, "test_sidecar_move_source_root_relocates_files_without_text_edits"),
+        (V3_SOURCE_ROOT_MOVE, "test_sidecar_move_source_root_refuses_destination_collision"),
+        (V3_SOURCE_ROOT_MOVE, "test_sidecar_move_source_root_preserve_true_keeps_declarations_and_moves_files"),
+        (V3_SOURCE_ROOT_MOVE, "test_sidecar_move_source_root_preserve_false_recomputes_package_from_directory"),
+    ],
+    "Propagate delete": [
+        (V3_SAFE_DELETE, "test_sidecar_safe_delete_apply_removes_orphan_files"),
+        (V3_SAFE_DELETE, "test_sidecar_safe_delete_refuses_when_deletion_breaks_compilation"),
+        (V3_DELETION_PROTO, "test_cascade_pulls_in_private_helper"),
+        (V3_DELETION_PROTO, "test_blocked_when_live_referrer_remains"),
+        (V3_DELETION_PROTO, "test_service_loader_provider_line_removed"),
+        (V3_DELETION_PROTO, "test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous"),
+        (V3_DELETION_PROTO, "test_propagate_refuses_when_no_roots"),
+    ],
+    "Find dead code": [
+        (V3_SAFE_DELETE, "test_sidecar_find_dead_code_scan_is_read_only"),
+        (V3_DELETION_PROTO, "test_find_dead_code_high_and_low"),
+        (V3_DELETION_PROTO, "test_find_dead_code_mutates_nothing"),
+        (V3_DELETION_PROTO, "test_find_dead_code_reports_unused_constructor_and_overload"),
+        (V3_DELETION_PROTO, "test_find_dead_code_never_reports_required_roots"),
+        (V3_TOOLS, "test_find_dead_code_max_answer_chars_bounds_the_report"),
+    ],
+    "Extract class": [
+        (V3_EXTRACT_INLINE, "test_sidecar_extract_class_apply_writes_helper"),
+        (V3_EXTRACT_INLINE, "test_sidecar_extract_class_refuses_dropping_delegates_for_public_api"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_moves_field_and_method"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_refuses_super_dependency"),
+    ],
+    "Extract superclass": [
+        (V3_EXTRACT_INLINE, "test_sidecar_extract_superclass_apply_inserts_extends"),
+        (V3_EXTRACT_INLINE, "test_sidecar_extract_superclass_refuses_existing_superclass"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_hoists_common_method"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_refuses_existing_super"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_make_abstract_keeps_concrete_override"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_suggests_interface_alternative"),
+    ],
+    "Replace inheritance with delegation": [
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_apply_rewrites_to_composition"),
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_refuses_no_superclass"),
+        # §10 literal-implementation coverage: a co-located `implements` clause is preserved (only `extends` is severed),
+        # cross-package forwarders use a simple type name plus an added import, the public-API change is gated behind an
+        # explicit confirmation, and a protected-superclass-member dependency is refused with a specific code.
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_preserves_implements_clause"),
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_cross_package_uses_import"),
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_blocks_public_api_change_by_default"),
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_refuses_protected_member_dependency"),
+        (V3_EXTRACT_INLINE, "test_sidecar_replace_inheritance_rewrites_super_method_call"),
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_forwards_methods"),
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_refuses_generic_super"),
+    ],
+    "Deep inline method": [
+        (V3_EXTRACT_INLINE, "test_sidecar_deep_inline_method_apply_inlines_and_deletes"),
+        (V3_EXTRACT_INLINE, "test_sidecar_deep_inline_method_refuses_non_private"),
+        (V3_DEEP_INLINE_PROTO, "test_deep_inline_void_multi_statement"),
+        (V3_DEEP_INLINE_PROTO, "test_deep_inline_refuses_recursion"),
+        (V3_DEEP_INLINE_PROTO, "test_deep_inline_max_call_sites_below_count_refuses"),
+        (V3_DEEP_INLINE_PROTO, "test_deep_inline_max_call_sites_at_count_proceeds"),
+    ],
+    "Anonymous to lambda": [
+        (V3_CONVERSIONS, "test_sidecar_convert_anonymous_to_lambda_apply_rewrites"),
+        (V3_CONVERSIONS, "test_sidecar_convert_anonymous_to_lambda_refuses_state"),
+        (V3_CONVERSIONS_PROTO, "test_anonymous_to_lambda_runnable"),
+        (V3_CONVERSIONS_PROTO, "test_anonymous_to_lambda_refuses_field"),
+    ],
+    "Lambda to method reference": [
+        (V3_CONVERSIONS, "test_sidecar_convert_lambda_to_method_reference_apply_rewrites"),
+        (V3_CONVERSIONS, "test_sidecar_convert_lambda_to_method_reference_refuses_block_body"),
+        (V3_CONVERSIONS_PROTO, "test_lambda_to_static_method_reference"),
+        (V3_CONVERSIONS_PROTO, "test_lambda_to_method_reference_refuses_compound"),
+    ],
+    "Resource-aware rewrite": [
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_rewrites_resource_fqcn_and_warns_on_reflection"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_find_across_providers"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_find_package_prefix"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_find_refuses_unknown_kind"),
+    ],
+    "Framework-aware blocking": [
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_detect_junit"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_find_declares"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_find_names"),
+    ],
+    "Recipe engine": [
+        (V3_RECIPES, "test_sidecar_apply_recipe_apply_rewrites"),
+        (V3_RECIPES, "test_sidecar_apply_recipe_refuses_new_compiler_errors"),
+        (V3_RECIPES, "test_sidecar_scan_migration_opportunities_groups_and_writes_nothing"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_custom_safe_static_call"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_refuses_unresolved_symbol"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_blocks_needs_review_by_default"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_applies_needs_review_when_allowed"),
+    ],
+    "Impact report": [
+        (V3_IMPACT_FACTS_PROTO, "test_touched_types_with_flags"),
+        (V3_IMPACT_FACTS_PROTO, "test_incoming_refs_main_vs_test"),
+        (V3_IMPACT_FACTS_PROTO, "test_resource_refs_detected"),
+        (V3_IMPACT_FACTS_PROTO, "test_mutates_nothing"),
+        (V3_SIDECAR_FACTS, "test_report_over_sidecar_facts_has_all_five_sections"),
+        # G3: the sidecar transformation.report computes the real §17 five-section report (no computed:false),
+        # and the Python composed-edit projection computes every section from touched files (no not_analyzed).
+        (V3_TRANSFORMATION_PROTO, "test_report_computes_all_five_sections_with_honest_counts"),
+        (V3_TRANSFORMATION_PROTO, "test_report_zero_sections_are_computed_not_skeleton"),
+        (V3_WORKSPACE, "test_impact_report_classifies_touched_files_with_honest_counts"),
+    ],
+}
+
+# The canonical §26 capability set, transcribed verbatim from the design's "V3 is complete when..." table (left
+# column). It is an independent literal -- NOT derived from V3_ACCEPTANCE_CRITERIA -- so the completeness guard below
+# detects drift in either direction: dropping a capability row, or adding one the design never sanctioned.
+V3_SECTION_26_CAPABILITIES = frozenset(
+    {
+        "Rename package",
+        "Move package",
+        "Propagate delete",
+        "Find dead code",
+        "Extract class",
+        "Extract superclass",
+        "Replace inheritance with delegation",
+        "Deep inline method",
+        "Anonymous to lambda",
+        "Lambda to method reference",
+        "Resource-aware rewrite",
+        "Framework-aware blocking",
+        "Recipe engine",
+        "Impact report",
+    }
+)
+
+ACCEPTANCE_MATRIX["V3 acceptance criteria"] = V3_ACCEPTANCE_CRITERIA
+
+
+# F14: the V3 code-review blocker ledger. The static V3 review raised fourteen blocking findings (F1-F14); each was
+# closed by REAL compiler-backed behavior, never a documented refusal or a no-op param. This section is the capstone
+# (F14 itself): it maps every other finding F1-F13 -- by exact name -- to the dedicated, behavior-asserting test(s)
+# that prove its fix, and maps F14 to the guards below that hold this ledger to the same standard as every other row.
+# Because the section is registered into ACCEPTANCE_MATRIX, the generic guards already enforce that each mapped row
+# (a) names a test that exists (test_acceptance_matrix_rows_map_to_existing_tests), (b) runs under the dedicated CI
+# workflow (test_dedicated_workflow_runs_every_mapped_test_file), and (c) asserts behavior rather than mere existence
+# (test_every_mapped_test_asserts_behavior_not_mere_existence). The completeness guard below then ties the section to
+# the verbatim F1-F14 finding set, so a dropped finding -- or a finding silently demoted to no coverage -- fails CI.
+V3_CAPABILITY_CONTRACT = "test/serena/test_java_refactor_sidecar_v3_capability_contract.py"
+V3_CAPABILITY_GATE_PROTO = "test/serena/test_java_refactor_v3_capability_gate_protocol.py"
+V3_PKG_REF_SURFACE = "test/serena/test_java_refactor_sidecar_v3_package_reference_surface.py"
+V3_PKG_RENAME_AST = "test/serena/test_java_refactor_v3_package_rename_ast_safety.py"
+V3_TYPE_RENAME_RESOURCE = "test/serena/test_java_refactor_v3_type_rename_resource_rewrite.py"
+V3_VALIDATE_EDIT_RESOURCE = "test/serena/test_java_refactor_v3_validate_edit_resource_resolution.py"
+V3_SAFE_DELETE_IMPORT_CLEANUP = "test/serena/test_java_refactor_v3_safe_delete_import_cleanup.py"
+V3_REPORTS = "test/serena/test_java_refactor_v3_reports.py"
+V3_APPLY_POLICY = "test/serena/test_java_refactor_v3_apply_policy.py"
+
+V3_REVIEW_BLOCKERS: dict[str, list[tuple[str, str]]] = {
+    "F1: enumerate every V3 op in the public capability/readiness contract": [
+        (V3_CAPABILITY_CONTRACT, "test_sidecar_enumerates_every_v3_dispatch_operation"),
+        (V3_CAPABILITY_CONTRACT, "test_sidecar_v3_operation_reports_disabled_when_section_flag_gates_it"),
+        (V3_CAPABILITY_CONTRACT, "test_sidecar_v3_master_switch_disables_every_dispatch_operation"),
+        (V3_CAPABILITY_GATE_PROTO, "test_v3_op_refused_when_disabled_by_config"),
+    ],
+    "F2: resource SPI planEdits wired into rename/move/delete/validation/impact": [
+        (V3_RESOURCE_SPI_PROTO, "test_resource_plan_edits_across_providers"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_plan_edits_interface_rename"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_plan_edits_offsets_match_find"),
+        (V3_RESOURCE_SPI_PROTO, "test_resource_plan_edits_refuses_empty"),
+    ],
+    "F3: full package rename/move rewrite surface (wildcard/static imports, javadoc, FQNs)": [
+        (V3_PKG_REF_SURFACE, "test_sidecar_rename_package_rewrites_wildcard_import_and_javadoc"),
+        (V3_PKG_REF_SURFACE, "test_sidecar_move_package_rewrites_wildcard_import_and_javadoc"),
+        (V3_PKG_RENAME_AST, "test_rename_package_rewrites_code_refs_but_not_strings_or_comments"),
+        (V3_RENAME_PACKAGE, "test_sidecar_rename_package_basic_moves_file_and_rewrites_references"),
+    ],
+    "F4: module-info.java module-aware behavior": [
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_rewrites_module_info_directive"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_respects_rewrite_module_info_false"),
+        (V3_PKG_MOD_RES, "test_sidecar_move_package_removes_redundant_export_when_merging_into_exported_package"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_refuses_when_split_across_modules"),
+    ],
+    "F5: resource rewriting (service-loader renames, provider lines, confidence, package-prefix policy)": [
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_renames_service_loader_file_and_rewrites_provider_line"),
+        (V3_PKG_MOD_RES, "test_sidecar_resource_class_name_rewrite_carries_high_confidence_kind"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_leaves_standalone_package_prefix_untouched_by_default"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_rewrites_package_prefix_with_medium_confidence_when_enabled"),
+        (V3_TYPE_RENAME_RESOURCE, "test_type_rename_renames_service_loader_registration_file"),
+    ],
+    "F6: framework participation pipeline (Spring/JPA/Jackson/JUnit)": [
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_detect_junit"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_find_declares"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_find_names"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_framework_find_refuses_empty"),
+        # participate(): the transformation-participant half (§16) — plugins veto deletes, validate metadata,
+        # contribute resource edits/warnings on rename, and contribute reachability roots.
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_jpa_entity_blocks_safe_delete"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_jpa_metadata_validation_warns_without_id"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_jpa_metadata_no_warning_with_id"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_spring_rename_contributes_resource_edit"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_junit_test_is_reachability_root"),
+        (V3_FRAMEWORK_SPI_PROTO, "test_participate_refuses_unrecognized_change_kind"),
+        # plan-joined seams: participation actually affects the delete plan and the dead-code scan.
+        (V3_DELETION_PROTO, "test_propagate_delete_blocked_by_framework_participant"),
+        (V3_DELETION_PROTO, "test_find_dead_code_keeps_junit_test_via_framework_participant"),
+    ],
+    "F7: full V3 impact report (semantic/resource/test/API/risk)": [
+        (V3_IMPACT_FACTS_PROTO, "test_touched_types_with_flags"),
+        (V3_IMPACT_FACTS_PROTO, "test_incoming_refs_main_vs_test"),
+        (V3_IMPACT_FACTS_PROTO, "test_resource_refs_detected"),
+        (V3_IMPACT_FACTS_PROTO, "test_risk_high_for_framework_entry_point"),
+        (V3_REPORTS, "test_impact_report_flags_api_resources_and_tests"),
+        (V3_SIDECAR_FACTS, "test_report_over_sidecar_facts_has_all_five_sections"),
+        # G3: transformation.report's authoritative §17 five-section report computed end-to-end over a live sidecar.
+        (V3_TRANSFORMATION_PROTO, "test_report_computes_all_five_sections_with_honest_counts"),
+        (V3_TRANSFORMATION_PROTO, "test_report_zero_sections_are_computed_not_skeleton"),
+    ],
+    "F8: validation resource/framework layers (exact resolution, provider/interface consistency)": [
+        (V3_VALIDATE_EDIT_RESOURCE, "test_validate_edit_flags_dangling_spring_bean_after_rename_without_resource_rewrite"),
+        (V3_VALIDATE_EDIT_RESOURCE, "test_validate_edit_flags_dangling_jpa_class_after_delete"),
+        (V3_VALIDATE_EDIT_RESOURCE, "test_validate_edit_no_finding_when_resource_rewritten_in_same_overlay"),
+        (V3_VALIDATE_EDIT_RESOURCE, "test_validate_edit_no_finding_for_library_type_reference"),
+    ],
+    "F9: propagating safe-delete cleanup (imports, empty pkg/dir, resource/bean entries)": [
+        (V3_DELETION_PROTO, "test_cascade_pulls_in_private_helper"),
+        (V3_DELETION_PROTO, "test_blocked_when_live_referrer_remains"),
+        (V3_DELETION_PROTO, "test_service_loader_provider_line_removed"),
+        (V3_DELETION_PROTO, "test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous"),
+        (V3_DELETION_PROTO, "test_find_dead_code_reports_unused_constructor_and_overload"),
+        (V3_SAFE_DELETE_IMPORT_CLEANUP, "test_safe_delete_strips_dangling_import_and_compiles"),
+        (V3_SAFE_DELETE_IMPORT_CLEANUP, "test_safe_delete_does_not_mask_real_usage_and_refuses"),
+    ],
+    "F10: extract class with constructor-aware dependency closure": [
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_moves_field_and_method"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_injects_constructor_assigned_fields"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_allows_selected_method_dependency"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_passes_retained_field_as_constructor_parameter"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_keeps_retained_method_as_delegate_call"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_rewrites_external_method_usage_with_update_usages"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_refuses_external_field_usage_even_with_update_usages"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_refuses_retained_field_without_constructor"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_class_refuses_multiple_constructors"),
+    ],
+    "F11: extract superclass (abstract method hoisting, field pull-up, constructor propagation, implements preservation, interface-alternative suggestion)": [
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_hoists_common_method"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_interposes_shared_superclass"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_preserves_implements"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_propagates_constructor"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_refuses_existing_super"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_make_abstract_keeps_concrete_override"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_suggests_interface_alternative"),
+        (V3_CLASS_REFACTOR_PROTO, "test_extract_superclass_field_pull_up_does_not_suggest_interface"),
+    ],
+    "F12: replace inheritance with delegation (constructor adaptation, safe super rewrites)": [
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_forwards_methods"),
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_forwards_transitively_inherited_method"),
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_honors_custom_delegate_field_name"),
+        (V3_CLASS_REFACTOR_PROTO, "test_replace_inheritance_refuses_generic_super"),
+    ],
+    "F13: recipe changeMethodSignature via compiler-backed change-signature engine": [
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_change_method_signature"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_change_signature_refusal_passthrough"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_refuses_no_matches"),
+        (V3_RECIPE_ENGINE_PROTO, "test_recipe_apply_refuses_unresolved_symbol"),
+    ],
+    "F14: test matrix covering every blocker (this ledger + its guards)": [
+        (ACCEPTANCE, "test_v3_review_blockers_cover_every_finding"),
+        (ACCEPTANCE, "test_v3_review_blocker_rows_map_to_existing_tests"),
+        (ACCEPTANCE, "test_v3_review_blocker_rows_assert_behavior"),
+    ],
+}
+
+# The verbatim F1-F14 finding identifiers from the V3 static review. An independent literal -- NOT derived from
+# V3_REVIEW_BLOCKERS -- so the completeness guard detects drift in BOTH directions: a dropped finding row, or a row
+# claiming a finding the review never raised.
+V3_REVIEW_FINDING_IDS = frozenset({f"F{n}" for n in range(1, 15)})
+
+ACCEPTANCE_MATRIX["V3 review blockers"] = V3_REVIEW_BLOCKERS
+
+
+# V3 review gaps: post-blocker review findings ("Review Gap N") raised AFTER the F1-F14 ledger. Each is closed by REAL
+# compiler-backed behavior and mapped here to its dedicated, behavior-asserting test(s). Registered into
+# ACCEPTANCE_MATRIX so the generic guards enforce that every mapped row names a test that exists, runs under the
+# dedicated CI workflow, and asserts behavior — exactly as for the F-ledger.
+V3_REVIEW_GAPS: dict[str, list[tuple[str, str]]] = {
+    # Gap 6: split-package / collision detection must use the build graph's real package-to-source-root facts for ALL
+    # source packages (exported/opened or not), not module-info exports alone. A package physically present in two
+    # source roots/modules is split regardless of module-info, and the qualified directive forms are preserved across a
+    # rename.
+    "Review Gap 6: build-graph split-package detection (package-to-source-root facts, not module-info exports)": [
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_detects_split_of_non_exported_package_via_build_graph"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_split_of_non_exported_package_proceeds_with_module_strategy"),
+        (V3_PKG_MOD_RES, "test_sidecar_move_package_detects_non_exported_split_across_two_source_roots"),
+        (V3_PKG_MOD_RES, "test_sidecar_rename_package_preserves_qualified_directives_and_provides_uses"),
+    ],
+    # Gap 14: uniform risk classification + enforced apply policy, no default-medium. Every accepted V3 edit is
+    # classified from an explicit sidecar value onto the canonical SAFE/REVIEW_REQUIRED/REFUSED taxonomy, and the
+    # apply path enforces policy at ONE seam (the bridge): SAFE applies, REVIEW_REQUIRED is blocked unless the uniform
+    # allow_review_required control opts in, REFUSED never applies. The bridge never defaults an unclassified payload to
+    # a guessed "medium" — it fails closed. Composes with the resource-confidence and framework-participation gaps,
+    # whose facts the sidecar's aggregate (worst-of) risk already rolls into needs_review.
+    "Review Gap 14: uniform risk classification + enforced apply policy (no default-medium)": [
+        (V3_APPLY_POLICY, "test_from_sidecar_wire_maps_safe_and_needs_review"),
+        (V3_APPLY_POLICY, "test_from_sidecar_wire_refuses_medium_explicitly"),
+        (V3_APPLY_POLICY, "test_from_sidecar_wire_refuses_unknown_or_missing"),
+        (V3_APPLY_POLICY, "test_safe_edit_applies"),
+        (V3_APPLY_POLICY, "test_review_required_edit_is_blocked_by_default"),
+        (V3_APPLY_POLICY, "test_review_required_edit_applies_with_uniform_allow_control"),
+        (V3_APPLY_POLICY, "test_route_refuses_accepted_payload_without_explicit_risk"),
+        (V3_APPLY_POLICY, "test_route_passes_through_refused_payload_without_classifying"),
+        (V3_APPLY_POLICY, "test_composition_resource_or_framework_aggregate_blocks_apply"),
+    ],
+    # Review Gap (transformation graph): the unified V3 transformation graph (refactor-feature-plan-V3.md §1.2/§3
+    # F-GRAPH) must be a REAL whole-repo graph built from the sidecar's compiler/build/resource models — not a
+    # touched-set facade or a Python-side report contract alone. The sidecar assembles build layout (Maven/Gradle/plain
+    # source roots, package->source-root and type->file maps), javac symbols/hierarchy/calls, EXACT resource FQN
+    # references (provider-backed, never substring), and javac-resolved test->production edges; it caches per project
+    # revision and invalidates on any source edit (content-addressed). The Python graph_client reshapes that payload
+    # into the ProjectGraph contract verbatim so the impact report reads a real graph. Each protocol test asserts one of
+    # these behaviors against a live sidecar.
+    "Review Gap (transformation graph): real whole-repo graph built/cached from compiler+build+resource models": [
+        (V3_GRAPH_PROTO, "test_plain_graph_build_system_roots_and_maps"),
+        (V3_GRAPH_PROTO, "test_gradle_graph_reports_gradle_build_system"),
+        (V3_GRAPH_PROTO, "test_maven_graph_reports_maven_build_system"),
+        (V3_GRAPH_PROTO, "test_resource_references_are_exact_fqn_not_substring"),
+        (V3_GRAPH_PROTO, "test_tests_referencing_a_touched_type"),
+        (V3_GRAPH_PROTO, "test_graph_cached_then_incrementally_updated_on_source_change"),
+        (V3_GRAPH_PROTO, "test_graph_build_refuses_before_initialize"),
+        (V3_GRAPH_PROTO, "test_parsed_graph_feeds_report_shaped_reads"),
+    ],
+}
+
+ACCEPTANCE_MATRIX["V3 review gaps"] = V3_REVIEW_GAPS
 
 
 def _sidecar_refusal_codes() -> set[str]:
@@ -974,9 +1351,9 @@ def _behavioral_check_count(node: ast.FunctionDef | ast.AsyncFunctionDef) -> int
             count += 1
         elif isinstance(child, ast.Call):
             func = child.func
-            if isinstance(func, ast.Attribute) and func.attr in {"raises", "warns", "fail"}:
-                count += 1
-            elif isinstance(func, ast.Name) and func.id.startswith("_assert"):
+            if (isinstance(func, ast.Attribute) and func.attr in {"raises", "warns", "fail"}) or (
+                isinstance(func, ast.Name) and func.id.startswith("_assert")
+            ):
                 count += 1
     return count
 
@@ -987,6 +1364,62 @@ def test_v2_refusal_code_inventory_matches_sidecar_sources() -> None:
 
 def test_v2_full_design_requirements_are_part_of_acceptance_matrix() -> None:
     assert ACCEPTANCE_MATRIX["V2 full semantic requirements"] == V2_FULL_DESIGN_REQUIREMENTS
+
+
+def test_v3_acceptance_criteria_cover_section_26_capabilities() -> None:
+    # refactor-feature-plan-V3.md §26: V3 is complete only when EVERY capability in the design's table has acceptance
+    # coverage. Tie the matrix section to the verbatim §26 capability set so the table cannot drift -- a dropped
+    # capability row or an unsanctioned addition both fail here, and the generic guards then enforce that each mapped
+    # row points at a real, behavior-asserting test.
+    assert set(ACCEPTANCE_MATRIX["V3 acceptance criteria"]) == set(V3_SECTION_26_CAPABILITIES), (
+        "the V3 acceptance section drifted from refactor-feature-plan-V3.md §26; every shipped V3 capability must keep "
+        "exactly one acceptance row, and no row may claim a capability the design does not list."
+    )
+
+
+def test_v3_review_blockers_cover_every_finding() -> None:
+    # F14: the blocker ledger must account for EXACTLY the fourteen V3 review findings F1-F14 -- no finding dropped and
+    # no row inventing a finding the review never raised. We read the leading "F<n>" token of each row key and tie the
+    # set to the verbatim V3_REVIEW_FINDING_IDS literal. The generic guards then enforce that every row's mapped tests
+    # exist, run under CI, and assert behavior -- so "covered" cannot decay into an empty or existence-only mapping.
+    finding_ids = {key.split(":", 1)[0].strip() for key in ACCEPTANCE_MATRIX["V3 review blockers"]}
+    assert finding_ids == set(V3_REVIEW_FINDING_IDS), (
+        "the V3 review-blocker ledger drifted from the F1-F14 finding set; every blocking finding must keep exactly "
+        f"one row and no row may claim a finding the review never raised. got={sorted(finding_ids)}"
+    )
+
+
+def test_v3_review_blocker_rows_map_to_existing_tests() -> None:
+    # F14: each blocker row must reference at least one test that exists by exact name. (This duplicates the generic
+    # rows-map guard's coverage for this section on purpose: F14 maps to this test, so the ledger names a concrete,
+    # behavior-asserting proof of its own integrity rather than only relying on the shared guard.)
+    nodes_by_file: dict[str, set[str]] = {}
+    missing: list[str] = []
+    for finding, mapped in ACCEPTANCE_MATRIX["V3 review blockers"].items():
+        assert mapped, f"{finding}: no mapped tests"
+        for relative_path, test_name in mapped:
+            if relative_path not in nodes_by_file:
+                assert (REPO_ROOT / relative_path).is_file(), f"{finding}: missing test file {relative_path}"
+                nodes_by_file[relative_path] = _test_function_names(relative_path)
+            if test_name not in nodes_by_file[relative_path]:
+                missing.append(f"{finding} -> {relative_path}::{test_name}")
+    assert not missing, f"V3 review-blocker ledger references missing test(s): {missing}"
+
+
+def test_v3_review_blocker_rows_assert_behavior() -> None:
+    # F14: every blocker proof must observe behavior (an edit/value/refusal outcome), never merely call a function. A
+    # row mapped to an existence-only test would let a finding be "covered" by a test that asserts nothing; this guard
+    # fails in that case, freezing the ledger's honesty.
+    nodes_by_file: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    existence_only: list[str] = []
+    for finding, mapped in ACCEPTANCE_MATRIX["V3 review blockers"].items():
+        for relative_path, test_name in mapped:
+            if relative_path not in nodes_by_file:
+                nodes_by_file[relative_path] = _test_function_nodes(relative_path)
+            node = nodes_by_file[relative_path].get(test_name)
+            if node is not None and _behavioral_check_count(node) == 0:
+                existence_only.append(f"{finding} -> {relative_path}::{test_name}")
+    assert not existence_only, f"V3 review-blocker ledger maps to existence-only test(s): {existence_only}"
 
 
 def test_acceptance_matrix_rows_map_to_existing_tests() -> None:

@@ -13,6 +13,7 @@ from serena.java_refactor.models import JavaRefactorInitializeParams
 from solidlsp.ls_config import Language
 from test.serena._java_refactor_sidecar_helpers import (  # noqa: F401
     CROSS_SOURCE_SET_CONFIG,
+    javac_supports_release_21,
     _build_processor_jar,
     _build_vendored_jar,
     _crafted_apply,
@@ -2211,6 +2212,10 @@ def test_gradle_extracts_add_exports_into_javac_options(sidecar_jar: Path, tmp_p
     assert options[options.index("--add-exports") + 1] == "jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED", options
 
 
+@pytest.mark.skipif(
+    not javac_supports_release_21(),
+    reason="requires a javac supporting --release 21 (JDK 21+); skipped on JDK 17 runs (passes under JDK 21)",
+)
 def test_gradle_extracts_enable_preview_into_javac_options(sidecar_jar: Path, tmp_path: Path) -> None:
     # --enable-preview at the running JDK's release compiles clean (non-preview) code successfully and the flag must be
     # present in the merged javacOptions alongside Serena's own managed --release.

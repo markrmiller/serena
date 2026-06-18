@@ -271,9 +271,9 @@ def _is_str_list_type(field_type: Any) -> bool:
 
 
 def _validated_from_dict(cls: type[T], data: "dict[str, Any] | None", *, domain: str) -> T:
-    """Builds a typed V2 sub-config dataclass from a mapping, rejecting unknown keys and wrong-typed values.
+    """Builds a typed sub-config dataclass from a mapping, rejecting unknown keys and wrong-typed values.
 
-    Shared helper for the ``JavaRefactorV2Config`` family. It enumerates the dataclass field names (via
+    Shared helper for the ``JavaRefactorV2Config`` and ``JavaRefactorV3Config`` families. It enumerates the dataclass field names (via
     ``dataclasses.fields``), rejects any key not declared on the dataclass with a clear ``ValueError`` naming the
     offending ``domain``, and coerces/validates each value against the declared field default's runtime type
     (``bool``/``int``/``str``). Nested dataclass fields are recursed into via their own ``from_dict``. Missing keys fall
@@ -282,12 +282,12 @@ def _validated_from_dict(cls: type[T], data: "dict[str, Any] | None", *, domain:
     if data is None:
         return cls()  # type: ignore[call-arg]
     if not isinstance(data, dict):
-        raise ValueError(f"Invalid {domain} v2 config value {data!r}; expected a mapping of settings.")
+        raise ValueError(f"Invalid {domain} config value {data!r}; expected a mapping of settings.")
     fields_by_name = {f.name: f for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
     unknown = [key for key in data if key not in fields_by_name]
     if unknown:
         raise ValueError(
-            f"Unknown {domain} v2 config key(s): {sorted(unknown)}; expected one of {sorted(fields_by_name)}."
+            f"Unknown {domain} config key(s): {sorted(unknown)}; expected one of {sorted(fields_by_name)}."
         )
     kwargs: dict[str, Any] = {}
     for name, value in data.items():
@@ -640,6 +640,219 @@ class JavaRefactorV2Config:
 
 
 # Maps (containing dataclass, field name) -> nested dataclass type so the shared validator recurses correctly.
+@dataclass
+class V3TransformationsConfig:
+    """Transformation-workspace lifecycle limits (design §20)."""
+
+    max_open_workspaces: int = 8
+    workspace_ttl_minutes: int = 60
+    require_clean_revision_on_apply: bool = True
+    allow_multi_module_edits: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3TransformationsConfig":
+        config = _validated_from_dict(cls, data, domain="transformations")
+        # The apply-time clean-revision guard is non-bypassable by design (the workspace manager enforces it
+        # unconditionally), so an explicit opt-out is rejected at config-load rather than silently ignored.
+        if not config.require_clean_revision_on_apply:
+            raise ValueError(
+                "transformations.require_clean_revision_on_apply:false is not supported; the apply-time "
+                "revision guard is non-bypassable. Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class V3PackagesConfig:
+    """Package rename/move rewrite scope (design §20)."""
+
+    rename_enabled: bool = True
+    move_enabled: bool = True
+    rewrite_module_info: bool = True
+    rewrite_resources: bool = True
+    rewrite_reflective_strings: bool = False
+    # §5.5: an exact dotted FQCN in a scanned resource (e.g. ``<bean class="com.old.Foo"/>``) is safe to rewrite, but a
+    # standalone package prefix (e.g. ``base-package="com.old"``) is ambiguous (it may name a scanning root that should
+    # follow the move, or an unrelated string) so it is left untouched by default and surfaced for human review.
+    rewrite_exact_class_names: bool = True
+    rewrite_package_prefixes: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3PackagesConfig":
+        return _validated_from_dict(cls, data, domain="packages")
+
+
+@dataclass
+class V3DeletionConfig:
+    """Propagating-safe-delete policy (design §20)."""
+
+    propagate_enabled: bool = True
+    public_api_policy: str = "keep"  # canonical: keep | warn | allow ("report" is a legacy alias for "warn")
+    max_cascade_depth: int = 5
+    include_tests_default: bool = False
+    delete_empty_packages: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3DeletionConfig":
+        config = _validated_from_dict(cls, data, domain="deletion")
+        # Normalize the legacy "report" alias to canonical "warn", matching the sidecar analyzer's mapping so the stored
+        # config value and the analyzer agree on one vocabulary (R14, refactor-feature-plan-V3.md §7.5).
+        if config.public_api_policy == "report":
+            config.public_api_policy = "warn"
+        valid_policies = {"keep", "warn", "allow"}
+        if config.public_api_policy not in valid_policies:
+            raise ValueError(
+                f"Invalid deletion.public_api_policy value {config.public_api_policy!r}; "
+                f"expected one of {sorted(valid_policies)} (legacy 'report' is accepted as an alias for 'warn')."
+            )
+        return config
+
+
+@dataclass
+class V3ClassRefactorsConfig:
+    """Extract/replace-inheritance class-refactor toggles (design §20)."""
+
+    extract_class_enabled: bool = True
+    extract_superclass_enabled: bool = True
+    replace_inheritance_with_delegation_enabled: bool = True
+    leave_delegates_default: bool = True
+    allow_public_api_change: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3ClassRefactorsConfig":
+        return _validated_from_dict(cls, data, domain="class_refactors")
+
+
+@dataclass
+class V3InlineConfig:
+    """Deep-inline-method limits (design §20)."""
+
+    deep_inline_enabled: bool = True
+    max_call_sites: int = 25
+    introduce_temps_for_side_effects: bool = True
+    delete_inlined_method_default: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3InlineConfig":
+        return _validated_from_dict(cls, data, domain="inline")
+
+
+@dataclass
+class V3ConversionsConfig:
+    """Anonymous/lambda conversion toggles (design §20)."""
+
+    anonymous_to_lambda_enabled: bool = True
+    lambda_to_method_reference_enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3ConversionsConfig":
+        return _validated_from_dict(cls, data, domain="conversions")
+
+
+@dataclass
+class V3ResourcesConfig:
+    """Resource-provider scan scope (design §20)."""
+
+    enabled: bool = True
+    scan_xml: bool = True
+    scan_properties: bool = True
+    scan_yaml: bool = True
+    scan_json: bool = True
+    scan_service_loader: bool = True
+    auto_apply_confidence: str = "high"  # high | medium | low
+    report_reflection_candidates: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3ResourcesConfig":
+        config = _validated_from_dict(cls, data, domain="resources")
+        valid_confidence = {"high", "medium", "low"}
+        if config.auto_apply_confidence not in valid_confidence:
+            raise ValueError(
+                f"Invalid resources.auto_apply_confidence value {config.auto_apply_confidence!r}; "
+                f"expected one of {sorted(valid_confidence)}."
+            )
+        return config
+
+
+@dataclass
+class V3FrameworksConfig:
+    """Framework-awareness toggles (design §20). Each framework is ``auto``, ``on``, or ``off``."""
+
+    enabled: bool = True
+    spring: str = "auto"
+    jakarta_persistence: str = "auto"
+    jackson: str = "auto"
+    junit: str = "auto"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3FrameworksConfig":
+        config = _validated_from_dict(cls, data, domain="frameworks")
+        valid_modes = {"auto", "on", "off"}
+        for name in ("spring", "jakarta_persistence", "jackson", "junit"):
+            value = getattr(config, name)
+            if value not in valid_modes:
+                raise ValueError(
+                    f"Invalid frameworks.{name} value {value!r}; expected one of {sorted(valid_modes)}."
+                )
+        return config
+
+
+@dataclass
+class V3RecipesConfig:
+    """Migration-recipe engine toggles (design §20)."""
+
+    enabled: bool = True
+    allow_user_recipes: bool = True
+    builtins_enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3RecipesConfig":
+        return _validated_from_dict(cls, data, domain="recipes")
+
+
+@dataclass
+class V3ValidationConfig:
+    """V3 javac-validation policy (design §20)."""
+
+    javac_required: bool = True
+    run_build_tool_compile: bool = False
+    run_tests: bool = False
+    max_validation_seconds: int = 120
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3ValidationConfig":
+        config = _validated_from_dict(cls, data, domain="validation")
+        # The javac before/after delta is the universal V3 safety invariant; disabling it would let edits commit
+        # unvalidated. Reject the opt-out at config-load rather than silently accept an unsafe value.
+        if not config.javac_required:
+            raise ValueError(
+                "validation.javac_required:false is not supported; real javac validation is the non-bypassable "
+                "V3 safety invariant. Remove the key or set it to true."
+            )
+        return config
+
+
+@dataclass
+class JavaRefactorV3Config:
+    """Typed, strictly-validated V3 java_refactor configuration (design §20)."""
+
+    enabled: bool = True
+    transformations: V3TransformationsConfig = field(default_factory=V3TransformationsConfig)
+    packages: V3PackagesConfig = field(default_factory=V3PackagesConfig)
+    deletion: V3DeletionConfig = field(default_factory=V3DeletionConfig)
+    class_refactors: V3ClassRefactorsConfig = field(default_factory=V3ClassRefactorsConfig)
+    inline: V3InlineConfig = field(default_factory=V3InlineConfig)
+    conversions: V3ConversionsConfig = field(default_factory=V3ConversionsConfig)
+    resources: V3ResourcesConfig = field(default_factory=V3ResourcesConfig)
+    frameworks: V3FrameworksConfig = field(default_factory=V3FrameworksConfig)
+    recipes: V3RecipesConfig = field(default_factory=V3RecipesConfig)
+    validation: V3ValidationConfig = field(default_factory=V3ValidationConfig)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "JavaRefactorV3Config":
+        return _validated_from_dict(cls, data, domain="java_refactor")
+
+
 _V2_NESTED_DATACLASSES: dict[tuple[type, str], type] = {
     (JavaRefactorV2Config, "sessions"): V2SessionsConfig,
     (JavaRefactorV2Config, "diagnostics"): V2DiagnosticsConfig,
@@ -658,6 +871,16 @@ _V2_NESTED_DATACLASSES: dict[tuple[type, str], type] = {
     (JavaRefactorV2Config, "lombok"): V2LombokConfig,
     (JavaRefactorV2Config, "operation_defaults"): V2OperationDefaultsConfig,
     (JavaRefactorV2Config, "style"): V2StyleConfig,
+    (JavaRefactorV3Config, "transformations"): V3TransformationsConfig,
+    (JavaRefactorV3Config, "packages"): V3PackagesConfig,
+    (JavaRefactorV3Config, "deletion"): V3DeletionConfig,
+    (JavaRefactorV3Config, "class_refactors"): V3ClassRefactorsConfig,
+    (JavaRefactorV3Config, "inline"): V3InlineConfig,
+    (JavaRefactorV3Config, "conversions"): V3ConversionsConfig,
+    (JavaRefactorV3Config, "resources"): V3ResourcesConfig,
+    (JavaRefactorV3Config, "frameworks"): V3FrameworksConfig,
+    (JavaRefactorV3Config, "recipes"): V3RecipesConfig,
+    (JavaRefactorV3Config, "validation"): V3ValidationConfig,
 }
 
 
@@ -707,6 +930,7 @@ class JavaRefactorConfig:
     target: str | None = None
     encoding: str | None = None
     v2: JavaRefactorV2Config = field(default_factory=JavaRefactorV2Config)
+    v3: JavaRefactorV3Config = field(default_factory=JavaRefactorV3Config)
     # Design-shaped explicit build model override: java_refactor.model.modules.
     model: dict[str, Any] = field(default_factory=dict)
     # Patterns pruned while discovering Java sources/build files. Sent to the sidecar as the initialize contract's
@@ -772,6 +996,16 @@ class JavaRefactorConfig:
                 normalized["v2"] = JavaRefactorV2Config.from_dict(v2_value)
             else:
                 raise ValueError(f"Invalid v2 value {v2_value!r}; expected a mapping of V2 java_refactor settings.")
+        # The v3 sub-tree is likewise a strictly-typed schema: convert it up front so unknown/malformed V3 keys are
+        # rejected at config-load time rather than reaching the V3 transformation platform opaquely.
+        if "v3" in normalized:
+            v3_value = normalized["v3"]
+            if isinstance(v3_value, JavaRefactorV3Config):
+                pass
+            elif v3_value is None or isinstance(v3_value, dict):
+                normalized["v3"] = JavaRefactorV3Config.from_dict(v3_value)
+            else:
+                raise ValueError(f"Invalid v3 value {v3_value!r}; expected a mapping of V3 java_refactor settings.")
         config = cls(**normalized)
         valid_modes = {"none", "classpath", "project"}
         if config.annotation_processing not in valid_modes:
@@ -785,6 +1019,8 @@ class JavaRefactorConfig:
             )
         if not isinstance(config.v2, JavaRefactorV2Config):
             raise ValueError(f"Invalid v2 value {config.v2!r}; expected a mapping of V2 java_refactor settings.")
+        if not isinstance(config.v3, JavaRefactorV3Config):
+            raise ValueError(f"Invalid v3 value {config.v3!r}; expected a mapping of V3 java_refactor settings.")
         if not isinstance(config.model, dict):
             raise ValueError(
                 f"Invalid model value {config.model!r}; expected a mapping with java_refactor.model modules."

@@ -342,6 +342,23 @@ def test_status_reports_v2_capabilities(sidecar_jar: Path, tmp_path: Path) -> No
         # G012-G013 resolved: extract-method now supports method/constructor AND initializer (static/instance block,
         # field initializer) selections with the full V2 data-flow/control-flow matrix, so it is advertised supported.
         "extractMethod",
+        # V3-3 resolved: package rename rewrites declarations, file moves, imports, and FQN references, and every
+        # accepted preview is revalidated by the central PreviewDiagnosticValidator (javac before/after). The one
+        # documented edge case — renaming a package whose subpackages are not also renamed — is caught and refused as
+        # new_compiler_errors rather than silently corrupting code, so the operation is safe-by-refusal and supported.
+        "renamePackage",
+        # V3-3 (G003 second half) resolved: package MOVE relocates the source package and (by default) its subpackages
+        # to a target package, optionally under a different configured source root, rewriting declarations, file moves,
+        # imports, and FQN references. Every accepted preview is revalidated by the central PreviewDiagnosticValidator
+        # (javac before/after); any subpackage/prefix over-rewrite edge case is caught and refused as new_compiler_errors
+        # rather than silently corrupting code, so the operation is safe-by-refusal and supported.
+        "movePackage",
+        # V3-3 (G003) resolved: source-root MOVE relocates Java files from one configured source root to another
+        # WITHOUT changing package declarations, so it emits only file move operations and leaves FQNs/imports
+        # untouched. Every accepted preview is still revalidated by the central PreviewDiagnosticValidator (javac
+        # before/after); a destination collision or type shadowing on the compile path is caught and refused rather
+        # than silently applied, so the operation is safe-by-refusal and supported.
+        "moveSourceRoot",
     )
     for operation in supported_beta_ops:
         assert capabilities[operation] == "beta"
@@ -522,12 +539,13 @@ def test_capabilities_response_includes_javac_runtime_object(sidecar_jar: Path, 
 
     capabilities = cast(dict[str, str], capability_payload["capabilities"])
     details = cast(dict[str, dict[str, Any]], capability_payload["capabilityDetails"])
-    # capabilities maps op -> string level; capabilityDetails carries the truthful status (G001: "supported" only when
-    # the op's V2 hard requirements are implemented; otherwise "preview").
+    # capabilities maps op -> string level (V1/V2 ops are stable/beta; the F1-enumerated dedicated V3 dispatch ops are
+    # experimental); capabilityDetails carries the truthful status (G001: "supported" only when the op's hard
+    # requirements are implemented, "disabled" when config gates it off, otherwise "preview").
     for operation, level in capabilities.items():
-        assert level in {"stable", "beta"}
+        assert level in {"stable", "beta", "experimental"}
         assert details[operation]["level"] == level
-        assert details[operation]["status"] in {"supported", "preview"}
+        assert details[operation]["status"] in {"supported", "preview", "disabled"}
 
     runtime = capability_payload["runtime"]
     assert runtime["status"] == "running"

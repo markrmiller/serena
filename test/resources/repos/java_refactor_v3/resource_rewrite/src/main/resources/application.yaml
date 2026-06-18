@@ -1,0 +1,2 @@
+service:
+  handler: com.acme.app.Handler

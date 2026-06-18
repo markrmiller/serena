@@ -19,6 +19,7 @@ from serena.java_refactor.models import JavaRefactorInitializeParams
 from test.serena._java_refactor_sidecar_helpers import (  # noqa: F401
     text_edits,
     file_ops,
+    javac_supports_release_21,
     sidecar_jar,
     run_status,
     maven_offline_repo,
@@ -243,6 +244,10 @@ def test_gradle_included_build_source_sets_are_extracted(sidecar_jar: Path, tmp_
     assert any("lib/src/main/java/lib/Lib.java" in java_file for java_file in model["allJavaFiles"]), model["allJavaFiles"]
 
 
+@pytest.mark.skipif(
+    not javac_supports_release_21(),
+    reason="requires a javac supporting --release 21 (JDK 21+); skipped on JDK 17 runs (passes under JDK 21)",
+)
 def test_gradle_toolchain_sets_source_target_without_synthesizing_release(sidecar_jar: Path, tmp_path: Path) -> None:
     # A Java toolchain selects the javac binary and pins sourceCompatibility/targetCompatibility, but must NOT be turned
     # into `--release N` (which would diverge from the real build and reject legal `--add-exports` builds). The toolchain
@@ -418,6 +423,10 @@ def test_maven_source_target_without_release_sets_source_and_target_flags(
     assert "--release" not in main["javacOptions"], main["javacOptions"]
 
 
+@pytest.mark.skipif(
+    not javac_supports_release_21(),
+    reason="requires a javac supporting --release 21 (JDK 21+); skipped on JDK 17 runs (passes under JDK 21)",
+)
 def test_explicit_model_named_modules_produces_distinct_source_sets(sidecar_jar: Path, tmp_path: Path) -> None:
     # G008 gap 3: §17.3 flat-module explicit override — modules: [{name, sourceRoots, release}, ...] must produce one
     # distinct source set per module entry, each with its own name, source roots, and per-module release. No build tool

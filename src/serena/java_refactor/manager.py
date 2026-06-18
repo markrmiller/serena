@@ -1,11 +1,12 @@
 import dataclasses
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from importlib import resources
 from pathlib import Path
@@ -25,6 +26,9 @@ from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
 
 if TYPE_CHECKING:
+    from serena.java_refactor_v3 import TransformationClient, TransformationWorkspaceManager
+    from serena.java_refactor_v3.models import RiskLevel
+    from serena.java_refactor_v3.workspace import V3OperationPlan
     from serena.project import Project
 
 # javac diagnostics are formatted "<path>:<line>:<col>: <message>". G003 parses that legacy display string into the
@@ -53,6 +57,23 @@ _V2_CAPABILITY_OPERATIONS = {
     "encapsulateField",
     "inlineMethod",
 }
+
+# V3 whole-repo package operations that ship with dedicated capability tools (v3_tools.JAVA_REFACTOR_V3_CAPABILITY_TOOLS).
+# They are advertised and gated by the sidecar exactly like V2 ops (status supported/preview/disabled), so they must flow
+# through ``_capabilities`` / ``supported_v2_operations`` for their tools to register. They are kept separate from
+# ``_V2_CAPABILITY_OPERATIONS`` (which a guard test pins to the eleven V2 ops) but share the same negotiation path.
+#
+# The dedicated V3 dispatch ops (deletion.*/classRefactor.*/conversions.*/inlineRefactor.*/recipes.*) are deliberately
+# NOT capability-gated at tool registration: they ship as experimental/preview, register on ``java_refactor.enabled``,
+# and refuse at DISPATCH time when the project's ``java_refactor.v3`` config disables them. A guard test
+# (``test_manager_negotiates_v3_package_operations``) pins that a preview dispatch op does not negotiate through this set.
+_V3_CAPABILITY_OPERATIONS = {
+    "renamePackage",
+    "movePackage",
+    "moveSourceRoot",
+}
+
+_CAPABILITY_OPERATIONS = _V2_CAPABILITY_OPERATIONS | _V3_CAPABILITY_OPERATIONS
 
 
 # Coarse identity categories the sidecar verifies against javac ElementKinds (TargetHints.kindMatches). Only
@@ -99,6 +120,65 @@ def _signature_arity(symbol_name: str) -> int | None:
         elif character == "," and depth == 0:
             count += 1
     return count
+
+
+def _validate_member_selectors(members: list[str], operation: str = "extractClass") -> dict | None:
+    """Validates member selectors against the ``ClassOpsSupport.parseSelector`` grammar before calling the sidecar.
+
+    Each selector must be ``field:<name>`` or ``method:<name>`` / ``method:<name>(<types>)``: a kind prefix
+    (``field`` or ``method``), a colon, and a non-blank name. Malformed selectors are rejected with a structured
+    ``invalid_member`` refusal BEFORE the sidecar call so errors are caught early with a clear message.
+
+    :param members: the raw selector strings to validate.
+    :param operation: the operation name to embed in the refusal envelope; defaults to ``"extractClass"``.
+    :returns: a refusal dict when any selector is invalid, or ``None`` when all are valid.
+    """
+    _VALID_KINDS = {"field", "method"}
+    for raw in members:
+        text = (raw or "").strip()
+        colon = text.find(":")
+        if colon <= 0:
+            return {
+                "accepted": False,
+                "operation": operation,
+                "refusal": {
+                    "code": "invalid_member",
+                    "message": (
+                        f"Member selector {raw!r} must be 'field:<name>' or 'method:<name>(<types>)'; "
+                        "a colon after the kind prefix is required."
+                    ),
+                },
+            }
+        kind = text[:colon].strip().lower()
+        if kind not in _VALID_KINDS:
+            return {
+                "accepted": False,
+                "operation": operation,
+                "refusal": {
+                    "code": "invalid_member",
+                    "message": (
+                        f"Member selector {raw!r} has unsupported kind {kind!r}; "
+                        "only 'field' or 'method' are accepted."
+                    ),
+                },
+            }
+        name_part = text[colon + 1 :].strip()
+        # strip optional parameter list for method selectors
+        paren = name_part.find("(")
+        name = name_part[:paren].strip() if paren >= 0 else name_part
+        if not name:
+            return {
+                "accepted": False,
+                "operation": operation,
+                "refusal": {
+                    "code": "invalid_member",
+                    "message": (
+                        f"Member selector {raw!r} has an empty name after the kind prefix; "
+                        "expected 'field:<name>' or 'method:<name>(<types>)'."
+                    ),
+                },
+            }
+    return None
 
 
 def target_hints_from_lsp_symbol(symbol: object) -> dict:
@@ -337,6 +417,8 @@ class JavaRefactorManager:
         self._client: JavaRefactorClient | None = None
         self._capability_levels: dict[str, Mapping[str, Any]] | None = None
         self._initialization_error: str | None = None
+        # V3 transformation-workspace manager, created on first access (see transformation_workspaces).
+        self._transformation_workspaces: "TransformationWorkspaceManager | None" = None
 
     @staticmethod
     def _default_repo_root() -> Path:
@@ -358,10 +440,14 @@ class JavaRefactorManager:
             return JavaRefactorStatus.unavailable(str(e), jar_path=jar_path)
 
     def supported_v2_operations(self) -> set[str] | None:
-        """Returns the set of V2 operations the sidecar advertises with status ``supported``.
+        """Returns the capability-gated operations the sidecar advertises with status ``supported``.
+
+        Covers both the eleven V2 operations and the V3 whole-repo package operations
+        (``_V3_CAPABILITY_OPERATIONS``) that ship with dedicated capability tools, so tool registration
+        enables exactly the operations the sidecar reports as supported.
 
         Returns ``None`` when the sidecar cannot be started or its capability registry is malformed,
-        signalling to tool registration that no capability-gated V2 tools should be enabled for this
+        signalling to tool registration that no capability-gated tools should be enabled for this
         project (a status/debug tool may still be registered separately).
         """
         try:
@@ -396,7 +482,7 @@ class JavaRefactorManager:
 
         capabilities: dict[str, Mapping[str, Any]] = {}
         for operation, capability in registry.items():
-            if not isinstance(operation, str) or operation not in _V2_CAPABILITY_OPERATIONS:
+            if not isinstance(operation, str) or operation not in _CAPABILITY_OPERATIONS:
                 continue
             if isinstance(capability, str):
                 detail = details.get(operation)
@@ -600,6 +686,1628 @@ class JavaRefactorManager:
             validate=validate,
         )
 
+    def rename_package(
+        self,
+        old_package: str,
+        new_package: str,
+        include_subpackages: bool = True,
+        rewrite_resources: bool | None = None,
+        rewrite_module_info: bool | None = None,
+        module_strategy: str | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a compiler-backed Java package rename (V3 ``renamePackage``).
+
+        Renames the package declared by ``old_package`` to ``new_package`` and, when ``include_subpackages`` is true
+        (the default), every subpackage nested beneath it (e.g. ``com.acme.app.util`` -> ``com.acme.core.util`` when
+        ``com.acme.app`` -> ``com.acme.core``). Every affected file has its package declaration rewritten (swapping the
+        ``old_package`` prefix for ``new_package``, subpackages preserving their tail) and its file moved under the new
+        package directory within the same source root; imports / fully-qualified references to every moved package are
+        updated across the project (owner-aware, so references into a non-moved subpackage are left untouched). The
+        sidecar refuses with a structured ``refusal`` (``package_collision``, ``package_not_found``,
+        ``non_editable_target``, or ``malformed_rename_package``) rather than producing an edit that would not compile,
+        and an accepted result is javac-validated through the central preview diagnostic validator.
+
+        :param allow_review_required: B1 uniform apply gate. An accepted ``renamePackage`` result carries the sidecar's
+            §14.3 ``risk``; on apply a ``needs_review`` (REVIEW_REQUIRED) result is refused unless this is true. Preview
+            is unaffected and defaults to ``False`` (block), consistent with the other V3 edit tools.
+        """
+        params: dict = {
+            "oldPackage": old_package,
+            "newPackage": new_package,
+            "includeSubpackages": include_subpackages,
+        }
+        if rewrite_resources is not None:
+            params["rewriteResources"] = rewrite_resources
+        if rewrite_module_info is not None:
+            params["rewriteModuleInfo"] = rewrite_module_info
+        if module_strategy is not None:
+            params["moduleStrategy"] = module_strategy
+        return self._preview_or_apply_refactor(
+            operation="renamePackage",
+            params=params,
+            apply=apply,
+            validate=validate,
+            allow_review_required=allow_review_required,
+        )
+
+    def move_package(
+        self,
+        source_package: str,
+        target_package: str,
+        include_subpackages: bool = True,
+        target_source_root: str | None = None,
+        rewrite_resources: bool | None = None,
+        rewrite_module_info: bool | None = None,
+        module_strategy: str | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a compiler-backed Java package move (V3 ``movePackage``).
+
+        Moves the package declared by ``source_package`` (and, when ``include_subpackages`` is true, every subpackage
+        nested beneath it) to ``target_package``: each affected file's package declaration is rewritten and its file
+        relocated under the destination package directory, optionally beneath a different configured ``target_source_root``,
+        and imports / fully-qualified references to every moved package are updated across the project. The sidecar refuses
+        with a structured ``refusal`` (``package_collision``, ``package_not_found``, ``non_editable_target``, or
+        ``malformed_move_package``) rather than producing an edit that would not compile, and an accepted result is
+        javac-validated through the central preview diagnostic validator.
+
+        :param allow_review_required: B1 uniform apply gate. An accepted ``movePackage`` result carries the sidecar's
+            §14.3 ``risk``; on apply a ``needs_review`` (REVIEW_REQUIRED) result is refused unless this is true. Preview
+            is unaffected and defaults to ``False`` (block), consistent with the other V3 edit tools.
+        """
+        params: dict = {
+            "sourcePackage": source_package,
+            "targetPackage": target_package,
+            "includeSubpackages": include_subpackages,
+        }
+        if target_source_root is not None:
+            params["targetSourceRoot"] = target_source_root
+        if rewrite_resources is not None:
+            params["rewriteResources"] = rewrite_resources
+        if rewrite_module_info is not None:
+            params["rewriteModuleInfo"] = rewrite_module_info
+        if module_strategy is not None:
+            params["moduleStrategy"] = module_strategy
+        return self._preview_or_apply_refactor(
+            operation="movePackage",
+            params=params,
+            apply=apply,
+            validate=validate,
+            allow_review_required=allow_review_required,
+        )
+
+    def move_source_root(
+        self,
+        source_root: str,
+        target_source_root: str,
+        packages: list[str] | None = None,
+        include_subpackages: bool = True,
+        rewrite_build_files: bool = False,
+        preserve_package_names: bool = True,
+        apply: bool = False,
+        validate: bool | None = None,
+    ) -> dict:
+        """Previews or applies a compiler-backed Java source-root move (V3 ``moveSourceRoot``).
+
+        Relocates Java source files from one configured source root to ANOTHER source root while keeping their package
+        declarations unchanged: a pure physical move between source sets. Because every moved file's declared package is
+        identical, fully-qualified names and imports across the project are unaffected, so the plan carries file rename
+        operations and (only when ``rewrite_build_files`` is true and the target is not already a configured source
+        root) a single additive build-file edit registering the target as a ``srcDir`` of the owning source set. An
+        optional ``packages`` list restricts the move to specific packages (and, when ``include_subpackages`` is true,
+        their subpackages); an empty list moves every package rooted under the source root.
+
+        When ``preserve_package_names`` is false the new package for each moved file is computed from the directory
+        mapping (its relative directory beneath ``target_source_root``) and the existing package-rename machinery is
+        run, so package declarations, imports, fully-qualified references, ``module-info`` directives, and resource
+        references are rewritten and javac-validated (§6.2 step 6); the default true keeps declarations untouched.
+
+        When the target is not a configured source root and ``rewrite_build_files`` is false (the default, §6.3), the
+        sidecar refuses with ``BUILD_FILE_UPDATE_REQUIRED``; when it is true but the module is Maven or has no Gradle
+        build file, it refuses with ``build_file_rewrite_unsupported``. Other structured refusals
+        (``source_root_not_found``, ``package_collision``, ``package_not_found``, ``non_editable_target``, or
+        ``malformed_move_source_root``) prevent a move that would not compile, and an accepted result is javac-validated
+        through the central preview diagnostic validator.
+        """
+        params: dict = {
+            "sourceRoot": source_root,
+            "targetSourceRoot": target_source_root,
+            "includeSubpackages": include_subpackages,
+            "rewriteBuildFiles": rewrite_build_files,
+            "preservePackageNames": preserve_package_names,
+        }
+        if packages:
+            params["packages"] = list(packages)
+        return self._preview_or_apply_refactor(
+            operation="moveSourceRoot",
+            params=params,
+            apply=apply,
+            validate=validate,
+        )
+
+    # -- V3 Python-planned transformations (validated through the javac bridge) ------------------------
+
+    # Fixed graph-build revision token: the Python ProjectGraph builder only uses the revision as a cache
+    # key, and the manager exposes no live sidecar revision for the source-text graph, so a stable token is
+    # correct here (a cold build is still performed per call against the current on-disk sources).
+    _V3_GRAPH_REVISION = "v3-python-scan"
+
+    def find_dead_code(
+        self,
+        min_confidence: str | None = None,
+        scope: str | None = None,
+        include_tests: bool = False,
+        public_api_policy: str = "keep",
+    ) -> dict:
+        """Reports Java types unreachable from the public-API boundary, confidence-ranked (V3 ``findDeadCode``, READ-ONLY).
+
+        Forwards to the sidecar's ``deletion.findDeadCode`` (refactor-feature-plan-V3.md §7.5), where javac's
+        ``Trees``/``Elements`` reachability is authoritative. This is a pure analysis that produces NO edit and runs NO
+        javac to validate (nothing is changed). The sidecar returns ``deadCodeCandidates`` — each a
+        ``{symbol, confidence, reason}`` where HIGH is referenced nowhere and LOW is a framework/service-provider entry
+        point that may be reflectively reachable. ``min_confidence`` (``"high"``/``"medium"``/``"low"``) is a PURE
+        PRESENTATION PROJECTION over that list, dropping lower-confidence candidates from the returned report; it changes
+        nothing the sidecar computes (the sidecar emits ``high``/``low``, so a ``medium`` floor keeps only ``high``).
+
+        ``scope`` restricts the scan to a package subtree (e.g. ``"com.acme.app"``; the default ``"project"``/``None``
+        scans the whole project) — a SEMANTIC restriction applied inside the sidecar against each candidate's
+        javac-resolved owner-type FQN, not a Python post-filter. ``include_tests`` widens the reachability graph to test
+        source sets. ``public_api_policy`` is one of ``"keep"`` (public/protected API is an entry point and such symbols
+        are never reported, the default), ``"warn"`` (unreferenced public/protected symbols ARE reported as candidates
+        but carry a public-API-boundary warning for review), or ``"allow"`` (public-API status is ignored and such
+        symbols are treated like internal ones). The legacy value ``"report"`` is accepted as an alias for ``"warn"``.
+        """
+        _CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}
+
+        disabled = self._v3_disabled_refusal("findDeadCode", apply=False)
+        if disabled is not None:
+            disabled["mode"] = "scan"
+            disabled.pop("applied", None)
+            return disabled
+
+        floor: int | None = None
+        if min_confidence is not None and str(min_confidence).strip():
+            floor = _CONFIDENCE_RANK.get(str(min_confidence).strip().lower())
+            if floor is None:
+                return {
+                    "accepted": False,
+                    "operation": "findDeadCode",
+                    "mode": "scan",
+                    "refusal": {
+                        "code": "invalid_min_confidence",
+                        "message": f"min_confidence must be one of 'high', 'medium', 'low'; got {min_confidence!r}.",
+                    },
+                }
+        self._validate_supported_project()
+
+        from serena.java_refactor_v3.deletion_client import DeletionClient
+
+        client = self._get_or_start_client(refresh=False)
+        payload = DeletionClient(client).find_dead_code(
+            scope=scope if scope is not None and str(scope).strip() else "project",
+            include_tests=include_tests,
+            public_api_policy=public_api_policy,
+        )
+        payload.setdefault("mode", "scan")
+        if floor is not None and payload.get("accepted") and isinstance(payload.get("deadCodeCandidates"), list):
+            payload["deadCodeCandidates"] = [
+                candidate
+                for candidate in payload["deadCodeCandidates"]
+                if _CONFIDENCE_RANK.get(str(candidate.get("confidence", "")).strip().lower(), 0) >= floor
+            ]
+        return payload
+
+    def transformation_workspace_impact_report(
+        self,
+        workspace_id: str,
+        include_tests: bool = True,
+        include_resources: bool = True,
+    ) -> dict:
+        """Whole-repo impact report (Java/resources/API/tests/risk) for a composed transformation workspace (G011).
+
+        READ-ONLY: composes the workspace's member plan (without staging or writing), then asks the Java sidecar's
+        stateless ``impact.facts`` op for the javac-truth facts over the touched files (declared types + visibility,
+        source-root classification, resource references, and incoming test references). Those facts back a pure-reshape
+        :class:`SidecarFactsGraph`, over which the unchanged :class:`ImpactReportBuilder` projects the five-section
+        report. All semantic analysis happens in the sidecar with real javac (the anti-hybrid contract); Python only
+        forwards the composed edit's touched paths and reshapes the returned facts into the report. Produces NO edit and
+        runs NO mutation. Refuses on an unknown/terminal/empty/conflicting workspace, on a disabled engine, or on a
+        sidecar facts refusal — each with the standard structured envelope.
+
+        ``include_tests``/``include_resources`` are PURE PRESENTATION PROJECTIONS over the fully-computed report: the
+        sidecar always emits javac-truth resource references and incoming test references, and the risk roll-up is
+        always computed from that complete data; setting either flag to ``False`` only drops the corresponding section
+        from the returned ``report`` so a reviewer who does not care about that dimension gets a smaller envelope. It
+        never changes which facts the sidecar computes nor the risk classification — turning a section off cannot make a
+        risky change look safe.
+        """
+        from serena.java_refactor_v3.impact_facts_client import ImpactFactsClient, ImpactFactsRefused
+        from serena.java_refactor_v3.reports import ImpactReportBuilder
+        from serena.java_refactor_v3.reports.sidecar_facts import SidecarFactsGraph, facts_to_graph_input
+
+        if not self._config.enabled:
+            return {
+                "accepted": False,
+                "operation": "impactReport",
+                "mode": "scan",
+                "refusal": {
+                    "code": "java_refactor_disabled",
+                    "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                    "project configuration to enable compiler-backed Java refactoring tools.",
+                },
+            }
+        self._validate_supported_project()
+        facts_client = ImpactFactsClient(self._get_or_start_client(refresh=False))
+
+        def build(edit, risk, operation) -> dict:
+            raw = facts_client.facts(sorted(edit.touched_files()))
+            if not raw.get("accepted", False):
+                raise ImpactFactsRefused(raw.get("refusal", {}))
+            graph = SidecarFactsGraph(facts_to_graph_input(raw))
+            return ImpactReportBuilder(str(self._project_root), graph).build(edit, risk=risk, operation=operation).to_dict()
+
+        try:
+            result = self.transformation_workspaces.impact_report(workspace_id, build)
+        except ImpactFactsRefused as refused:
+            return {
+                "accepted": False,
+                "operation": "impactReport",
+                "mode": "impact_report",
+                "workspaceId": workspace_id,
+                "refusal": refused.refusal
+                or {"code": "impact_facts_failed", "message": "The sidecar refused to compute impact facts."},
+            }
+        result.setdefault("operation", "impactReport")
+        if result.get("accepted") and isinstance(result.get("report"), dict):
+            report = result["report"]
+            if not include_tests:
+                report.pop("tests", None)
+            if not include_resources:
+                report.pop("resources", None)
+        return result
+
+    def _v3_workspace_disabled_refusal(self, mode: str) -> dict:
+        """The standard ``java_refactor_disabled`` refusal for a transformation-workspace lifecycle call."""
+        return {
+            "accepted": False,
+            "operation": "transformationWorkspace",
+            "mode": mode,
+            "refusal": {
+                "code": "java_refactor_disabled",
+                "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                "project configuration to enable compiler-backed Java refactoring tools.",
+            },
+        }
+
+    def transformation_workspace_create(self) -> dict:
+        """Creates a new open V3 transformation workspace and returns its status summary (G001).
+
+        The workspace groups multiple compiler-backed operations under one revision-guarded unit; enroll member
+        operations with :meth:`transformation_workspace_add_session` / :meth:`transformation_workspace_add_operation`,
+        review with :meth:`transformation_workspace_preview`, then commit with :meth:`transformation_workspace_apply`.
+        Refuses on a disabled engine with the standard structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("create")
+        self._validate_supported_project()
+        workspace = self.transformation_workspaces.create_workspace()
+        result = workspace.status_dict()
+        result["accepted"] = True
+        result["mode"] = "create"
+        result["operation"] = "transformationWorkspace"
+        return result
+
+    def transformation_workspace_add_session(
+        self,
+        workspace_id: str,
+        operation: str,
+        params: dict,
+        validate: bool | None = None,
+    ) -> dict:
+        """Plans a V2 refactor session and enrolls it as a member of ``workspace_id`` under the pinned revision (G001).
+
+        Forwards to the workspace manager's revision-guarded session enrollment. Refuses on a disabled engine, an
+        unknown/terminal workspace, a sidecar-declined session, or a revision mismatch, each with a structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("add_session")
+        self._validate_supported_project()
+        return self.transformation_workspaces.add_session(workspace_id, operation, params, validate=validate)
+
+    def transformation_workspace_add_operation(self, workspace_id: str, operation: str, params: dict) -> dict:
+        """Plans a compute-only V3 operation and enrolls it as a member of ``workspace_id`` (G001).
+
+        The V3 counterpart of :meth:`transformation_workspace_add_session`: the op is planned compute-only (nothing
+        applied or javac-validated) and its edit cached for composition. Refuses on a disabled engine, an
+        unknown/terminal workspace, a sidecar-declined op, or a revision mismatch, each with a structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("add_operation")
+        self._validate_supported_project()
+        return self.transformation_workspaces.add_operation(workspace_id, operation, params)
+
+    def transformation_workspace_preview(self, workspace_id: str) -> dict:
+        """Composes and validates the member plan of ``workspace_id`` without writing anything (G001). READ-ONLY.
+
+        Stages the merged edit in memory (revalidating every file-hash precondition) and returns the aggregated stats,
+        risk, and impact projection. A drifted/overlapping/unsafe composition is refused here rather than at apply time.
+        Refuses on a disabled engine or an unknown/terminal workspace with a structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("preview")
+        self._validate_supported_project()
+        return self.transformation_workspaces.preview(workspace_id)
+
+    def transformation_workspace_apply(
+        self,
+        workspace_id: str,
+        validate: bool | None = None,
+        expected_project_revision: object = None,
+    ) -> dict:
+        """Composes and transactionally commits the member plan of ``workspace_id`` (all-or-nothing) (G001).
+
+        On success the merged edit is staged (validated) then committed atomically and the member sessions released; on
+        any staging/commit failure the applier rolls back and nothing is written. ``expected_project_revision``, when
+        supplied, is an optimistic-concurrency guard that must match the workspace's pinned revision or the apply is
+        refused before any write. Refuses on a disabled engine, an unknown/terminal workspace, a revision mismatch, or a
+        composition/commit failure, each with a structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("apply")
+        self._validate_supported_project()
+        return self.transformation_workspaces.apply(
+            workspace_id, validate=validate, expected_project_revision=expected_project_revision
+        )
+
+    def transformation_workspace_cancel(self, workspace_id: str) -> dict:
+        """Cancels every member of ``workspace_id`` and drops it from the registry (G001).
+
+        V2 member sessions are cancelled in the sidecar; compute-only V3 op members are dropped. Refuses on a disabled
+        engine or an unknown/terminal workspace with a structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("cancel")
+        self._validate_supported_project()
+        return self.transformation_workspaces.cancel(workspace_id)
+
+    def transformation_workspace_list(self) -> dict:
+        """Lists the live transformation workspaces with their status summaries (G001). READ-ONLY.
+
+        Reclaims expired/overflowing workspaces first, then returns one status summary per live workspace. Refuses on a
+        disabled engine with the standard structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_workspace_disabled_refusal("list")
+        self._validate_supported_project()
+        return {
+            "accepted": True,
+            "operation": "transformationWorkspace",
+            "mode": "list",
+            "workspaces": self.transformation_workspaces.list_workspaces(),
+        }
+
+    def _v3_scan_disabled_refusal(self, operation: str) -> dict:
+        """The standard ``java_refactor_disabled`` refusal for a read-only V3 scan (mode ``"scan"``)."""
+        return {
+            "accepted": False,
+            "operation": operation,
+            "mode": "scan",
+            "refusal": {
+                "code": "java_refactor_disabled",
+                "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                "project configuration to enable compiler-backed Java refactoring tools.",
+            },
+        }
+
+    def transformation_graph(self) -> dict:
+        """Builds (or serves the revision-cached) V3 transformation graph for the project (G002). READ-ONLY.
+
+        Forwards to the sidecar's ``graph.build``: the seven-section, revision-keyed transformation graph
+        (``project``/``build``/``symbols``/``hierarchy``/``calls``/``resources``/``tests`` + ``stats``) computed from
+        real javac facts with content-addressed cache invalidation. Produces NO edit and writes nothing. Refuses on a
+        disabled engine or a sidecar ``graph.build`` refusal (``not_initialized``/``graph_build_failed``) with the
+        standard structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("transformationGraph")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.graph_client import GraphClient
+
+        result = GraphClient(self._get_or_start_client(refresh=False)).build()
+        result.setdefault("operation", "transformationGraph")
+        result.setdefault("mode", "scan")
+        return result
+
+    def resource_find_references(
+        self,
+        target: str,
+        *,
+        target_is_package: bool = False,
+        kinds: list[str] | None = None,
+    ) -> dict:
+        """Finds references to ``target`` (a fully-qualified class, or a package) in scanned resources (G005). READ-ONLY.
+
+        Forwards to the sidecar's ``resources.findReferences``: exact-class and package-prefix matches across XML/
+        properties/YAML/JSON and ``META-INF/services``, each with offsets/kind/confidence/provider. Produces NO edit.
+        Refuses on a disabled engine or a sidecar refusal (``resource_target_unresolved``/``unsupported_resource_kind``).
+        """
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("resourceProviders")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.resource_spi_client import ResourceSpiClient
+
+        result = ResourceSpiClient(self._get_or_start_client(refresh=False)).find_references(
+            target, target_is_package=target_is_package, kinds=kinds
+        )
+        result.setdefault("operation", "resourceProviders")
+        result.setdefault("mode", "scan")
+        return result
+
+    def resource_plan_edits(
+        self,
+        *,
+        type_fqn_map: dict[str, str] | None = None,
+        package_map: dict[str, str] | None = None,
+        rewrite_exact_class_names: bool = True,
+        rewrite_package_prefixes: bool = False,
+        apply_medium_confidence: bool = False,
+    ) -> dict:
+        """Plans the SAFE resource rewrites/renames for a set of moved types/packages (G005). READ-ONLY (plan only).
+
+        Forwards to the sidecar's ``resources.planEdits``: the §18.4 confidence-partitioned edit plan
+        (``autoApply``/``preview``/``reviewOnly`` + ``fileRenames``) for the supplied moved-type/package maps. Plans
+        only; it writes nothing. Refuses on a disabled engine or a sidecar refusal (``resource_rename_empty``).
+        """
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("resourceProviders")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.resource_spi_client import ResourceSpiClient
+
+        result = ResourceSpiClient(self._get_or_start_client(refresh=False)).plan_edits(
+            type_fqn_map=type_fqn_map,
+            package_map=package_map,
+            rewrite_exact_class_names=rewrite_exact_class_names,
+            rewrite_package_prefixes=rewrite_package_prefixes,
+            apply_medium_confidence=apply_medium_confidence,
+        )
+        result.setdefault("operation", "resourceProviders")
+        result.setdefault("mode", "scan")
+        return result
+
+    def framework_detect(self) -> dict:
+        """Detects which known frameworks are present in the project, by applied annotations (G005, §16). READ-ONLY.
+
+        Forwards to the sidecar's ``frameworks.detect``: one entry per known framework with ``detected`` and the
+        ``evidence`` annotations found (compiler-backed, not package-name heuristic). Produces NO edit. Refuses on a
+        disabled engine with the standard structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("frameworkDetect")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.framework_spi_client import FrameworkSpiClient
+
+        result = FrameworkSpiClient(self._get_or_start_client(refresh=False)).detect()
+        result.setdefault("operation", "frameworkDetect")
+        result.setdefault("mode", "scan")
+        return result
+
+    def propagate_safe_delete(
+        self,
+        seeds: list[Any],
+        cascade_depth: int | None = None,
+        delete_private_only: bool = True,
+        include_tests: bool = False,
+        include_resources: bool = True,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a compiler-backed propagating safe delete of dead Java types (V3 ``propagateSafeDelete``).
+
+        Forwards to the sidecar's ``deletion.propagateSafeDelete`` (refactor-feature-plan-V3.md §7), where javac's
+        ``Trees``/``Elements`` reachability is authoritative: starting from ``seeds`` (fully-qualified type keys), the
+        sidecar cascades the deletion through every type whose only remaining referrers are themselves being deleted
+        (bounded by ``cascade_depth``), prunes service-loader provider lines naming a deleted class, and returns the
+        graph-shaped ``deletePlan`` (``requested``/``cascade``/``blocked``) plus a removing ``workspaceEdit``.
+
+        Per plan §7.4 the result is graph-shaped and ACCEPTED even when some roots are unresolvable, on the public-API/
+        framework boundary, or still referenced by retained symbols: each such root is reported in ``deletePlan.blocked``
+        with a reason and is absent from the cascade and the edit (so nothing referenced from outside the delete set is
+        ever removed). The ONLY refusal is ``no_roots`` for an empty seed set. The composed edit is computed once by the
+        sidecar (``validate=False``, byte-identical) and routed through the central javac validation bridge
+        (:meth:`_bridge_v3_edit`), which owns staging, preview/apply, the REAL before/after diagnostic delta, and
+        transactional post-validation rollback — so a cascade that would not compile is refused (``new_compiler_errors``)
+        and writes nothing.
+
+        :param seeds: deletion roots, each in any of three interchangeable forms (B08): a fully-qualified type name
+            STRING (the backward-compatible alias), a canonical symbol-key STRING, or a structured position root
+            ``{relativePath, line, column}`` (``column`` optional) the sidecar resolves to the symbol at that source
+            position. The list may mix forms; it is forwarded verbatim to ``deletion.propagateSafeDelete``.
+        :param cascade_depth: bound on the fixpoint cascade depth; when omitted the sidecar default (5) applies.
+            Forwarded as ``maxCascadeDepth``.
+        :param delete_private_only: when ``True`` (default) the cascade never auto-deletes public/protected API — a
+            symbol that crosses the public-API boundary is reported in ``deletePlan.blocked`` rather than removed; when
+            ``False`` unreferenced public symbols may cascade (each emits a public-API boundary warning). This is the
+            sole public-API control on the propagate path. Forwarded as ``deletePrivateOnly``.
+        :param include_tests: when ``True`` the reachability graph includes test source sets so test-only symbols can
+            cascade. Forwarded as ``includeTests``.
+        :param include_resources: when ``True`` (default) ``META-INF/services`` provider lines naming deleted classes
+            are pruned. Forwarded as ``includeResources``.
+        :param apply: when ``True`` commit the edit to disk; otherwise return a preview.
+        :param validate: override for sidecar-side javac validation; ``None`` uses the sidecar default.
+        """
+        from serena.java_refactor_v3.deletion_client import DeletionClient
+
+        disabled = self._v3_disabled_refusal("propagateSafeDelete", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        # Option B (supersedes R3): the sidecar composes the deletion edit compute-only (validate=False); the manager's
+        # _bridge_v3_edit owns the single javac validation seam — preview diagnostic delta plus transactional
+        # apply/rollback — exactly as the recipe engine does, so validation is never double-run or split across layers.
+        kwargs: dict[str, Any] = {
+            "validate": False,
+            "delete_private_only": delete_private_only,
+            "include_tests": include_tests,
+            "include_resources": include_resources,
+        }
+        if cascade_depth is not None:
+            kwargs["max_cascade_depth"] = cascade_depth
+        payload = DeletionClient(client).propagate_safe_delete(list(seeds), **kwargs)
+        # Carry the sidecar's graph-shaped deletePlan{requested,cascade,blocked}, stats, and the now-empty package
+        # directories the cascade pruned (plan §7.3 step 7 / §19.2 directory cleanup) onto the accepted result so the
+        # blocked/cascade safety contract (plan §7.4) is observable; refusals (no_roots) pass through verbatim.
+        return self._route_sidecar_v3_edit(
+            "propagateSafeDelete",
+            payload,
+            apply=apply,
+            validate=validate,
+            carry=("deletePlan", "stats", "removedDirectories"),
+            allow_review_required=allow_review_required,
+        )
+
+    def extract_class(
+        self,
+        relative_path: str,
+        new_class_name: str,
+        members: list[str],
+        *,
+        target_package: str | None = None,
+        leave_delegate_methods: bool = True,
+        update_usages: bool = False,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated extract-class refactoring (V3 ``extractClass``).
+
+        Forwards to the sidecar's compiler-backed ``classRefactor.extractClass`` (refactor-feature-plan-V3.md §8), which
+        moves the cohesive cluster of ``members`` out of the class in ``relative_path`` into a new ``new_class_name`` held
+        behind a delegate field. ``members`` are selectors of the form ``"field:<name>"`` or ``"method:<name>(<types>)"``;
+        ``target_package`` defaults to the source package; ``leave_delegate_methods`` keeps a forwarding stub for each
+        moved method (required to move a public method, else ``extract_class_public_api_without_delegates``).
+
+        Fields without a declaration initializer are constructor-injected: the new class gains a generated constructor for
+        them and the single source constructor is rewritten to build the delegate from the very parameters that fed those
+        fields (§8.3 step 6). Each moved method's dependency closure is classified (§8.3 step 3-4): a selected dependency
+        moves with the cluster; a retained source field a moved method reads is passed as a constructor parameter into the
+        new class; a retained source method a moved method calls is reached through an injected back-reference to the
+        source; only genuinely unrepresentable §8.4 cases are refused. When ``leave_delegate_methods=False`` and
+        ``update_usages=True``, external call sites of a removed method are rewritten through a generated public delegate
+        accessor instead of being refused (§8.3 step 8). A refusal (e.g. ``no_members``, ``member_not_found``,
+        ``source_type_not_found``, ``extract_class_static_field``, ``extract_class_static_method``,
+        ``extract_class_native_method``, ``extract_class_abstract_method``, ``extract_class_uses_super``,
+        ``extract_class_synchronized_receiver``, ``extract_class_source_type_parameter``,
+        ``extract_class_unanalyzable_method``, ``extract_class_public_api_without_delegates``,
+        ``extract_class_external_usage`` (only when ``update_usages`` is false or the external usage form cannot be
+        rewritten through the delegate accessor), ``extract_class_unselected_field_dependency``,
+        ``extract_class_unselected_method_dependency``, ``extract_class_no_constructor_to_inject``,
+        ``extract_class_constructor_unanalyzable``, ``extract_class_multiple_constructors``,
+        ``extract_class_constructor_init_not_simple``,
+        ``extract_class_field_assigned_multiple_times``, ``extract_class_field_not_constructor_assigned``) is returned
+        verbatim. An accepted sidecar edit is routed through the central javac validation bridge so it carries a REAL
+        before/after diagnostic delta; on preview it is accepted only when it introduces no new compiler error, and on
+        apply it is committed transactionally with post-validation rollback.
+        """
+        from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
+
+        disabled = self._v3_disabled_refusal("extractClass", apply)
+        if disabled is not None:
+            return disabled
+
+        # validate member selectors before calling the sidecar — each must be ``field:<name>`` or
+        # ``method:<name>`` / ``method:<name>(<types>)``, matching ClassOpsSupport.parseSelector grammar.
+        invalid = _validate_member_selectors(members)
+        if invalid is not None:
+            return invalid
+
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        payload = ClassRefactorClient(client).extract_class(
+            relative_path,
+            new_class_name,
+            list(members),
+            target_package=target_package,
+            leave_delegate_methods=leave_delegate_methods,
+            update_usages=update_usages,
+        )
+        return self._route_sidecar_v3_edit(
+            "extractClass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+        )
+
+    def extract_superclass(
+        self,
+        classes: list[str],
+        superclass_name: str,
+        members: list[str],
+        *,
+        target_package: str | None = None,
+        make_abstract: bool = False,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated extract-superclass refactoring (V3 ``extractSuperclass``).
+
+        Forwards to the sidecar's compiler-backed ``classRefactor.extractSuperclass`` (refactor-feature-plan-V3.md §9),
+        which hoists ``members`` common to every sibling in ``classes`` (at least one) into a new ``superclass_name`` that
+        each sibling then ``extends``. ``members`` are selectors of the form ``"field:<name>"`` or
+        ``"method:<name>(<types>)"`` and must exist on every selected class; ``target_package`` defaults to the source
+        package.
+
+        ``make_abstract`` reconciliation (B08): the default is ``False`` — hoisted methods are moved CONCRETELY into the
+        generated superclass (their implementation moves up and the subclasses no longer declare them), the
+        smallest-diff, least-surprising extract-superclass shape. Set it ``True`` for the abstract-hoist variant, where
+        each hoisted method becomes an ``abstract`` declaration in the superclass while every subclass keeps its concrete
+        override (annotated ``@Override``). The design doc (G006) does not mandate a default; ``False`` is chosen so the
+        common case (genuinely common implementations) hoists once rather than forcing per-subclass overrides.
+
+        Each entry in ``classes`` is EITHER a PROJECT-RELATIVE PATH to a ``.java`` file
+        (e.g. ``src/main/java/com/acme/app/Account.java``) OR a semantic class identifier — a fully-qualified class name
+        (``com.acme.app.Account``) or a ``fqn:``/``symbol:``-prefixed key — which is resolved to its declaring file via
+        the compiler-backed transformation graph's FQN->file index before dispatch (an identifier that resolves to no
+        project type fails closed with ``class_identifier_unresolved``). The sidecar then resolves each path to its
+        primary type via javac. A refusal (e.g. ``no_members``, ``extract_superclass_member_not_common``,
+        ``extract_superclass_existing_superclass``, ``extract_superclass_has_implements``,
+        ``extract_superclass_abstract_member``, ``extract_superclass_private_member``,
+        ``extract_superclass_field_requires_initializer``) is returned verbatim. An accepted sidecar edit is routed
+        through the central javac validation bridge so it carries a REAL before/after diagnostic delta; on preview it is
+        accepted only when it introduces no new compiler error, and on apply it is committed transactionally with
+        post-validation rollback.
+        """
+        from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
+
+        disabled = self._v3_disabled_refusal("extractSuperclass", apply)
+        if disabled is not None:
+            return disabled
+
+        # validate member selectors before calling the sidecar — each must be ``field:<name>`` or
+        # ``method:<name>`` / ``method:<name>(<types>)``, matching ClassOpsSupport.parseSelector grammar.
+        invalid = _validate_member_selectors(members, operation="extractSuperclass")
+        if invalid is not None:
+            return invalid
+
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+
+        # Resolve any semantic class identifiers (FQN / 'fqn:'/'symbol:' keys) to project-relative paths via the
+        # compiler-backed graph's FQN->file index; project-relative .java paths pass through unchanged. Only build the
+        # graph when at least one entry is non-path, so the common path-only call avoids the graph build.
+        from serena.java_refactor_v3.graph_client import GraphClient, GraphRefused
+
+        needs_resolution = any(
+            entry and not (entry.strip().endswith(".java") or "/" in entry.strip()) for entry in classes
+        )
+        type_to_file: dict[str, str] = {}
+        if needs_resolution:
+            try:
+                type_to_file = GraphClient(client).project_graph().symbols.type_to_file
+            except GraphRefused as error:
+                return {
+                    "accepted": False,
+                    "operation": "extractSuperclass",
+                    "applied": False,
+                    "refusal": {
+                        "code": "class_identifier_unresolved",
+                        "message": "A semantic class identifier was supplied but the transformation graph needed to "
+                        f"resolve it could not be built: {error}. Pass project-relative .java paths instead, or fix the "
+                        "project model and retry.",
+                    },
+                }
+        resolved_classes: list[str] = []
+        for entry in classes:
+            resolved = self._resolve_class_identifier_to_path(entry, type_to_file) if entry else entry
+            if isinstance(resolved, dict):
+                return resolved
+            resolved_classes.append(resolved)
+
+        payload = ClassRefactorClient(client).extract_superclass(
+            resolved_classes,
+            superclass_name,
+            list(members),
+            target_package=target_package,
+            make_abstract=make_abstract,
+        )
+        return self._route_sidecar_v3_edit(
+            "extractSuperclass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+        )
+
+    def _resolve_class_identifier_to_path(self, entry: str, type_to_file: "dict[str, str]") -> "str | dict":
+        """Resolves one ``extractSuperclass`` class identifier to a project-relative ``.java`` path (B08).
+
+        Accepts three forms, resolving the latter two through the compiler-backed graph's FQN->file index so a caller can
+        target a class semantically without knowing its on-disk path:
+
+        * a project-relative ``.java`` PATH (contains ``/`` or ends ``.java``) — returned verbatim (the backward-compatible
+          alias the sidecar already resolves), and
+        * a fully-qualified class name (``com.acme.app.Account``), or a ``fqn:``/``symbol:`` prefixed key — resolved to its
+          declaring file via the graph's ``type_to_file`` map.
+
+        Returns the resolved relative path string, or a structured ``{accepted: False, refusal}`` dict when an FQN/symbol
+        key resolves to no type in the project (so the caller fails closed rather than passing an unresolved identifier
+        through to the sidecar).
+        """
+        raw = entry.strip()
+        # A prefixed semantic key always resolves through the graph.
+        prefixed = None
+        for prefix in ("symbol:", "fqn:"):
+            if raw.startswith(prefix):
+                prefixed = raw[len(prefix) :].strip()
+                break
+        if prefixed is None and (raw.endswith(".java") or "/" in raw):
+            # A project-relative path: pass through unchanged (the sidecar resolves it to its primary type).
+            return raw
+        fqn = prefixed if prefixed is not None else raw
+        resolved = type_to_file.get(fqn)
+        if resolved is None:
+            return {
+                "accepted": False,
+                "operation": "extractSuperclass",
+                "applied": False,
+                "refusal": {
+                    "code": "class_identifier_unresolved",
+                    "message": f"The class identifier {entry!r} did not resolve to any type in the project. Pass a "
+                    "fully-qualified class name (e.g. 'com.acme.app.Account'), a 'symbol:'/'fqn:'-prefixed key, or a "
+                    "project-relative .java path.",
+                },
+            }
+        return resolved
+
+    def replace_inheritance_with_delegation(
+        self,
+        relative_path: str,
+        *,
+        members: list[str] | None = None,
+        delegate_field_name: str | None = None,
+        superclass_fqn: str | None = None,
+        confirm_public_api_change: bool = False,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated replace-inheritance-with-delegation refactoring (V3
+        ``replaceInheritanceWithDelegation``).
+
+        Forwards to the sidecar's compiler-backed ``classRefactor.replaceInheritanceWithDelegation``
+        (refactor-feature-plan-V3.md §10) on the class in ``relative_path``: the ``extends`` clause is dropped, the former
+        superclass is held behind a ``private final`` delegate field (named ``delegate_field_name`` if given), and each
+        selected inherited public instance method (``members`` as plain names or ``"method:<name>"`` selectors; empty
+        selects all forwardable methods) is re-exposed through a forwarder. The accepted result carries the resolved
+        ``superclass`` FQN. A refusal (e.g. ``replace_inheritance_no_superclass``,
+        ``replace_inheritance_generic_superclass``, ``replace_inheritance_generic_subclass``,
+        ``replace_inheritance_sealed_superclass``, ``replace_inheritance_public_api_change``,
+        ``replace_inheritance_protected_member_dependency``,
+        ``replace_inheritance_base_constructor_args``) is returned verbatim. A co-located ``implements`` clause is
+        PRESERVED (only the ``extends`` relationship is severed). An accepted sidecar edit is routed through the
+        central javac validation bridge so it carries a REAL before/after diagnostic delta; on preview it is accepted only
+        when it introduces no new compiler error, and on apply it is committed transactionally with post-validation
+        rollback.
+
+        :param relative_path: project-relative path of the ``.java`` file whose top-level subclass is converted.
+        :param members: optional inherited member names / ``"method:<name>"`` selectors to restrict forwarders; empty
+            selects all forwardable public instance methods.
+        :param delegate_field_name: optional name for the synthesised delegate field; the planner derives a default when
+            omitted.
+        :param superclass_fqn: optional fully-qualified name of the expected direct superclass. When provided it is
+            forwarded to the sidecar as ``superclassFqn``; ``ReplaceInheritanceWithDelegationPlanner`` compares it
+            against the javac-resolved direct superclass and refuses with ``replace_inheritance_superclass_mismatch``
+            on a mismatch, guarding against position/identity drift before any edit is composed.
+        :param confirm_public_api_change: when ``True`` the planner is allowed to drop the supertype from the subclass's
+            public API; otherwise (the §10.3 default) it refuses with ``replace_inheritance_public_api_change``.
+        :param apply: when ``True`` commit the edit to disk; otherwise return a preview.
+        :param validate: override for sidecar-side javac validation; ``None`` uses the sidecar default (enabled).
+        """
+        from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
+
+        disabled = self._v3_disabled_refusal("replaceInheritanceWithDelegation", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        payload = ClassRefactorClient(client).replace_inheritance_with_delegation(
+            relative_path,
+            members=members,
+            delegate_field_name=delegate_field_name,
+            superclass_fqn=superclass_fqn,
+            confirm_public_api_change=confirm_public_api_change,
+        )
+        return self._route_sidecar_v3_edit(
+            "replaceInheritanceWithDelegation",
+            payload,
+            apply=apply,
+            validate=validate,
+            carry=("superclass",),
+            allow_review_required=allow_review_required,
+        )
+
+    def deep_inline_method(
+        self,
+        relative_path: str,
+        line: int,
+        *,
+        column: int | None = None,
+        method_name: str | None = None,
+        delete_method: bool = False,
+        max_call_sites: int | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated deep-inline-method refactoring (V3 ``deepInlineMethod``).
+
+        Forwards to the sidecar's compiler-backed ``inlineRefactor.deepInlineMethod`` (refactor-feature-plan-V3.md §11),
+        which replaces every call to the private, non-recursive method at ``line`` (1-based) in ``relative_path`` with its
+        straight-line body — substituting parameters, hoisting side-effecting arguments into temporaries, and renaming
+        colliding locals — and, when ``delete_method`` is true, removes the now-unused declaration. ``column`` (1-based)
+        and ``method_name`` disambiguate the selected declaration. When ``max_call_sites`` is provided it overrides the
+        configured ``java_refactor.v3.inline.max_call_sites`` limit for this call; if the found call-site count exceeds
+        the effective limit the operation is refused with ``deep_inline_too_many_call_sites``. A refusal (e.g.
+        ``not_private``, ``no_call_sites``, ``recursive_method``, and the other §11 supported-scope guards) is returned
+        verbatim. An accepted sidecar edit is routed through the central javac validation bridge so it carries a REAL
+        before/after diagnostic delta; on preview it is accepted only when it introduces no new compiler error, and on
+        apply it is committed transactionally with post-validation rollback.
+
+        :param relative_path: project-relative path of the Java source file containing the method to inline.
+        :param line: 1-based line number of the method declaration to inline.
+        :param column: 1-based column number to disambiguate when multiple declarations start on the same line.
+        :param method_name: expected method name; the operation is refused when the declaration at the position does not
+            match, providing an unambiguous guard against position drift.
+        :param delete_method: when ``True``, remove the method declaration after inlining every call site.
+        :param max_call_sites: per-call override for the call-site count limit (``java_refactor.v3.inline.max_call_sites``
+            in configuration, default 25). The operation is refused with ``deep_inline_too_many_call_sites`` when the
+            found count exceeds the effective limit.
+        :param apply: when ``True``, commit the edit to disk; otherwise return a preview.
+        :param validate: override for sidecar-side javac validation; ``None`` uses the sidecar default (enabled).
+        """
+        from serena.java_refactor_v3.inline_refactor_client import InlineRefactorClient
+
+        disabled = self._v3_disabled_refusal("deepInlineMethod", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        payload = InlineRefactorClient(client).deep_inline_method(
+            relative_path,
+            line,
+            column=column,
+            method_name=method_name,
+            delete_method=delete_method,
+            max_call_sites=max_call_sites,
+        )
+        return self._route_sidecar_v3_edit(
+            "deepInlineMethod", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+        )
+
+    def convert_anonymous_to_lambda(
+        self,
+        relative_path: str,
+        line: int,
+        column: int | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated anonymous-class-to-lambda conversion (V3 ``convertAnonymousToLambda``).
+
+        Forwards to the sidecar's compiler-backed ``conversions.anonymousToLambda`` (refactor-feature-plan-V3.md §12),
+        which rewrites the anonymous functional-interface instance starting at ``line`` (1-based) in ``relative_path`` into
+        an equivalent lambda; ``column`` (1-based) disambiguates when more than one anonymous class starts on the line. A
+        refusal (e.g. ``anon_not_functional_interface``, ``anon_multiple_abstract_methods``, ``anon_declares_field``,
+        ``anon_has_instance_initializer``, ``anon_declares_extra_method``, ``anon_overrides_object_method``,
+        ``anon_uses_this``, ``anon_uses_super``, ``anon_extends_class``, ``anon_not_found``) is returned verbatim. An
+        accepted sidecar edit is routed through the central javac validation bridge so it carries a REAL before/after
+        diagnostic delta; on preview it is accepted only when it introduces no new compiler error, and on apply it is
+        committed transactionally with post-validation rollback.
+        """
+        from serena.java_refactor_v3.conversions_client import ConversionsClient
+
+        disabled = self._v3_disabled_refusal("convertAnonymousToLambda", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        payload = ConversionsClient(client).anonymous_to_lambda(relative_path, line, column=column)
+        return self._route_sidecar_v3_edit(
+            "convertAnonymousToLambda", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+        )
+
+    def convert_lambda_to_method_reference(
+        self,
+        relative_path: str,
+        line: int,
+        column: int | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated lambda-to-method-reference conversion (V3 ``convertLambdaToMethodReference``).
+
+        Forwards to the sidecar's compiler-backed ``conversions.lambdaToMethodReference`` (refactor-feature-plan-V3.md
+        §13), which rewrites the eligible single-call lambda starting at ``line`` (1-based) in ``relative_path`` into an
+        equivalent method reference (static, bound-instance, or constructor); ``column`` (1-based) disambiguates when more
+        than one lambda starts on the line. A refusal (e.g. ``lambda_not_single_call``, ``lambda_unsupported_shape``,
+        ``lambda_not_found``) is returned verbatim. An accepted sidecar edit is routed through the central javac validation
+        bridge so it carries a REAL before/after diagnostic delta; on preview it is accepted only when it introduces no new
+        compiler error, and on apply it is committed transactionally with post-validation rollback.
+        """
+        from serena.java_refactor_v3.conversions_client import ConversionsClient
+
+        disabled = self._v3_disabled_refusal("convertLambdaToMethodReference", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        client = self._get_or_start_client(refresh=False)
+        payload = ConversionsClient(client).lambda_to_method_reference(relative_path, line, column=column)
+        return self._route_sidecar_v3_edit(
+            "convertLambdaToMethodReference",
+            payload,
+            apply=apply,
+            validate=validate,
+            allow_review_required=allow_review_required,
+        )
+
+    def _select_recipe(
+        self, operation: str, apply_mode: bool, recipe_name: str | None, recipe_document: str | None
+    ) -> "tuple[str | None, dict | None] | dict":
+        """Validates the recipe selection and parses an inline document, returning ``(recipe_id, recipe_obj)`` or a refusal.
+
+        This is thin INPUT VALIDATION + document parsing only — it never plans a refactoring. The sidecar's
+        :class:`RecipeEngine` owns recipe resolution (built-in id or inline object), javac-backed matching, and edit
+        composition. Exactly one of ``recipe_name`` (a built-in id) or ``recipe_document`` (an inline JSON/YAML recipe
+        object) must select the recipe; the sidecar would otherwise silently prefer ``recipe_name`` when both are given,
+        so the exactly-one check is enforced here as a pre-dispatch input guard. A both/neither selection or an
+        unparseable document yields a structured refusal in the standard envelope; otherwise ``(recipe_id, None)`` or
+        ``(None, recipe_obj)`` is returned for the sidecar forwarder.
+        """
+
+        def _refuse(code: str, message: str) -> dict:
+            mode = "scan" if operation == "scanMigrationOpportunities" else ("apply" if apply_mode else "preview")
+            envelope: dict[str, Any] = {
+                "accepted": False,
+                "operation": operation,
+                "mode": mode,
+                "refusal": {"code": code, "message": message},
+            }
+            if operation != "scanMigrationOpportunities":
+                envelope["applied"] = False
+            return envelope
+
+        has_name = bool(recipe_name and recipe_name.strip())
+        has_document = bool(recipe_document and recipe_document.strip())
+        if has_name == has_document:
+            return _refuse(
+                "recipe_selection_ambiguous",
+                "Provide exactly one of recipe_name (built-in) or recipe_document (inline JSON/YAML).",
+            )
+        if has_name:
+            return recipe_name.strip(), None  # type: ignore[union-attr]
+        try:
+            recipe_obj = self._parse_recipe_document(recipe_document)  # type: ignore[arg-type]
+        except ValueError as error:
+            return _refuse("recipe_invalid", f"The recipe document could not be parsed: {error}")
+        if not isinstance(recipe_obj, dict):
+            return _refuse("recipe_invalid", "The recipe document must be a JSON or YAML object.")
+        return None, recipe_obj
+
+    @staticmethod
+    def _parse_recipe_document(recipe_document: str) -> Any:
+        """Parses an inline recipe document string (JSON or YAML) into a Python object for the :class:`RecipeParser`."""
+        text = recipe_document.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        try:
+            import yaml
+
+            return yaml.safe_load(text)
+        except Exception as error:  # surfaced as a structured recipe_invalid refusal
+            raise ValueError(str(error)) from error
+
+    @staticmethod
+    def _group_recipe_findings(findings: list[dict]) -> dict:
+        """Groups scan findings by file and by rule for the agent-facing preview (presentation only)."""
+        by_file: dict[str, list[dict]] = {}
+        by_rule: dict[str, list[dict]] = {}
+        for finding in findings:
+            by_file.setdefault(str(finding.get("path")), []).append(finding)
+            by_rule.setdefault(str(finding.get("ruleId")), []).append(finding)
+        return {"byFile": by_file, "byRule": by_rule}
+
+    def _present_recipe_scan(self, payload: dict) -> dict:
+        """Maps the sidecar ``recipes.scanMigrationOpportunities`` payload onto the manager's grouped scan envelope.
+
+        A refusal is re-enveloped verbatim (only ``operation``/``mode`` are normalized); an accepted scan surfaces the
+        sidecar's report-only ``findings`` as the grouped ``matches`` with the resolved recipe id and ``stats`` summary.
+        This is pure presentation: the sidecar already did all matching against javac-resolved symbols.
+        """
+        if not payload.get("accepted"):
+            refusal = dict(payload)
+            refusal["operation"] = "scanMigrationOpportunities"
+            refusal["mode"] = "scan"
+            return refusal
+        findings = list(payload.get("findings", []))
+        return {
+            "accepted": True,
+            "operation": "scanMigrationOpportunities",
+            "mode": "scan",
+            "recipe": payload.get("recipeId") or "",
+            "warnings": list(payload.get("warnings", [])),
+            "matchCount": len(findings),
+            "groups": self._group_recipe_findings(findings),
+            "matches": findings,
+            "summary": dict(payload.get("stats", {})),
+        }
+
+    def _surface_recipe_apply_presentation(self, result: dict, payload: dict) -> dict:
+        """Adds the recipe-specific grouped preview (``recipe``/``matchCount``/``groups``/``matches``) onto a bridge result.
+
+        The sidecar's ``recipes.applyRecipe`` payload carries only the composed ``workspaceEdit`` and ``stats`` (no
+        per-occurrence findings), so the agent-facing grouping is synthesized from the staged edits. A refusal (already
+        re-enveloped by :meth:`_route_sidecar_v3_edit`) is returned untouched; an accepted edit gains the recipe id, the
+        sidecar's matched-occurrence count, and the per-file edit groups.
+        """
+        if not result.get("accepted"):
+            return result
+        changes = list((payload.get("workspaceEdit") or {}).get("changes", []))
+        by_file: dict[str, list[dict]] = {}
+        matches: list[dict] = []
+        for change in changes:
+            path = str(change.get("path"))
+            edits = list(change.get("edits", []))
+            for edit in edits:
+                occurrence = {"path": path, **edit}
+                by_file.setdefault(path, []).append(occurrence)
+                matches.append(occurrence)
+        stats = dict(payload.get("stats", {}))
+        result["recipe"] = payload.get("recipeId") or ""
+        result["matchCount"] = stats.get("matches", len(matches))
+        result["groups"] = {"byFile": by_file}
+        result["matches"] = matches
+        return result
+
+    def scan_migration_opportunities(
+        self,
+        recipe_name: str | None = None,
+        recipe_document: str | None = None,
+        scope: str = "project",
+    ) -> dict:
+        """Reports the grouped migration opportunities a recipe matches across the project (READ-ONLY scan).
+
+        Resolves the recipe from a built-in ``recipe_name`` or an inline ``recipe_document`` (JSON/YAML), builds the V3
+        :class:`ProjectGraph`, and runs :class:`RecipeEngine.scan`, which matches every rule and classifies each
+        occurrence (SAFE / REVIEW_REQUIRED) WITHOUT composing or applying any edit. This is a pure preview: nothing is
+        written and no javac runs (there is no edit to validate), mirroring :meth:`find_dead_code`. A parse error or
+        unknown built-in name is returned as a structured refusal.
+        """
+        from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
+
+        if not self._config.enabled:
+            return {
+                "accepted": False,
+                "operation": "scanMigrationOpportunities",
+                "mode": "scan",
+                "refusal": {
+                    "code": "java_refactor_disabled",
+                    "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                    "project configuration to enable compiler-backed Java refactoring tools.",
+                },
+            }
+        self._validate_supported_project()
+
+        selection = self._select_recipe("scanMigrationOpportunities", False, recipe_name, recipe_document)
+        if isinstance(selection, dict):
+            return selection
+        recipe_id, recipe_obj = selection
+
+        client = self._get_or_start_client(refresh=False)
+        payload = RecipeEngineClient(client).scan_migration_opportunities(
+            recipe_id=recipe_id, recipe=recipe_obj, scope=scope
+        )
+        return self._present_recipe_scan(payload)
+
+    def apply_refactor_recipe(
+        self,
+        recipe_name: str | None = None,
+        recipe_document: str | None = None,
+        apply: bool = False,
+        validate: bool | None = None,
+        scope: str = "project",
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Previews or applies a javac-validated migration recipe across the project (V3 ``applyRefactorRecipe``).
+
+        Resolves the recipe from a built-in ``recipe_name`` or an inline ``recipe_document`` (JSON/YAML), builds the V3
+        :class:`ProjectGraph`, and runs :class:`RecipeEngine.plan`, which composes a transactional edit for every matched
+        occurrence. A refused plan (``recipe_no_matches`` and the parse/selection refusals) is returned verbatim. An
+        accepted plan's edit is routed through the central javac validation bridge so it carries a REAL before/after
+        diagnostic delta; on preview it is accepted only when it introduces no new compiler error, and on apply it is
+        committed transactionally with post-validation rollback. The grouped ``matches`` and impact ``summary`` are
+        surfaced on the result alongside the validated delta.
+
+        ``allow_review_required`` (forwarded to the sidecar as ``apply_needs_review``) controls the risk policy: when
+        ``False`` (the default) only matches the engine classifies SAFE are applied and REVIEW_REQUIRED matches that
+        carry a concrete replacement are SKIPPED; when ``True`` those REVIEW_REQUIRED matches are also applied. Report-only
+        findings (no replacement) are never applied regardless.
+        """
+        from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
+
+        disabled = self._v3_disabled_refusal("applyRefactorRecipe", apply)
+        if disabled is not None:
+            return disabled
+        self._validate_supported_project()
+
+        selection = self._select_recipe("applyRefactorRecipe", apply, recipe_name, recipe_document)
+        if isinstance(selection, dict):
+            return selection
+        recipe_id, recipe_obj = selection
+
+        client = self._get_or_start_client(refresh=False)
+        # validate=False keeps the sidecar a pure compute-only edit composer: the manager's central javac bridge
+        # (_bridge_v3_edit, via _route_sidecar_v3_edit) owns ALL validation so a breaking recipe is refused with the
+        # uniform bridge codes (preview new_compiler_errors; apply pre_apply_validation_failed / post_validation_failed)
+        # and an accepted edit is staged/applied transactionally with post-commit rollback.
+        payload = RecipeEngineClient(client).apply_recipe(
+            recipe_id=recipe_id,
+            recipe=recipe_obj,
+            apply_needs_review=allow_review_required,
+            validate=False,
+            scope=scope,
+        )
+        result = self._route_sidecar_v3_edit(
+            "applyRefactorRecipe", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+        )
+        return self._surface_recipe_apply_presentation(result, payload)
+
+    def _v3_disabled_refusal(self, operation: str, apply: bool) -> dict | None:
+        """The standard ``java_refactor_disabled`` refusal envelope when the project has Java refactoring off, else None."""
+        if self._config.enabled:
+            return None
+        return {
+            "accepted": False,
+            "applied": False,
+            "operation": operation,
+            "mode": "apply" if apply else "preview",
+            "refusal": {
+                "code": "java_refactor_disabled",
+                "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                "project configuration to enable compiler-backed Java refactoring tools.",
+            },
+        }
+
+    def _route_sidecar_v3_edit(
+        self,
+        operation: str,
+        payload: dict,
+        *,
+        apply: bool,
+        validate: bool | None,
+        carry: tuple[str, ...] = (),
+        allow_review_required: bool = False,
+    ) -> dict:
+        """Routes a compute-only sidecar V3 op payload through the manager's apply/rollback bridge.
+
+        The Java sidecar's V3 ops (``classRefactor.*``, ``conversions.*``, ``inlineRefactor.*``, ``recipes.applyRecipe``,
+        ``deletion.propagateSafeDelete``) never write files: an accepted payload carries a ``workspaceEdit`` the sidecar
+        has already javac-validated. This helper is the thin Python forwarder seam:
+
+        * A refusal (``accepted: false``) is passed through VERBATIM, only re-enveloped with the manager's ``operation``
+          and preview/apply ``mode`` so the agent-facing envelope is stable.
+        * An accepted payload's edit is parsed with :meth:`RefactorWorkspaceEdit.from_protocol_dict` (failing CLOSED to a
+          ``malformed_workspace_edit`` refusal) and routed through :meth:`_bridge_v3_edit`, which owns the manager-level
+          staging, preview/apply, mandatory post-commit javac validation, and transactional rollback. Selected
+          sidecar-only fields named in ``carry`` (e.g. ``deletePlan``, ``matches``) are copied onto an accepted result.
+        """
+        mode = "apply" if apply else "preview"
+        # Parse + risk-classify the accepted edit through the single shared extraction seam (also used by the
+        # transformation-workspace ``plan_v3_operation`` enrollment path). A refusal or an unparseable/unclassified
+        # payload comes back as a structured refusal dict; otherwise we get the parsed edit, risk, warnings, summary.
+        extracted = self._extract_sidecar_v3_edit(operation, payload, mode=mode)
+        if isinstance(extracted, dict):
+            return extracted
+        workspace_edit, risk, warnings, summary = extracted
+
+        result = self._bridge_v3_edit(
+            operation=operation,
+            workspace_edit=workspace_edit,
+            apply=apply,
+            validate=validate,
+            risk=risk,
+            allow_review_required=allow_review_required,
+            warnings=warnings,
+            summary=summary,
+        )
+        if result.get("accepted"):
+            for key in carry:
+                if key in payload:
+                    result[key] = payload[key]
+        return result
+
+    def _extract_sidecar_v3_edit(
+        self, operation: str, payload: dict, *, mode: str
+    ) -> dict | tuple["RefactorWorkspaceEdit", "RiskLevel", list[str], dict[str, Any]]:
+        """Canonical extraction of a parsed ``RefactorWorkspaceEdit`` + risk + warnings/summary from a sidecar V3-op payload.
+
+        This is the SINGLE seam that turns a compute-only sidecar V3-op payload into the typed inputs the manager works
+        with, shared by both the edit-apply bridge (:meth:`_route_sidecar_v3_edit`) and the transformation-workspace
+        enrollment path (:meth:`plan_v3_operation`). It fails CLOSED, mirroring the historical inline logic exactly:
+
+        * A refusal (``accepted: false``) is re-enveloped VERBATIM with ``operation``/``mode`` and returned as a dict.
+        * A malformed ``workspaceEdit`` returns a ``malformed_workspace_edit`` refusal dict (nothing parsed).
+        * A missing/unknown ``risk`` returns an ``unclassified_risk`` refusal dict (no guessed default).
+
+        On success returns the ``(workspace_edit, risk, warnings, summary)`` tuple; the caller is never handed a partially
+        parsed payload.
+        """
+        from serena.java_refactor_v3.models import RiskLevel
+
+        if not payload.get("accepted"):
+            refusal = dict(payload)
+            refusal["operation"] = operation
+            refusal["mode"] = mode
+            refusal.setdefault("applied", False)
+            return refusal
+
+        try:
+            workspace_edit = RefactorWorkspaceEdit.from_protocol_dict(payload["workspaceEdit"])
+        except (WorkspaceEditError, KeyError, TypeError, ValueError) as error:
+            return {
+                "accepted": False,
+                "applied": False,
+                "operation": operation,
+                "mode": mode,
+                "refusal": {
+                    "code": "malformed_workspace_edit",
+                    "message": f"The sidecar returned a malformed workspace edit, so nothing was staged or applied: {error}",
+                },
+            }
+
+        # Normalise the sidecar's accepted-edit risk onto the canonical SAFE/REVIEW_REQUIRED taxonomy. There is NO
+        # default: an accepted V3 edit ALWAYS carries an explicit ``risk`` the sidecar's CanonicalEnvelope computed, so
+        # a missing/unknown value is a sidecar<->bridge contract violation. We fail CLOSED (refuse, apply nothing)
+        # rather than guessing a "medium" middle ground.
+        try:
+            risk = RiskLevel.from_sidecar_wire(payload.get("risk"))
+        except ValueError as error:
+            return {
+                "accepted": False,
+                "applied": False,
+                "operation": operation,
+                "mode": mode,
+                "refusal": {
+                    "code": "unclassified_risk",
+                    "message": "The sidecar returned an accepted edit without an explicit risk classification, so "
+                    f"nothing was staged or applied: {error}",
+                },
+            }
+
+        return workspace_edit, risk, list(payload.get("warnings", [])), dict(payload.get("summary", {}))
+
+    def _bridge_v3_edit(
+        self,
+        *,
+        operation: str,
+        workspace_edit: RefactorWorkspaceEdit,
+        apply: bool,
+        validate: bool | None,
+        risk: "RiskLevel",
+        allow_review_required: bool = False,
+        warnings: list[str],
+        summary: dict[str, Any],
+    ) -> dict:
+        """Routes a Python-planned V3 ``RefactorWorkspaceEdit`` through the sidecar's generic javac validation.
+
+        This is the reusable validation bridge for every V3 capability whose edit is computed in pure Python (dead-code
+        delete, extract, inline, ...): it gives that edit a REAL before/after javac diagnostic delta using the existing,
+        hardened sidecar primitives (``validateEdit`` per source set with the staged overlay applied), refusing on any
+        newly introduced compiler error and committing nothing it cannot prove safe.
+
+        PREVIEW (``apply=False``): the edit is staged fully in memory and, unless preview-time validation is disabled,
+        run through :meth:`_staged_validation_report` (a real javac baseline + overlay delta). A staged-report refusal
+        (e.g. ``new_compiler_errors``) is surfaced as the result refusal with the diagnostic delta attached and NOTHING
+        applied; otherwise the workspace-edit preview is attached with the validated delta.
+
+        APPLY (``apply=True``): the edit is routed through the full transactional pipeline — stage, mandatory post-commit
+        javac post-validation with rollback, plus the staged pre-commit validation unless ``validate_before_apply`` is
+        disabled — exactly as the package-op tools document. The ``validate`` flag governs PREVIEW-time reporting only and
+        can never weaken the apply safety gate.
+
+        Fails CLOSED: any validation that cannot run (sidecar refusal/crash/timeout) refuses the operation and writes
+        nothing, mirroring :meth:`_validation_refused_apply_result` / :class:`ValidationRefusedError` handling.
+        """
+        from serena.java_refactor_v3.models import RiskLevel
+
+        result: dict[str, Any] = {
+            "accepted": True,
+            "applied": False,
+            "operation": operation,
+            "mode": "apply" if apply else "preview",
+            "risk": risk.value,
+            "warnings": list(warnings),
+            "summary": dict(summary),
+        }
+
+        client = self._get_or_start_client(refresh=False)
+        applier = TransactionalWorkspaceEditApplier(
+            self._project_root, encoding=self._source_encoding(), line_ending=self._project_line_ending
+        )
+
+        if apply:
+            # Uniform apply-policy gate (refactor-feature-plan-V3.md §18): this is the ONE canonical seam where the
+            # risk taxonomy is enforced for every Python-routed V3 edit op. SAFE applies; REVIEW_REQUIRED is blocked
+            # UNLESS the caller explicitly opts in via ``allow_review_required`` (the single uniform allow-review
+            # control, consistent with the recipe path's ``apply_needs_review``); a REFUSED result never reaches here
+            # (refusals are passed through verbatim by _route_sidecar_v3_edit and never produce a workspace edit). The
+            # gate runs BEFORE the workspace is mutated, so a blocked REVIEW_REQUIRED edit writes nothing.
+            if risk is RiskLevel.REVIEW_REQUIRED and not allow_review_required:
+                result["accepted"] = False
+                result["applied"] = False
+                result["editsAlreadyApplied"] = False
+                result["refusal"] = {
+                    "code": "review_required",
+                    "message": "This edit is classified REVIEW_REQUIRED (it crosses a public-API/framework/resource "
+                    "boundary or relies on a heuristic a human should confirm), so it was not applied. Re-run with "
+                    "allow_review_required=true to apply it after review (no files were written).",
+                }
+                return result
+
+            # Apply-path safety gate (H3): refuse before mutating the workspace if the model is degraded (no resolved
+            # classpath), exactly like the sidecar-operation apply path. Preview stays permissive (it writes nothing).
+            degraded_refusal = self._degraded_model_apply_refusal(client, operation)
+            if degraded_refusal is not None:
+                degraded_refusal.setdefault("risk", risk.value)
+                degraded_refusal.setdefault("warnings", list(warnings))
+                degraded_refusal.setdefault("summary", dict(summary))
+                return degraded_refusal
+
+        # Stage the edit fully in memory: enforces path-in-root, content-hash preconditions, exact spans, no overlaps,
+        # and create/rename/delete sequencing. An edit that cannot be staged exactly refuses rather than being applied.
+        try:
+            staged = applier.stage(workspace_edit)
+        except WorkspaceEditError as error:
+            result["accepted"] = False
+            result["applied"] = False
+            result["editsAlreadyApplied"] = False
+            result["refusal"] = {
+                "code": "apply_unsafe_edit" if apply else "preview_unsafe_edit",
+                "message": "The planned V3 edit could not be staged exactly (no files were written): " + str(error),
+            }
+            return result
+
+        if not apply:
+            self._attach_preview(result, staged.preview, applied=False)
+            # PREVIEW-time javac validation: a real baseline + overlay diagnostic delta. The per-call ``validate`` flag
+            # (falling back to the project's ``validate_after_preview``) controls only whether this reporting runs.
+            validate_after_preview = self._config.validate_after_preview if validate is None else validate
+            if validate_after_preview:
+                report = self._staged_validation_report(client, staged)
+                result["previewValidation"] = report
+                if report.get("refusal"):
+                    # Fail closed: the edit introduced new compiler errors (or validation could not run). Accept nothing
+                    # and surface the diagnostic delta so the caller sees exactly what broke.
+                    result["accepted"] = False
+                    result["applied"] = False
+                    result["refusal"] = report["refusal"]
+                    result["diagnosticDeltaValidated"] = False
+                    return result
+                result["diagnosticDelta"] = report["diagnosticDelta"]
+                result["diagnosticDeltaValidated"] = True
+            return result
+
+        # APPLY: full transactional validation pipeline, mirroring _apply_v2_session_preview / _preview_or_apply_refactor.
+        validate_before_apply = self._config.validate_before_apply
+        baseline_errors: list[dict[str, Any]] = []
+        baseline_warnings: list[dict[str, Any]] = []
+        if validate_before_apply or self._config.allow_incomplete_analysis:
+            try:
+                baseline_validation = self._checked_validate_edit(client, _EMPTY_OVERLAY)
+                baseline_errors = self._compiler_errors(baseline_validation)
+                baseline_warnings = self._compiler_warnings(baseline_validation)
+            except ValidationRefusedError as error:
+                refused = self._validation_refused_apply_result(result, error, stage="baseline")
+                refused["operation"] = operation
+                return refused
+
+        if validate_before_apply:
+            try:
+                staged_validation = self._checked_validate_edit(client, staged.overlay())
+                staged_errors = self._compiler_errors(staged_validation)
+                staged_warnings = self._compiler_warnings(staged_validation)
+            except ValidationRefusedError as error:
+                refused = self._validation_refused_apply_result(result, error, stage="staged pre-commit")
+                refused["operation"] = operation
+                return refused
+            diagnostic_delta = _diagnostic_delta(baseline_errors, staged_errors, baseline_warnings, staged_warnings)
+            new_errors = _diagnostic_displays(diagnostic_delta["newErrors"])
+            blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+            if blocking:
+                pre_existing = _diagnostic_displays(diagnostic_delta["unchangedErrors"])
+                result["accepted"] = False
+                result["applied"] = False
+                result["editsAlreadyApplied"] = False
+                result["preValidation"] = {
+                    "ready": False,
+                    "errors": blocking,
+                    "newErrors": new_errors,
+                    "preExistingErrors": pre_existing,
+                    "resolvedErrors": _diagnostic_displays(diagnostic_delta["resolvedErrors"]),
+                    "unchangedErrors": pre_existing,
+                    "warnings": _diagnostic_displays(staged_warnings),
+                    "newWarnings": _diagnostic_displays(diagnostic_delta["newWarnings"]),
+                    "diagnosticDelta": diagnostic_delta,
+                }
+                detail = "newly introduced compiler errors" if self._config.allow_incomplete_analysis else "compiler errors"
+                validation_code = "new_compiler_errors" if new_errors else "preexisting_compiler_errors_not_allowed"
+                result["refusal"] = {
+                    "code": "pre_apply_validation_failed",
+                    "message": f"The V3 edit was not applied because staged javac pre-validation found {detail} (no files "
+                    "were written):\n" + "\n".join(blocking),
+                    "validationRefusal": {"code": validation_code, "diagnosticDelta": diagnostic_delta},
+                }
+                return result
+
+        # Capture the pre-apply snapshot so a post-validation failure can be rolled back, then commit transactionally.
+        try:
+            snapshot = applier.snapshot(workspace_edit)
+        except (WorkspaceEditError, OSError) as error:
+            result["accepted"] = False
+            result["applied"] = False
+            result["editsAlreadyApplied"] = False
+            result["refusal"] = {
+                "code": "apply_snapshot_failed",
+                "message": "Apply was refused because the pre-apply rollback snapshot could not be captured "
+                f"(no files were written): {error}",
+            }
+            return result
+        try:
+            applier.commit(staged)
+        except WorkspaceEditError as error:
+            result["accepted"] = False
+            result["applied"] = False
+            result["editsAlreadyApplied"] = False
+            result["rolledBack"] = True
+            result["refusal"] = {
+                "code": "apply_commit_failed",
+                "message": f"Apply failed while committing the edit; the original file contents were restored: {error}",
+            }
+            return result
+        except Exception as error:
+            result["accepted"] = False
+            result["applied"] = False
+            result["editsAlreadyApplied"] = True
+            result["rolledBack"] = False
+            result["refusal"] = {
+                "code": "apply_commit_failed",
+                "message": "Apply failed while committing the edit and the original file contents could NOT be fully "
+                f"restored; the workspace may contain partially applied edits: {error}",
+            }
+            return result
+        self._attach_preview(result, staged.preview, applied=True)
+
+        # G003 (B05): run the optional external formatter NOW — after the V3 refactor edit is committed but BEFORE the
+        # javac post-validation pass — so the formatter's output is part of the SAME validated transaction as the edit,
+        # exactly as the V2 apply path does. The post-validation below re-runs javac over the formatted on-disk state, and
+        # the rollback path restores the whole snapshot (refactor + formatting) if the formatter introduced any compiler
+        # error. The preview/apply formatting contract: PREVIEW is never formatted (the preview path attaches the
+        # PRE-format edit + preview block), and APPLY leaves the POST-format bytes on disk with ``result["formatting"]``
+        # carrying the post-format content that javac validated. Disabled by default; a no-op when off.
+        self._run_external_formatter(applier, staged, result)
+
+        # Mandatory post-commit javac validation with rollback (independent of any flag).
+        post_status = client.status(refresh=True)
+        post_errors = _diagnostics(post_status.errors, "error") if not post_status.ready else []
+        post_warnings = _diagnostics((post_status.project_model or {}).get("warnings", []), "warning")
+        post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
+        if self._config.allow_incomplete_analysis:
+            try:
+                post_validation_response = self._checked_validate_edit(client, _EMPTY_OVERLAY)
+                post_errors = self._compiler_errors(post_validation_response)
+                post_warnings = self._compiler_warnings(post_validation_response)
+                post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
+            except ValidationRefusedError as error:
+                post_delta = _diagnostic_delta(
+                    baseline_errors,
+                    _diagnostics([f"post-apply javac revalidation was refused by the sidecar: [{error.code}] {error.message}"], "error"),
+                    baseline_warnings,
+                    post_warnings,
+                )
+        result["postValidation"] = {
+            "ready": not post_delta["newErrors"] and (self._config.allow_incomplete_analysis or not post_errors),
+            "errors": _diagnostic_displays(post_delta["newErrors"])
+            if self._config.allow_incomplete_analysis
+            else _diagnostic_displays(post_errors),
+            "newErrors": _diagnostic_displays(post_delta["newErrors"]),
+            "resolvedErrors": _diagnostic_displays(post_delta["resolvedErrors"]),
+            "unchangedErrors": _diagnostic_displays(post_delta["unchangedErrors"]),
+            "warnings": _diagnostic_displays(post_warnings),
+            "newWarnings": _diagnostic_displays(post_delta["newWarnings"]),
+            "diagnosticDelta": post_delta,
+        }
+        post_failure_errors: list[str] = list(result["postValidation"]["errors"])
+        if post_failure_errors:
+            # Rolls back the WHOLE snapshot — the V3 refactor edit AND any external-formatter changes on top of it — so
+            # the disk returns to its pre-apply state. This is the path that fails closed on formatter-introduced errors,
+            # mirroring the V2 apply path's contract.
+            applier.restore(snapshot)
+            client.status(refresh=True)
+            result["accepted"] = False
+            result["applied"] = False
+            result["editsAlreadyApplied"] = False
+            result["rolledBack"] = True
+            result["diagnosticDeltaValidated"] = False
+            if isinstance(result.get("formatting"), dict):
+                result["formatting"]["rolledBack"] = True
+            result["refusal"] = {
+                "code": "post_validation_failed",
+                "message": "The V3 edit was rolled back because javac post-validation failed (this includes any compiler "
+                "errors introduced by the external formatter):\n" + "\n".join(post_failure_errors),
+            }
+            return result
+
+        # Optional post-javac build-tool compile/test validation (design §20; B02). Runs only when
+        # validation.run_build_tool_compile or validation.run_tests is set. It runs AFTER javac post-validation has passed
+        # (so the build is exercised over the formatted, javac-clean on-disk state) and BEFORE the apply is accepted; a
+        # compile/test failure or timeout rolls the whole snapshot back exactly like a javac post-validation failure. A
+        # no-op (returns None) when both flags are off.
+        build_validation = self._run_build_tool_validation(client, operation)
+        if build_validation is not None:
+            result["buildValidation"] = build_validation
+            if not build_validation.get("ok"):
+                applier.restore(snapshot)
+                client.status(refresh=True)
+                result["accepted"] = False
+                result["applied"] = False
+                result["editsAlreadyApplied"] = False
+                result["rolledBack"] = True
+                result["diagnosticDeltaValidated"] = False
+                if isinstance(result.get("formatting"), dict):
+                    result["formatting"]["rolledBack"] = True
+                result["refusal"] = build_validation.get(
+                    "refusal",
+                    {
+                        "code": "build_tool_validation_failed",
+                        "message": "The V3 edit was rolled back because build-tool validation failed.",
+                    },
+                )
+                return result
+
+        result["diagnosticDelta"] = post_delta
+        result["diagnosticDeltaValidated"] = True
+        return result
+
     def _apply_v2_session_preview(
         self,
         client: JavaRefactorClient,
@@ -799,6 +2507,147 @@ class JavaRefactorManager:
             "formattedContent": formatted_content,
             "warnings": warnings,
         }
+
+    def _build_tool_validation_plan(self, build_tool: str | None) -> "dict[str, Any] | None":
+        """Resolves the build-tool compile/test command plan for the active project, or ``None`` when unresolvable (B02).
+
+        Returns ``{"tool": "maven"|"gradle", "compile": [argv...], "test": [argv...]}`` where each ``argv`` is the
+        process command (wrapper-preferred) for that stage, or ``None`` when the project has no recognizable Maven/Gradle
+        build model. The build tool is taken from the validated sidecar status (``buildTool``/``discoveryKind``). Maven
+        compiles main+test sources via ``compile``/``test-compile`` (run together) and tests via ``test``; Gradle compiles
+        via ``compileJava``/``compileTestJava`` and tests via ``test``. The wrapper script (``mvnw``/``gradlew``) is
+        preferred when present in the project root so the project's pinned build version is used; otherwise the bare
+        ``mvn``/``gradle`` on PATH is used.
+        """
+        if not build_tool:
+            return None
+        tool = str(build_tool).strip().lower()
+        root = self._project_root
+        if tool == "maven":
+            wrapper = root / ("mvnw.cmd" if os.name == "nt" else "mvnw")
+            launcher = [str(wrapper)] if wrapper.exists() else ["mvn"]
+            return {
+                "tool": "maven",
+                "compile": [*launcher, "-q", "-B", "compile", "test-compile"],
+                "test": [*launcher, "-q", "-B", "test"],
+            }
+        if tool == "gradle":
+            wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
+            launcher = [str(wrapper)] if wrapper.exists() else ["gradle"]
+            return {
+                "tool": "gradle",
+                "compile": [*launcher, "--quiet", "--console=plain", "compileJava", "compileTestJava"],
+                "test": [*launcher, "--quiet", "--console=plain", "test"],
+            }
+        return None
+
+    def _invoke_build_tool(self, argv: list[str], timeout_seconds: int) -> "subprocess.CompletedProcess[str]":
+        """Runs one build-tool command from the project root, capturing output (the stubbable subprocess seam for B02).
+
+        Isolated as its own method so tests can monkeypatch the actual process invocation (Maven/Gradle are impractical in
+        CI) while the real ``subprocess.run`` command construction and timeout enforcement above/below it are still
+        exercised. Raises :class:`subprocess.TimeoutExpired` on timeout and :class:`OSError` when the launcher cannot be
+        executed; the caller turns both into a structured validation failure.
+        """
+        return subprocess.run(
+            argv,
+            cwd=str(self._project_root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+
+    def _run_build_tool_validation(self, client: JavaRefactorClient, operation: str) -> "dict[str, Any] | None":
+        """Runs the optional post-javac build-tool compile/test validation stage (design §20; B02).
+
+        Returns ``None`` when neither ``validation.run_build_tool_compile`` nor ``validation.run_tests`` is set (the stage
+        is entirely off, the default). Otherwise returns a structured report ``{"ran", "tool", "stages": [...]}``; on
+        failure the report additionally carries ``{"ok": False, "refusal": {code, message}}`` so the caller rolls the
+        committed edit back. The stage runs AFTER the mandatory javac post-validation has passed, invoking the discovered
+        build tool's compile (and, when ``run_tests`` is set, test) tasks with a hard ``max_validation_seconds`` timeout.
+
+        Fails CLOSED on every error mode rather than silently ignoring the flags: when no Maven/Gradle build model can be
+        resolved, when the launcher cannot be executed, when a stage exits non-zero, or when a stage exceeds the timeout,
+        it returns a refusal report (``code`` one of ``build_tool_model_unavailable`` / ``build_tool_invocation_failed`` /
+        ``build_tool_compile_failed`` / ``build_tool_tests_failed`` / ``build_tool_validation_timeout``).
+        """
+        validation = self._config.v3.validation
+        if not validation.run_build_tool_compile and not validation.run_tests:
+            return None
+
+        status = client.status(refresh=False)
+        plan = self._build_tool_validation_plan(status.build_tool)
+        if plan is None:
+            return {
+                "ran": False,
+                "tool": status.build_tool,
+                "stages": [],
+                "ok": False,
+                "refusal": {
+                    "code": "build_tool_model_unavailable",
+                    "message": "Build-tool validation was requested (validation.run_build_tool_compile/run_tests) but no "
+                    f"Maven or Gradle build model could be resolved for this project (buildTool={status.build_tool!r}), "
+                    "so the edit was not accepted. Configure a recognizable build or disable the build-tool validation "
+                    "flags.",
+                },
+            }
+
+        # A misconfigured 0/negative max_validation_seconds would make every invocation an
+        # immediate timeout; floor it at 1s so the build tool gets a real (if short) window.
+        timeout_seconds = max(1, int(validation.max_validation_seconds))
+        report: dict[str, Any] = {"ran": True, "tool": plan["tool"], "stages": []}
+
+        stages: list[tuple[str, str, str]] = []
+        # compile runs whenever EITHER flag is set: tests require compiled sources, so the compile stage is the
+        # prerequisite for the test stage and is always run first when build-tool validation is active.
+        stages.append(("compile", "build_tool_compile_failed", "compile"))
+        if validation.run_tests:
+            stages.append(("test", "build_tool_tests_failed", "test"))
+
+        for stage_name, failure_code, plan_key in stages:
+            argv = list(plan[plan_key])
+            try:
+                completed = self._invoke_build_tool(argv, timeout_seconds)
+            except subprocess.TimeoutExpired:
+                report["stages"].append({"stage": stage_name, "command": argv, "status": "timeout"})
+                report["ok"] = False
+                report["refusal"] = {
+                    "code": "build_tool_validation_timeout",
+                    "message": f"The build-tool {stage_name} stage ({' '.join(argv)}) exceeded the "
+                    f"{timeout_seconds}s validation.max_validation_seconds timeout, so the edit was rolled back.",
+                }
+                return report
+            except OSError as error:
+                report["stages"].append({"stage": stage_name, "command": argv, "status": "error", "detail": str(error)})
+                report["ok"] = False
+                report["refusal"] = {
+                    "code": "build_tool_invocation_failed",
+                    "message": f"The build-tool {stage_name} stage could not be invoked ({' '.join(argv)}): {error}. "
+                    "The edit was rolled back.",
+                }
+                return report
+            stage_record = {
+                "stage": stage_name,
+                "command": argv,
+                "exitCode": completed.returncode,
+                "status": "ok" if completed.returncode == 0 else "failed",
+            }
+            if completed.returncode != 0:
+                detail = (completed.stdout or "") + (("\n" + completed.stderr) if completed.stderr else "")
+                stage_record["output"] = detail.strip()[-4000:]
+                report["stages"].append(stage_record)
+                report["ok"] = False
+                report["refusal"] = {
+                    "code": failure_code,
+                    "message": f"The build-tool {stage_name} stage exited with code {completed.returncode} "
+                    f"({' '.join(argv)}), so the edit was rolled back:\n{stage_record['output']}",
+                }
+                return report
+            report["stages"].append(stage_record)
+
+        report["ok"] = True
+        return report
 
     def v2_refactor_session(
         self,
@@ -1053,6 +2902,319 @@ class JavaRefactorManager:
         self._validate_supported_project()
         return self._get_or_start_client(refresh=False).cancel_session(session_id)
 
+    def new_workspace_edit_applier(self) -> TransactionalWorkspaceEditApplier:
+        """Constructs a fresh transactional applier bound to this project's root/encoding/line-ending.
+
+        The V3 transformation workspace engine drives a single all-or-nothing commit through one applier, so
+        it asks the manager for one rather than reaching into private construction details. This mirrors the
+        applier the V2 apply path builds (see :meth:`apply_v2_refactor_session`).
+        """
+        return TransactionalWorkspaceEditApplier(
+            self._project_root, encoding=self._source_encoding(), line_ending=self._project_line_ending
+        )
+
+    # Compute-only sidecar dispatch for every V3 op whose edit is enrollable in a transformation workspace. Each entry
+    # builds the SAME compute-only sidecar payload the corresponding op method computes, but with ``validate=False`` (the
+    # byte-identical, javac-skipping path also used by ``propagate_safe_delete``): the transformation workspace owns the
+    # single validation seam (its transactional applier revalidates every file's hash precondition when staging the
+    # composed plan), exactly as it does for enrolled V2 sessions, so per-member javac validation is neither double-run
+    # nor split across layers.
+    def _v3_plan_dispatch(self) -> dict[str, "Callable[[JavaRefactorClient, dict[str, Any]], dict]"]:
+        from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
+        from serena.java_refactor_v3.conversions_client import ConversionsClient
+        from serena.java_refactor_v3.deletion_client import DeletionClient
+        from serena.java_refactor_v3.inline_refactor_client import InlineRefactorClient
+        from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
+
+        def _extract_class(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return ClassRefactorClient(client).extract_class(
+                params["relative_path"],
+                params["new_class_name"],
+                list(params["members"]),
+                target_package=params.get("target_package"),
+                leave_delegate_methods=params.get("leave_delegate_methods", True),
+                update_usages=params.get("update_usages", False),
+                validate=False,
+            )
+
+        def _extract_superclass(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return ClassRefactorClient(client).extract_superclass(
+                list(params["classes"]),
+                params["superclass_name"],
+                list(params["members"]),
+                target_package=params.get("target_package"),
+                make_abstract=params.get("make_abstract", False),
+                validate=False,
+            )
+
+        def _replace_inheritance(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return ClassRefactorClient(client).replace_inheritance_with_delegation(
+                params["relative_path"],
+                members=params.get("members"),
+                delegate_field_name=params.get("delegate_field_name"),
+                superclass_fqn=params.get("superclass_fqn"),
+                confirm_public_api_change=params.get("confirm_public_api_change", False),
+                validate=False,
+            )
+
+        def _deep_inline(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return InlineRefactorClient(client).deep_inline_method(
+                params["relative_path"],
+                params["line"],
+                column=params.get("column"),
+                method_name=params.get("method_name"),
+                delete_method=params.get("delete_method", False),
+                max_call_sites=params.get("max_call_sites"),
+                validate=False,
+            )
+
+        def _anon_to_lambda(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return ConversionsClient(client).anonymous_to_lambda(
+                params["relative_path"],
+                params["line"],
+                column=params.get("column"),
+                validate=False,
+            )
+
+        def _lambda_to_method_ref(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            return ConversionsClient(client).lambda_to_method_reference(
+                params["relative_path"],
+                params["line"],
+                column=params.get("column"),
+                validate=False,
+            )
+
+        def _propagate_safe_delete(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            kwargs: dict[str, Any] = {
+                "validate": False,
+                "delete_private_only": params.get("delete_private_only", True),
+                "include_tests": params.get("include_tests", False),
+                "include_resources": params.get("include_resources", True),
+            }
+            if params.get("cascade_depth") is not None:
+                kwargs["max_cascade_depth"] = params["cascade_depth"]
+            return DeletionClient(client).propagate_safe_delete(list(params["seeds"]), **kwargs)
+
+        def _apply_recipe(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            # Resolve the recipe exactly as the standalone op does (built-in name XOR inline document), failing closed to
+            # the same recipe_* refusal envelope so a bad selection is never enrolled.
+            selection = self._select_recipe(
+                "applyRefactorRecipe", False, params.get("recipe_name"), params.get("recipe_document")
+            )
+            if isinstance(selection, dict):
+                return selection
+            recipe_id, recipe_obj = selection
+            return RecipeEngineClient(client).apply_recipe(
+                recipe_id=recipe_id,
+                recipe=recipe_obj,
+                apply_needs_review=params.get("allow_review_required", False),
+                validate=False,
+                scope=params.get("scope", "project"),
+            )
+
+        # The package-relocation ops compute their edit through the sidecar's no-write ``preview`` request (it never
+        # touches disk), and the sidecar wraps every package result in the canonical §1.1 impact + §14.3 risk envelope
+        # (Main.java augments renamePackage/movePackage/moveSourceRoot on the generic preview path), so the returned
+        # payload carries ``accepted``/``workspaceEdit``/``risk`` exactly like the other compute-only V3 op payloads and
+        # flows through the shared ``_extract_sidecar_v3_edit`` seam unchanged.
+        def _rename_package(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            preview_params: dict[str, Any] = {
+                "oldPackage": params["old_package"],
+                "newPackage": params["new_package"],
+                "includeSubpackages": params.get("include_subpackages", True),
+            }
+            if params.get("rewrite_resources") is not None:
+                preview_params["rewriteResources"] = params["rewrite_resources"]
+            if params.get("rewrite_module_info") is not None:
+                preview_params["rewriteModuleInfo"] = params["rewrite_module_info"]
+            if params.get("module_strategy") is not None:
+                preview_params["moduleStrategy"] = params["module_strategy"]
+            return client.preview("renamePackage", preview_params)
+
+        def _move_package(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            preview_params: dict[str, Any] = {
+                "sourcePackage": params["source_package"],
+                "targetPackage": params["target_package"],
+                "includeSubpackages": params.get("include_subpackages", True),
+            }
+            if params.get("target_source_root") is not None:
+                preview_params["targetSourceRoot"] = params["target_source_root"]
+            if params.get("rewrite_resources") is not None:
+                preview_params["rewriteResources"] = params["rewrite_resources"]
+            if params.get("rewrite_module_info") is not None:
+                preview_params["rewriteModuleInfo"] = params["rewrite_module_info"]
+            if params.get("module_strategy") is not None:
+                preview_params["moduleStrategy"] = params["module_strategy"]
+            return client.preview("movePackage", preview_params)
+
+        def _move_source_root(client: JavaRefactorClient, params: dict[str, Any]) -> dict:
+            preview_params: dict[str, Any] = {
+                "sourceRoot": params["source_root"],
+                "targetSourceRoot": params["target_source_root"],
+                "includeSubpackages": params.get("include_subpackages", True),
+                "rewriteBuildFiles": params.get("rewrite_build_files", False),
+                "preservePackageNames": params.get("preserve_package_names", True),
+            }
+            if params.get("packages"):
+                preview_params["packages"] = list(params["packages"])
+            return client.preview("moveSourceRoot", preview_params)
+
+        return {
+            "extractClass": _extract_class,
+            "extractSuperclass": _extract_superclass,
+            "replaceInheritanceWithDelegation": _replace_inheritance,
+            "deepInlineMethod": _deep_inline,
+            "convertAnonymousToLambda": _anon_to_lambda,
+            "convertLambdaToMethodReference": _lambda_to_method_ref,
+            "propagateSafeDelete": _propagate_safe_delete,
+            "applyRefactorRecipe": _apply_recipe,
+            "renamePackage": _rename_package,
+            "movePackage": _move_package,
+            "moveSourceRoot": _move_source_root,
+        }
+
+    @staticmethod
+    def _v3_project_revision(model: dict[str, Any]) -> str | None:
+        """Returns the revision a V3 op should pin against the workspace, or ``None`` when none can be derived (B04).
+
+        Prefers the sidecar's validated ``modelHash`` (the canonical revision token the V2 session path also uses). When
+        that is absent, derives a DETERMINISTIC replacement from the validated model's structural fingerprint so two ops
+        planned against the same on-disk model still pin to the SAME revision (the workspace's single-revision invariant
+        stays enforceable) while a structurally different model yields a different pin. The fingerprint is a stable
+        SHA-256 over the model's identifying fields — source roots/sets, classpath, the Java-file inventory and count, the
+        discovery kind, and any per-file content hashes the model carries — serialized canonically (sorted keys) so the
+        result is independent of dict ordering. Returns ``None`` only when the model carries none of these fields, in
+        which case the caller fails closed rather than enrolling with a permissive None.
+        """
+        model_hash = model.get("modelHash")
+        if isinstance(model_hash, str) and model_hash:
+            return model_hash
+
+        fingerprint_keys = (
+            "sourceRoots",
+            "sourceSets",
+            "sourceSetCount",
+            "classpath",
+            "javaFiles",
+            "javaFileCount",
+            "discoveryKind",
+            "fileHashes",
+            "fileContentHashes",
+        )
+        fingerprint = {key: model[key] for key in fingerprint_keys if key in model and model[key] is not None}
+        if not fingerprint:
+            return None
+        try:
+            canonical = json.dumps(fingerprint, sort_keys=True, default=str, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+        return "derived:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def plan_v3_operation(self, operation: str, params: dict[str, Any]) -> "V3OperationPlan | dict[str, Any]":
+        """Plans a V3 op compute-only and returns its parsed :class:`RefactorWorkspaceEdit` for workspace enrollment.
+
+        This is the V3 half of the :class:`~serena.java_refactor_v3.workspace.SessionDriver` protocol: it dispatches the
+        given V3 ``operation`` to the sidecar in COMPUTE-ONLY mode (``validate=False``, nothing written), then runs the
+        SAME extraction the apply bridge uses (:meth:`_extract_sidecar_v3_edit`) to obtain the parsed, hash-guarded
+        ``RefactorWorkspaceEdit`` plus its risk and warnings WITHOUT applying or javac-validating it here — the
+        transformation workspace owns the single validation seam when it stages the composed plan.
+
+        Returns a :class:`~serena.java_refactor_v3.workspace.V3OperationPlan` on success. A sidecar refusal
+        (``accepted: false``), a malformed edit, or an unclassified risk is returned VERBATIM as the structured refusal
+        dict the extractor produces, so a refused op is never enrolled. An unknown operation or a disabled project is
+        likewise returned as a structured refusal dict (nothing planned).
+        """
+        from serena.java_refactor_v3.workspace import V3OperationPlan
+
+        disabled = self._v3_disabled_refusal(operation, apply=False)
+        if disabled is not None:
+            return disabled
+
+        dispatch = self._v3_plan_dispatch()
+        planner = dispatch.get(operation)
+        if planner is None:
+            return {
+                "accepted": False,
+                "applied": False,
+                "operation": operation,
+                "mode": "preview",
+                "refusal": {
+                    "code": "unsupported_workspace_operation",
+                    "message": f"Operation {operation!r} is not an enrollable V3 transformation op; "
+                    f"enroll one of {sorted(dispatch)}.",
+                },
+            }
+
+        self._validate_supported_project()
+        client = self._get_or_start_client(refresh=False)
+        payload = planner(client, params)
+
+        extracted = self._extract_sidecar_v3_edit(operation, payload, mode="preview")
+        if isinstance(extracted, dict):
+            return extracted
+        workspace_edit, risk, warnings, _summary = extracted
+
+        # Source the V3 member's project revision so a mixed workspace's revision pin is consistent across V2 sessions and
+        # V3 ops. Prefer the sidecar's validated ``modelHash``; when it is absent (B04: an older sidecar, or a model that
+        # never computed one), DO NOT enroll with a permissive None — that would leave the workspace revision guard unable
+        # to detect a cross-member revision drift. Instead compute a DETERMINISTIC replacement revision from the validated
+        # model's structural fingerprint (a stable, repeatable hash over the same on-disk model), so two ops planned
+        # against the same model still pin identically and a drifted model produces a different pin. If even that
+        # fingerprint cannot be derived (no usable model fields), fail CLOSED with a structured refusal rather than
+        # enrolling unguarded.
+        status = client.status(refresh=False)
+        model = status.project_model or {}
+        project_revision = self._v3_project_revision(model)
+        if project_revision is None:
+            return {
+                "accepted": False,
+                "applied": False,
+                "operation": operation,
+                "mode": "preview",
+                "refusal": {
+                    "code": "project_revision_unavailable",
+                    "message": "The V3 op was planned but the sidecar reported no model hash and no deterministic "
+                    "project revision could be derived from the validated model, so it was not enrolled: the "
+                    "transformation workspace could not pin a revision to guard against cross-member drift (nothing was "
+                    "written). Refresh the Java project model and retry.",
+                },
+            }
+
+        return V3OperationPlan(
+            operation=operation,
+            project_revision=project_revision,
+            workspace_edit=workspace_edit,
+            risk=risk,
+            warnings=warnings,
+        )
+
+    @property
+    def transformation_workspaces(self) -> "TransformationWorkspaceManager":
+        """Returns the lazily-created V3 transformation-workspace manager for this project.
+
+        The manager groups multiple V2 refactor sessions under one revision-guarded workspace and drives
+        workspace-level preview/apply/cancel, using this :class:`JavaRefactorManager` as its session driver
+        (it satisfies the ``SessionDriver`` protocol via ``create_v2_refactor_session``,
+        ``cancel_v2_refactor_session`` and ``new_workspace_edit_applier``).
+        """
+        if self._transformation_workspaces is None:
+            from serena.java_refactor_v3 import TransformationWorkspaceManager
+
+            self._transformation_workspaces = TransformationWorkspaceManager(self)
+        return self._transformation_workspaces
+
+    def transformation_client(self) -> "TransformationClient":
+        """Returns a sidecar-backed transformation client bound to this project's live sidecar (Phase 1).
+
+        Unlike :attr:`transformation_workspaces` (the V2-session composition engine), this client drives the sidecar's
+        ``transformation.*`` protocol directly: the Java sidecar runs the V3 operation planner(s), composes the edits,
+        validates the composed overlay once, and returns the authoritative preview-ready workspace edit. Composition and
+        same-file/overlap conflict detection now live in the sidecar, not in Python.
+        """
+        from serena.java_refactor_v3 import TransformationClient
+
+        return TransformationClient(self._get_or_start_client(refresh=False))
+
     @staticmethod
     def _hint_params(target_hints: dict | None) -> dict:
         """The protocol fields for caller-supplied target-identity hints (``nameHint``/``kindHint``/``arityHint``)."""
@@ -1060,7 +3222,14 @@ class JavaRefactorManager:
             return {}
         return {key: value for key, value in target_hints.items() if key in ("nameHint", "kindHint", "arityHint") and value is not None}
 
-    def _preview_or_apply_refactor(self, operation: str, params: dict, apply: bool, validate: bool | None = None) -> dict:
+    def _preview_or_apply_refactor(
+        self,
+        operation: str,
+        params: dict,
+        apply: bool,
+        validate: bool | None = None,
+        allow_review_required: bool = False,
+    ) -> dict:
         """Previews or applies one Java refactoring workspace edit.
 
         :param validate: governs PREVIEW-time validation reporting only (whether a preview also runs the staged
@@ -1069,6 +3238,13 @@ class JavaRefactorManager:
             verification, regardless of ``validate`` or any config knob (G001). Staged pre-commit javac validation
             runs on apply unless the project's ``validate_before_apply`` config disables it (post-commit validation
             still rolls a broken commit back in that case).
+        :param allow_review_required: B1 uniform apply-policy gate for the package-relocation ops (``renamePackage`` /
+            ``movePackage``). Those results are run through the sidecar's :class:`CanonicalEnvelope` and therefore carry
+            a §14.3 ``risk`` like every other V3 edit op. On apply, a ``needs_review`` (REVIEW_REQUIRED) package result
+            is refused UNLESS the caller explicitly opts in via this flag — consistent with the
+            :meth:`_bridge_v3_edit` gate the other V3 edit tools use. It defaults to ``False`` (block) and has NO effect
+            on preview or on ops whose sidecar result carries no ``risk`` (semanticRename/safeDelete/move-top-level/
+            inline*), so existing callers are unaffected.
         """
         if not self._config.enabled:
             return {
@@ -1125,6 +3301,39 @@ class JavaRefactorManager:
         result = client.apply_refactor(operation, params) if apply else client.preview(operation, params)
         if not result.get("accepted"):
             return result
+
+        # B1 uniform apply-policy gate for the package-relocation ops. These results are augmented in the sidecar by
+        # CanonicalEnvelope, so an accepted package result carries an explicit §14.3 ``risk`` ("safe"/"needs_review").
+        # On apply we enforce the SAME taxonomy as every other Python-routed V3 edit op (_bridge_v3_edit §18): SAFE
+        # applies; REVIEW_REQUIRED is blocked UNLESS the caller opts in via ``allow_review_required``. The gate runs
+        # BEFORE the workspace is mutated (nothing staged/written on refusal). Preview is never gated, and ops whose
+        # sidecar result carries no ``risk`` (semanticRename/safeDelete/moveTopLevelType/inline*) are unaffected.
+        if apply and operation in ("renamePackage", "movePackage") and "risk" in result:
+            from serena.java_refactor_v3.models import RiskLevel
+
+            try:
+                package_risk = RiskLevel.from_sidecar_wire(result.get("risk"))
+            except ValueError as error:
+                result["accepted"] = False
+                result["applied"] = False
+                result["editsAlreadyApplied"] = False
+                result["refusal"] = {
+                    "code": "unclassified_risk",
+                    "message": "The sidecar returned an accepted package edit without an explicit risk classification, "
+                    f"so nothing was staged or applied: {error}",
+                }
+                return result
+            if package_risk is RiskLevel.REVIEW_REQUIRED and not allow_review_required:
+                result["accepted"] = False
+                result["applied"] = False
+                result["editsAlreadyApplied"] = False
+                result["refusal"] = {
+                    "code": "review_required",
+                    "message": "This package edit is classified REVIEW_REQUIRED (it crosses a public-API/framework/"
+                    "resource boundary, relies on a heuristic, or its resource scan was incomplete), so it was not "
+                    "applied. Re-run with allow_review_required=true to apply it after review (no files were written).",
+                }
+                return result
 
         # Fail closed on a malformed sidecar response: parsing rejects (among others) any text-edit group or
         # destructive file operation that lacks its oldSha256 precondition, so a buggy or tampered payload can never
@@ -1915,6 +4124,10 @@ class JavaRefactorManager:
                 if lombok_classpath:
                     v2_payload["lombokClasspath"] = list(lombok_classpath)
             java_refactor_config["v2"] = v2_payload
+        # The v3 sub-tree (packages/resources policy, §5.4/§5.5) travels as the same snake_case object the sidecar's
+        # PackageRewritePolicy.fromConfig reads from java_refactor.v3; absent keys fall back to the sidecar defaults.
+        if self._config.v3 is not None:
+            java_refactor_config["v3"] = dataclasses.asdict(self._config.v3)
         if self._config.model:
             java_refactor_config["model"] = deepcopy(self._config.model)
         if java_refactor_config:

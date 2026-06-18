@@ -79,22 +79,44 @@ public final class FileOverlay {
     List<JavaFileObject> fileObjectsFor(StandardJavaFileManager standardManager, SourceSet sourceSet, List<SourceSet> allSourceSets) {
         List<JavaFileObject> result = new ArrayList<>();
         List<Path> onDisk = new ArrayList<>();
-        for (Path file : sourceSet.javaFiles()) {
-            Path normalized = file.toAbsolutePath().normalize();
-            if (removed.contains(normalized)) {
-                continue;
-            }
-            String overlaid = content.get(normalized);
-            if (overlaid != null) {
-                result.add(source(normalized, overlaid));
+        for (EffectiveSource source : effectiveSources(sourceSet, allSourceSets)) {
+            if (source.overlayContent() != null) {
+                result.add(source(source.path(), source.overlayContent()));
             } else {
-                onDisk.add(normalized);
+                onDisk.add(source.path());
             }
         }
         // Read unchanged on-disk files through the standard manager so their content and encoding are handled exactly
         // as the non-overlay path does (getJavaFileObjectsFromPaths).
         for (JavaFileObject object : standardManager.getJavaFileObjectsFromPaths(onDisk)) {
             result.add(object);
+        }
+        return result;
+    }
+
+    /**
+     * A {@code .java} compilation unit this source set compiles under the overlay: its absolute, normalized path and,
+     * when the overlay supplies in-memory content (a changed or renamed-in file), that content; {@code overlayContent}
+     * is {@code null} for an unchanged on-disk file whose content must be read from disk.
+     */
+    record EffectiveSource(Path path, String overlayContent) {}
+
+    /**
+     * The {@code .java} compilation units this source set compiles once the overlay is applied — the single source of
+     * truth shared by {@link #fileObjectsFor} (in-memory javac compilation) and the temp-tree materialization used for
+     * multi-module overlay validation. On-disk files the overlay removes (deleted or renamed-away) are dropped, ones it
+     * changes are returned with their new content, and files renamed/created into this set's (or a dependency's) source
+     * roots are added with their in-memory content. When the overlay is empty this is exactly the source set's on-disk
+     * {@code javaFiles()} (each with {@code null} content).
+     */
+    List<EffectiveSource> effectiveSources(SourceSet sourceSet, List<SourceSet> allSourceSets) {
+        List<EffectiveSource> result = new ArrayList<>();
+        for (Path file : sourceSet.javaFiles()) {
+            Path normalized = file.toAbsolutePath().normalize();
+            if (removed.contains(normalized)) {
+                continue;
+            }
+            result.add(new EffectiveSource(normalized, content.get(normalized)));
         }
         // Add files the overlay introduces (e.g. rename targets, created files) that land under this set's roots or
         // dependency source roots but are not yet part of any source set's on-disk javaFiles() listing.
@@ -111,8 +133,11 @@ public final class FileOverlay {
             if (existing.contains(path)) {
                 continue;
             }
-            if (underAnyRoot(path, visibleRoots)) {
-                result.add(source(path, entry.getValue()));
+            // Only .java overlay files are compilation units; a changed resource (e.g. a rewritten META-INF/services
+            // entry or beans.xml under a source root) stays in the overlay content for reads but must never be handed
+            // to javac as a source file, or it would be parsed as Java and fail with a spurious syntax error.
+            if (underAnyRoot(path, visibleRoots) && path.getFileName().toString().endsWith(".java")) {
+                result.add(new EffectiveSource(path, entry.getValue()));
             }
         }
         return result;

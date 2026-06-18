@@ -119,7 +119,8 @@ final class CompilerTask {
             // SemanticIndex.close() leaves it alone and the pool drops it on model change / shutdown.
             StandardJavaFileManager fileManager = fileManagerPool.acquire(compiler, charset, options);
             Iterable<? extends JavaFileObject> files = fileManager.getJavaFileObjectsFromPaths(javaFiles);
-            JavacTask task = (JavacTask) compiler.getTask(null, fileManager, collector, options, null, files);
+            JavacTask task = (JavacTask) compiler.getTask(
+                    null, fileManager, collector, FileManagerPool.taskOptions(options), null, files);
             List<CompilationUnitTree> units = new ArrayList<>();
             for (CompilationUnitTree unit : task.parse()) {
                 units.add(unit);

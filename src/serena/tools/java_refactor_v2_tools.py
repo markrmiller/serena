@@ -584,24 +584,43 @@ JAVA_REFACTOR_V2_CAPABILITY_TOOLS: dict[type, str] = {
 
 
 def java_refactor_v2_capability_tool_operations() -> dict[str, str]:
-    """Maps each capability-gated V2 tool name to its sidecar operation identifier."""
-    return {cls.get_name_from_cls(): operation for cls, operation in JAVA_REFACTOR_V2_CAPABILITY_TOOLS.items()}
+    """Maps each capability-gated tool name to its sidecar operation identifier (V2 plus the V3 engine tools).
+
+    V3 transformation-engine tools (e.g. ``renamePackage``) are negotiated against the same sidecar capability
+    registry as the V2 operation tools, so they are merged into one capability map the agent consults at discovery
+    time.
+    """
+    from serena.tools.java_refactor_v3_tools import java_refactor_v3_capability_tool_operations
+
+    operations = {cls.get_name_from_cls(): operation for cls, operation in JAVA_REFACTOR_V2_CAPABILITY_TOOLS.items()}
+    operations.update(java_refactor_v3_capability_tool_operations())
+    return operations
 
 
 def java_refactor_always_on_tool_names() -> list[str]:
     """Names of Java refactoring tools that are available without capability negotiation.
 
-    This is the V1 set: the status/debug tool, session lifecycle tools (create/get/apply/cancel),
-    and V1 operations. These do not depend on a specific sidecar operation capability.
+    This is the V1 set (status/debug, session lifecycle, V1 operations) PLUS the Python-planned V3 tools that are not
+    sidecar operations (e.g. propagate-safe-delete and the dead-code scan): all of these depend only on
+    ``java_refactor.enabled``, not on a specific advertised sidecar operation capability.
     """
     from serena.tools.java_refactor_tools import java_refactor_tool_names as _v1_tool_names
+    from serena.tools.java_refactor_v3_tools import java_refactor_v3_non_capability_tool_names
 
-    return _v1_tool_names()
+    seen: set[str] = set()
+    names: list[str] = []
+    for name in list(_v1_tool_names()) + java_refactor_v3_non_capability_tool_names():
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
 
 
 def java_refactor_tool_names() -> list[str]:
-    """Names of ALL Java refactoring tools (V1 + V2), gated by ``java_refactor.enabled``."""
-    all_classes = JAVA_REFACTOR_TOOL_CLASSES + JAVA_REFACTOR_V2_TOOL_CLASSES
+    """Names of ALL Java refactoring tools (V1 + V2 + V3), gated by ``java_refactor.enabled``."""
+    from serena.tools.java_refactor_v3_tools import JAVA_REFACTOR_V3_TOOL_CLASSES
+
+    all_classes = JAVA_REFACTOR_TOOL_CLASSES + JAVA_REFACTOR_V2_TOOL_CLASSES + JAVA_REFACTOR_V3_TOOL_CLASSES
     seen: set[str] = set()
     result = []
     for cls in all_classes:

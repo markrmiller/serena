@@ -42,7 +42,9 @@ class CapabilityRegistryTest {
             "rename",
             // V2 operations (every entry of V2_OPERATIONS)
             "inlineMethod", "changeSignature", "introduceParameter", "moveStaticMember", "moveInstanceMethod",
-            "pullUpMember", "pushDownMember", "extractMethod", "extractInterface", "introduceField", "encapsulateField");
+            "pullUpMember", "pushDownMember", "extractMethod", "extractInterface", "introduceField", "encapsulateField",
+            // V3 operations (validated like V2: real javac before/after delta required before an accepted preview)
+            "renamePackage", "movePackage", "moveSourceRoot");
 
     @SuppressWarnings("unchecked")
     private static Set<String> readyOperations() throws Exception {
@@ -140,11 +142,14 @@ class CapabilityRegistryTest {
      */
     @Test
     void capabilityDescriptionsCarryNoNarrowingCaveat() throws Exception {
-        String json = capabilityDetailsJson(mainWithConfig("default")).toLowerCase(java.util.Locale.ROOT);
+        // The guard targets advertised DESCRIPTIONS (see javadoc), not the maturity taxonomy: a preview op legitimately
+        // carries "level":"experimental", so scan only the description values rather than the whole details blob.
+        String descriptions = allDescriptions(capabilityDetailsJson(mainWithConfig("default")))
+                .toLowerCase(java.util.Locale.ROOT);
         for (String caveat : new String[] {"conservative", "experimental", "partial", "best-effort"}) {
-            assertFalse(json.contains(caveat),
+            assertFalse(descriptions.contains(caveat),
                     () -> "capability descriptions must not narrow a supported op with the caveat word '" + caveat
-                            + "': " + json);
+                            + "': " + descriptions);
         }
     }
 
@@ -170,6 +175,27 @@ class CapabilityRegistryTest {
         // Any mention of multi-output / control-flow must be in the refusal clause, not advertised as supported.
         assertFalse(extract.contains("multi-output") && !extract.contains("refuses multi-output"),
                 () -> "extractMethod must not advertise multi-output extraction as supported: " + extract);
+    }
+
+    /** Concatenates every advertised {@code description} value from the capabilities JSON, one per line. */
+    private static String allDescriptions(String json) {
+        StringBuilder out = new StringBuilder();
+        String marker = "\"description\":\"";
+        int from = 0;
+        while (true) {
+            int descStart = json.indexOf(marker, from);
+            if (descStart < 0) {
+                break;
+            }
+            descStart += marker.length();
+            int descEnd = descStart;
+            while (descEnd < json.length() && !(json.charAt(descEnd) == '"' && json.charAt(descEnd - 1) != '\\')) {
+                descEnd++;
+            }
+            out.append(json, descStart, descEnd).append('\n');
+            from = descEnd + 1;
+        }
+        return out.toString();
     }
 
     /** Extracts the {@code description} string for an advertised operation from the capabilities JSON. */

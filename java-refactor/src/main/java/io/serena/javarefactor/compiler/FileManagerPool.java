@@ -10,8 +10,11 @@ import io.serena.javarefactor.operations.inline_method.*;
 
 import javax.tools.JavaCompiler;
 import javax.tools.StandardJavaFileManager;
+import javax.tools.StandardLocation;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.Charset;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -71,9 +74,67 @@ public final class FileManagerPool {
         // null DiagnosticListener: file-manager-level diagnostics are rare and the per-task DiagnosticCollectors that
         // call sites pass to getTask still capture every compilation diagnostic, so reporting is unchanged.
         StandardJavaFileManager manager = compiler.getStandardFileManager(null, null, charset);
+        applyModuleSourcePath(manager, options);
         managers.put(key, manager);
         creationCount++;
         return manager;
+    }
+
+    /**
+     * Applies every module-specific {@code --module-source-path <module>=<root>} option to the file manager ONCE, at
+     * creation. Unlike the path options ({@code -classpath}, {@code --module-path}, {@code -sourcepath}) — which javac
+     * re-applies idempotently from a task's options every {@code getTask} — a module's source path may be set only once:
+     * javac fails a second {@code getTask} that re-specifies it ("{@code --module-source-path specified more than once
+     * for module X}") when that task shares this pooled manager. So the module-specific entries are configured here, on
+     * the manager, via {@link StandardJavaFileManager#setLocationForModule}, and callers pass {@link #taskOptions} (the
+     * same option list with these pairs removed) to {@code getTask}: the module source path is established exactly once
+     * while the manager stays freely reusable across passes. A pattern-form {@code --module-source-path} (no
+     * {@code module=}) is left in the task options for javac to handle.
+     */
+    private static void applyModuleSourcePath(StandardJavaFileManager manager, List<String> options) {
+        if (options == null) {
+            return;
+        }
+        for (int i = 0; i + 1 < options.size(); i++) {
+            if (!options.get(i).equals("--module-source-path")) {
+                continue;
+            }
+            String value = options.get(i + 1);
+            int eq = value.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String moduleName = value.substring(0, eq);
+            Path root = Path.of(value.substring(eq + 1));
+            try {
+                manager.setLocationForModule(StandardLocation.MODULE_SOURCE_PATH, moduleName, List.of(root));
+            } catch (IOException e) {
+                throw new UncheckedIOException(
+                        "failed to set module source path for module " + moduleName + " -> " + root, e);
+            }
+        }
+    }
+
+    /**
+     * The options to pass to {@code getTask} for a manager from {@link #acquire}: the full option list with each
+     * module-specific {@code --module-source-path <module>=<root>} pair removed, because {@link #acquire} has already
+     * applied those to the manager and javac forbids specifying a module's source path a second time. Other options
+     * (including a pattern-form {@code --module-source-path} with no {@code module=}) pass through unchanged.
+     */
+    public static List<String> taskOptions(List<String> options) {
+        if (options == null) {
+            return List.of();
+        }
+        List<String> filtered = new ArrayList<>(options.size());
+        for (int i = 0; i < options.size(); i++) {
+            if (options.get(i).equals("--module-source-path") && i + 1 < options.size()
+                    && options.get(i + 1).indexOf('=') > 0) {
+                i++;
+                continue;
+            }
+            filtered.add(options.get(i));
+        }
+        return filtered;
     }
 
     /**
