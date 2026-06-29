@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Iterator
+from contextlib import AbstractContextManager
 from contextlib import contextmanager
 from pathlib import Path, PurePath
 from time import sleep
@@ -269,6 +270,10 @@ class EclipseJDTLS(SolidLanguageServer):
         - use_system_java_home: Whether to use the system's JAVA_HOME for JDTLS itself (default: false)
         - jdtls_xmx: Maximum heap size for the JDTLS server JVM (default: "3G")
         - jdtls_xms: Initial heap size for the JDTLS server JVM (default: "100m")
+        - import_exclusions: Additional glob patterns for java.import.exclusions. Use this to keep
+              generated, nested worktree, or agent state directories out of JDTLS project import.
+        - resource_filters: Additional resource filter names for java.project.resourceFilters.
+        - autobuild_enabled: Whether JDTLS/Eclipse autobuild is enabled (default: true)
         - intellicode_xmx: Maximum heap size for the IntelliCode embedded JVM (default: "1G")
         - intellicode_xms: Initial heap size for the IntelliCode embedded JVM (default: "100m")
         - lombok_show_generated: Show Lombok-generated methods (getX/setX/builder()/...) in document
@@ -306,6 +311,9 @@ class EclipseJDTLS(SolidLanguageServer):
         use_system_java_home: true  # set to true to use system JAVA_HOME for JDTLS
         jdtls_xmx: "3G"  # maximum heap size for the JDTLS server JVM
         jdtls_xms: "100m"  # initial heap size for the JDTLS server JVM
+        import_exclusions: []  # additional java.import.exclusions globs
+        resource_filters: []  # additional java.project.resourceFilters names
+        autobuild_enabled: true
         intellicode_xmx: "1G"  # maximum heap size for the IntelliCode embedded JVM
         intellicode_xms: "100m"  # initial heap size for the IntelliCode embedded JVM
         lombok_show_generated: true  # show Lombok-generated methods in document symbols (default true)
@@ -333,6 +341,8 @@ class EclipseJDTLS(SolidLanguageServer):
         self._service_ready_event = threading.Event()
         self._project_ready_event = threading.Event()
         self._intellicode_enable_command_available = threading.Event()
+        self._workspace_lifetime_lock_cm: AbstractContextManager[None] | None = None
+        self._workspace_lifetime_lock_path: Path | None = None
 
     def _create_dependency_provider(self) -> LanguageServerDependencyProvider:
         ls_resources_dir = self.ls_resources_dir(self._solidlsp_settings)
@@ -905,6 +915,9 @@ class EclipseJDTLS(SolidLanguageServer):
                         "gradle_java_home",
                         "gradle_user_home",
                         "gradle_annotation_processing_enabled",
+                        "import_exclusions",
+                        "resource_filters",
+                        "autobuild_enabled",
                     )
                     if custom_settings.get(key) is not None
                 )
@@ -1064,6 +1077,10 @@ class EclipseJDTLS(SolidLanguageServer):
         # IntelliCode JVM settings (used in vmargs for the embedded JVM)
         intellicode_xmx = self._custom_settings.get("intellicode_xmx", "1G")
         intellicode_xms = self._custom_settings.get("intellicode_xms", "100m")
+
+        additional_import_exclusions = list(self._custom_settings.get("import_exclusions", []))
+        additional_resource_filters = list(self._custom_settings.get("resource_filters", []))
+        autobuild_enabled = self._custom_settings.get("autobuild_enabled", True)
 
         # Lombok-generated symbols (getX/setX/builder()/equals/hashCode/toString/...): JDTLS filters
         # these out of documentSymbol results by default. Without them, find_symbol/get_symbols_overview
@@ -1324,6 +1341,7 @@ class EclipseJDTLS(SolidLanguageServer):
                                 "**/.metadata/**",
                                 "**/archetype-resources/**",
                                 "**/META-INF/maven/**",
+                                *additional_import_exclusions,
                             ],
                             "generatesMetadataFilesAtProjectRoot": False,
                         },
@@ -1347,12 +1365,12 @@ class EclipseJDTLS(SolidLanguageServer):
                             "referencedLibraries": ["lib/**/*.jar"],
                             "importOnFirstTimeStartup": "automatic",
                             "importHint": True,
-                            "resourceFilters": ["node_modules", "\\.git"],
+                            "resourceFilters": ["node_modules", "\\.git", *additional_resource_filters],
                             "encoding": "ignore",
                             "exportJar": {"targetPath": "${workspaceFolder}/${workspaceFolderBasename}.jar"},
                         },
                         "contentProvider": {"preferred": None},
-                        "autobuild": {"enabled": True},
+                        "autobuild": {"enabled": autobuild_enabled},
                         "maxConcurrentBuilds": 1,
                         "selectionRange": {"enabled": True},
                         "showBuildStatusOnStart": {"enabled": "notification"},
@@ -1485,11 +1503,47 @@ class EclipseJDTLS(SolidLanguageServer):
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_notification("language/actionableNotification", do_nothing)
 
-        lock_path = self._jdtls_gradle_import_lock_path(self.repository_root_path)
-        log.info("Waiting for EclipseJDTLS Gradle import lock: %s", lock_path)
-        with _exclusive_file_lock(lock_path):
-            log.info("Acquired EclipseJDTLS Gradle import lock: %s", lock_path)
-            self._start_server_with_gradle_import_lock()
+        workspace_lock_path = self._jdtls_workspace_lifetime_lock_path()
+        log.info("Waiting for EclipseJDTLS workspace lifetime lock: %s", workspace_lock_path)
+        self._workspace_lifetime_lock_cm = _exclusive_file_lock(workspace_lock_path)
+        self._workspace_lifetime_lock_cm.__enter__()
+        self._workspace_lifetime_lock_path = workspace_lock_path
+        log.info("Acquired EclipseJDTLS workspace lifetime lock: %s", workspace_lock_path)
+
+        try:
+            lock_path = self._jdtls_gradle_import_lock_path(self.repository_root_path)
+            log.info("Waiting for EclipseJDTLS Gradle import lock: %s", lock_path)
+            with _exclusive_file_lock(lock_path):
+                log.info("Acquired EclipseJDTLS Gradle import lock: %s", lock_path)
+                self._start_server_with_gradle_import_lock()
+        except Exception:
+            self._release_workspace_lifetime_lock()
+            raise
+
+    def _jdtls_workspace_lifetime_lock_path(self) -> Path:
+        workspace_hash = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            self.repository_root_path,
+            self.runtime_dependency_paths.jdtls_launcher_jar_path,
+            self._custom_settings,
+        )
+        return _serena_locks_dir() / f"jdtls-workspace-{workspace_hash}.lock"
+
+    def _release_workspace_lifetime_lock(self) -> None:
+        if self._workspace_lifetime_lock_cm is None:
+            return
+        lock_path = self._workspace_lifetime_lock_path
+        try:
+            self._workspace_lifetime_lock_cm.__exit__(None, None, None)
+            log.info("Released EclipseJDTLS workspace lifetime lock: %s", lock_path)
+        finally:
+            self._workspace_lifetime_lock_cm = None
+            self._workspace_lifetime_lock_path = None
+
+    def stop(self, shutdown_timeout: float = 2.0) -> None:
+        try:
+            super().stop(shutdown_timeout=shutdown_timeout)
+        finally:
+            self._release_workspace_lifetime_lock()
 
     @staticmethod
     def _jdtls_gradle_import_lock_path(repository_root_path: str | Path) -> Path:

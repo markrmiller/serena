@@ -536,6 +536,23 @@ class TestComputeWorkspaceHash:
         h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash("/b/repo", self.DEFAULT_LAUNCHER, empty_settings)
         assert h1 != h2
 
+    def test_nested_agent_worktree_path_produces_separate_workspace_hash(self) -> None:
+        """A main checkout must not share an Eclipse workspace with nested .claude/worktrees agents."""
+        settings = SolidLSPSettings.CustomLSSettings({"java_home": "/usr/lib/jvm/java-25-openjdk-amd64"})
+
+        main_hash = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            "/home/me/solr-ref",
+            self.DEFAULT_LAUNCHER,
+            settings,
+        )
+        agent_hash = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            "/home/me/solr-ref/.claude/worktrees/agent-1234",
+            self.DEFAULT_LAUNCHER,
+            settings,
+        )
+
+        assert main_hash != agent_hash
+
 
 # ----------------------------------------------------------------------------
 # create_launch_command_env
@@ -579,6 +596,27 @@ class TestInitializeParams:
 
         gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
         assert gradle_settings["annotationProcessing"]["enabled"] is False
+
+    def test_additional_import_exclusions_resource_filters_and_autobuild_setting_are_applied(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(
+            tmp_path,
+            {
+                "import_exclusions": ["**/.claude/**", "**/.omx/**"],
+                "resource_filters": ["\\.claude", "\\.omx"],
+                "autobuild_enabled": False,
+            },
+        )
+
+        params = ls._get_initialize_params(str(repo))
+
+        java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        assert "**/.claude/**" in java_settings["import"]["exclusions"]
+        assert "**/.omx/**" in java_settings["import"]["exclusions"]
+        assert "\\.claude" in java_settings["project"]["resourceFilters"]
+        assert "\\.omx" in java_settings["project"]["resourceFilters"]
+        assert java_settings["autobuild"]["enabled"] is False
 
 
 def _git(cwd: Path, *args: str) -> None:
