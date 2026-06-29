@@ -1465,6 +1465,20 @@ class EclipseJDTLS(SolidLanguageServer):
             # system-installed Gradle via its standard discovery rules.
             gradle_settings["home"] = self.runtime_dependency_paths.gradle_path
         gradle_settings["java"] = {"home": gradle_java_home if gradle_java_home is not None else self.runtime_dependency_paths.jre_path}
+
+        java_settings = initialize_params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        log.info(
+            "Effective JDTLS import settings: maven.enabled=%s, gradle.enabled=%s, gradle.wrapper.enabled=%s, "
+            "gradle.home=%s, gradle.java.home=%s, autobuild.enabled=%s, import.exclusions=%s, project.resourceFilters=%s",
+            java_settings["import"]["maven"]["enabled"],
+            gradle_settings["enabled"],
+            gradle_settings["wrapper"]["enabled"],
+            gradle_settings.get("home"),
+            gradle_settings["java"]["home"],
+            java_settings["autobuild"]["enabled"],
+            java_settings["import"]["exclusions"],
+            java_settings["project"]["resourceFilters"],
+        )
         return cast(InitializeParams, initialize_params)
 
     def _start_server(self) -> None:
@@ -1505,6 +1519,12 @@ class EclipseJDTLS(SolidLanguageServer):
         def window_log_message(msg: dict) -> None:
             log.info(f"LSP: window/logMessage: {msg}")
 
+        def progress_handler(params: dict) -> None:
+            log.info("LSP: $/progress: %s", params)
+
+        def language_event_notification_handler(params: dict) -> None:
+            log.info("LSP: language/eventNotification: %s", params)
+
         def do_nothing(params: dict) -> None:
             return
 
@@ -1512,7 +1532,8 @@ class EclipseJDTLS(SolidLanguageServer):
         self.server.on_notification("language/status", lang_status_handler)
         self.server.on_notification("window/logMessage", window_log_message)
         self.server.on_request("workspace/executeClientCommand", execute_client_command_handler)
-        self.server.on_notification("$/progress", do_nothing)
+        self.server.on_notification("$/progress", progress_handler)
+        self.server.on_notification("language/eventNotification", language_event_notification_handler)
         self.server.on_notification("textDocument/publishDiagnostics", do_nothing)
         self.server.on_notification("language/actionableNotification", do_nothing)
 
@@ -1566,7 +1587,59 @@ class EclipseJDTLS(SolidLanguageServer):
         digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
         return _serena_locks_dir() / f"jdtls-gradle-import-{digest}.lock"
 
+    def _log_project_refresh_hotspots(self) -> None:
+        """
+        Log local-state directory sizes that Eclipse/Buildship may refresh before Java import
+        exclusions are effective. This is intentionally limited to known high-risk directory names
+        so startup logging does not require walking the entire repository.
+        """
+        root = Path(self.repository_root_path)
+        candidates: list[Path] = []
+        for name in (".claude", ".omx", ".serena", ".gradle", "build"):
+            candidates.append(root / name)
+        candidates.extend(root.glob("triage-results*"))
+        candidates.extend(root.glob("*/build"))
+        candidates.extend(root.glob("*/*/build"))
+
+        seen: set[Path] = set()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in seen or not path.exists() or not path.is_dir():
+                continue
+            seen.add(resolved)
+            file_count = 0
+            dir_count = 0
+            truncated = False
+            stack = [path]
+            while stack:
+                current = stack.pop()
+                try:
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            if entry.is_dir(follow_symlinks=False):
+                                dir_count += 1
+                                stack.append(Path(entry.path))
+                            else:
+                                file_count += 1
+                            if file_count + dir_count >= 20_000:
+                                truncated = True
+                                stack.clear()
+                                break
+                except OSError as e:
+                    log.debug("Could not scan JDTLS refresh hotspot %s: %s", current, e)
+            log.info(
+                "JDTLS refresh hotspot: path=%s files=%s dirs=%s truncated=%s",
+                path,
+                file_count,
+                dir_count,
+                truncated,
+            )
+
     def _start_server_with_gradle_import_lock(self) -> None:
+        self._log_project_refresh_hotspots()
         log.info("Starting EclipseJDTLS server process")
         self.server.start()
         initialize_params = self._get_initialize_params(self.repository_root_path)
