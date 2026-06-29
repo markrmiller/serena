@@ -590,6 +590,18 @@ class TestInitializeParams:
         gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
         assert gradle_settings["annotationProcessing"]["enabled"] is True
 
+    def test_dot_prefixed_directories_are_excluded_from_import_and_refresh_by_default(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path)
+
+        params = ls._get_initialize_params(str(repo))
+
+        java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        assert "**/.*/**" in java_settings["import"]["exclusions"]
+        assert "\\..*" in java_settings["project"]["resourceFilters"]
+        assert "\\.git" not in java_settings["project"]["resourceFilters"]
+
     def test_gradle_wrapper_enabled_leaves_gradle_home_unset(self, tmp_path: Path) -> None:
         """When wrapper import is enabled, do not force Serena's bundled Gradle distribution."""
         repo = tmp_path / "repo"

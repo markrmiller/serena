@@ -1346,6 +1346,7 @@ class EclipseJDTLS(SolidLanguageServer):
                             },
                             "exclusions": [
                                 "**/node_modules/**",
+                                "**/.*/**",
                                 "**/.metadata/**",
                                 "**/archetype-resources/**",
                                 "**/META-INF/maven/**",
@@ -1373,7 +1374,7 @@ class EclipseJDTLS(SolidLanguageServer):
                             "referencedLibraries": ["lib/**/*.jar"],
                             "importOnFirstTimeStartup": "automatic",
                             "importHint": True,
-                            "resourceFilters": ["node_modules", "\\.git", *additional_resource_filters],
+                            "resourceFilters": ["node_modules", "\\..*", *additional_resource_filters],
                             "encoding": "ignore",
                             "exportJar": {"targetPath": "${workspaceFolder}/${workspaceFolderBasename}.jar"},
                         },
