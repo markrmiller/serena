@@ -266,6 +266,45 @@ class TestPreToolUseRemindAboutSerenaHook:
         assert "additionalContext" not in hook_output
         assert "read" in hook_output["permissionDecisionReason"].lower()
 
+    def test_codex_must_use_serena_after_threshold_before_workarounds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+        """Codex must not route around the reminder with python/cat/sed after a burst deny."""
+        session_id = "codex-serena-required"
+        grep_payload = _base_input(
+            "functions.shell_command",
+            session_id=session_id,
+            tool_input={"command": "rg -n Foo src/foo.py"},
+        )
+        for _ in range(ToolUseCounter._GREP_USES_THRESHOLD):
+            with patch("sys.stdin", _make_stdin(grep_payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+                PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+
+        first_result = json.loads(capsys.readouterr().out.strip())
+        first_output = first_result["hookSpecificOutput"]
+        assert first_output["permissionDecision"] == "deny"
+        assert "next tool call must be a Serena symbolic tool" in first_output["permissionDecisionReason"]
+
+        workaround_payload = _base_input(
+            "functions.shell_command",
+            session_id=session_id,
+            tool_input={"command": "python3 - <<'PY'\nfrom pathlib import Path\nPath('src/foo.py').read_text()\nPY"},
+        )
+        with patch("sys.stdin", _make_stdin(workaround_payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+
+        workaround_result = json.loads(capsys.readouterr().out.strip())
+        workaround_output = workaround_result["hookSpecificOutput"]
+        assert workaround_output["permissionDecision"] == "deny"
+        assert "Do not work around this with python" in workaround_output["permissionDecisionReason"]
+
+        serena_payload = _base_input("mcp__serena__get_symbols_overview", session_id=session_id, tool_input={"relative_path": "src/foo.py"})
+        with patch("sys.stdin", _make_stdin(serena_payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+        assert capsys.readouterr().out == ""
+
+        with patch("sys.stdin", _make_stdin(workaround_payload)), patch("serena.hooks.serena_home_dir", str(tmp_path)):
+            PreToolUseRemindAboutSymbolicToolsHook(HookClient.CODEX).execute()
+        assert capsys.readouterr().out == ""
+
     def test_serena_tool_resets_counters(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """Using a Serena tool should reset counters, so the threshold is not reached."""
         for _ in range(ToolUseCounter._GREP_USES_THRESHOLD - 1):

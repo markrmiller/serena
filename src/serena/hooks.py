@@ -159,6 +159,12 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         # timestamp of the most recently emitted deny; deliberately not cleared by
         # :meth:`reset` so the rate limit survives counter resets (e.g. Serena tool use)
         last_deny_timestamp: datetime | None = None
+        # Codex tends to route around a one-shot deny by switching from grep to
+        # python/cat/sed instead of calling Serena. Once a Codex burst trips the
+        # reminder, require one actual Serena symbolic/navigation call before any
+        # other tool is allowed again.
+        serena_required: bool = False
+        serena_required_reason: str = ""
 
         def too_many_recent_reads(self) -> bool:
             return self.n_recent_read_file_uses >= self._READ_FILE_USES_THRESHOLD
@@ -206,6 +212,8 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         def update(self, hook: "PreToolUseRemindAboutSymbolicToolsHook") -> None:
             if hook.is_serena_symbolic_tool():
                 self.reset()
+                self.serena_required = False
+                self.serena_required_reason = ""
                 return
 
             now = hook.triggered_at_timestamp
@@ -253,6 +261,16 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             self.last_grep_use_timestamp = None
             self.last_read_file_use_timestamp = None
             self.last_non_symbolic_use_timestamp = None
+
+        def require_serena(self, reason: str) -> None:
+            self.reset()
+            self.serena_required = True
+            self.serena_required_reason = reason
+
+        def clear_serena_requirement(self) -> None:
+            self.reset()
+            self.serena_required = False
+            self.serena_required_reason = ""
 
     #: substrings that, combined with ``"file"`` in the tool name, identify a
     #: read-file tool for non-Claude-Code clients (whose tool names vary across
@@ -423,8 +441,23 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         return Path(cleaned_path).suffix.lower() in cls._CODE_FILE_EXTENSIONS
 
     def execute(self) -> None:
-        # gate the entire hook on the rate-limit window: while we are within
-        # _MIN_DENY_INTERVAL_SECONDS of the last emitted deny, no counter
+        # If Codex is in the enforced-Serena state, do not rate-limit this hook:
+        # keep blocking non-Serena workarounds until the model actually calls a
+        # Serena symbolic/navigation tool. This is intentionally Codex-specific;
+        # Claude receives additional context and generally follows softer nudges.
+        if self._client == HookClient.CODEX and self._tool_call_counter.serena_required:
+            if self.is_serena_symbolic_tool():
+                self._tool_call_counter.clear_serena_requirement()
+                self._tool_call_counter.save(self)
+                return
+            output_data = self._build_codex_serena_required_deny()
+            self._tool_call_counter.last_deny_timestamp = self.triggered_at_timestamp
+            click.echo(output_data.to_json_string(self._client))
+            self._tool_call_counter.save(self)
+            return
+
+        # gate the normal reminder path on the rate-limit window: while we are
+        # within _MIN_DENY_INTERVAL_SECONDS of the last emitted deny, no counter
         # updates and no deny detection happen at all. The pickle is left
         # untouched so state survives the gating window unchanged.
         if not self._tool_call_counter.is_hook_active(self.triggered_at_timestamp):
@@ -454,15 +487,31 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             output_data = self._build_non_symbolic_deny()
 
         if output_data is not None:
-            # reset burst counters so the next interval starts fresh, then record
-            # the deny timestamp and emit. The is_hook_active() guard at the top
-            # ensures we never reach this branch within the rate-limit window.
-            self._tool_call_counter.reset()
+            # For Codex, a one-shot reminder is not sticky enough: the model often
+            # works around it with python/cat/sed instead of using Serena. Enter a
+            # pending state that blocks every non-Serena tool until a Serena
+            # symbolic/navigation tool is called.
+            if self._client == HookClient.CODEX:
+                self._tool_call_counter.require_serena(output_data.permission_decision_reason)
+            else:
+                # reset burst counters so the next interval starts fresh; Claude
+                # also receives additionalContext with the reminder.
+                self._tool_call_counter.reset()
             self._tool_call_counter.last_deny_timestamp = self.triggered_at_timestamp
             click.echo(output_data.to_json_string(self._client))
         self._tool_call_counter.save(self)
 
     def _build_grep_deny(self) -> "PreToolUseHook.OutputData":
+        if self._client == HookClient.CODEX:
+            return self.OutputData(
+                permission_decision="deny",
+                permission_decision_reason=(
+                    "Too many consecutive grep/search calls without Serena. Stop shell searching now; "
+                    "the next tool call must be a Serena symbolic tool such as "
+                    "mcp__serena__get_symbols_overview, mcp__serena__find_symbol, or "
+                    "mcp__serena__find_referencing_symbols."
+                ),
+            )
         return self.OutputData(
             permission_decision="deny",
             permission_decision_reason="Too many consecutive grep calls without using symbolic tools. "
@@ -474,6 +523,16 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         )
 
     def _build_code_read_deny(self) -> "PreToolUseHook.OutputData":
+        if self._client == HookClient.CODEX:
+            return self.OutputData(
+                permission_decision="deny",
+                permission_decision_reason=(
+                    "Too many consecutive file reads without Serena. Stop direct file inspection now; "
+                    "the next tool call must be a Serena symbolic tool such as "
+                    "mcp__serena__get_symbols_overview, mcp__serena__find_symbol, or "
+                    "mcp__serena__find_referencing_symbols."
+                ),
+            )
         return self.OutputData(
             permission_decision="deny",
             permission_decision_reason="Too many consecutive read calls of files without using symbolic tools. "
@@ -485,6 +544,16 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
         )
 
     def _build_non_symbolic_deny(self) -> "PreToolUseHook.OutputData":
+        if self._client == HookClient.CODEX:
+            return self.OutputData(
+                permission_decision="deny",
+                permission_decision_reason=(
+                    "Too many consecutive non-symbolic code exploration calls without Serena. "
+                    "The next tool call must be a Serena symbolic tool such as "
+                    "mcp__serena__get_symbols_overview, mcp__serena__find_symbol, or "
+                    "mcp__serena__find_referencing_symbols."
+                ),
+            )
         return self.OutputData(
             permission_decision="deny",
             permission_decision_reason="Too many consecutive non-symbolic tool calls (mixed grep and read). "
@@ -494,6 +563,20 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
                 "Serena's symbolic mcp tools. Consider using symbolic search and targeted symbol "
                 "reads instead for more code-centric exploration. You can continue using these tools "
                 "now if needed, the counter was reset."
+            ),
+        )
+
+    def _build_codex_serena_required_deny(self) -> "PreToolUseHook.OutputData":
+        reason = self._tool_call_counter.serena_required_reason or "Repeated non-symbolic code exploration was detected."
+        return self.OutputData(
+            permission_decision="deny",
+            permission_decision_reason=(
+                f"{reason} Before using any more shell/read/edit/write tools, call a Serena symbolic tool now. "
+                "Use one of: mcp__serena__get_symbols_overview for the target file/package, "
+                "mcp__serena__find_symbol for the class/method you need, or "
+                "mcp__serena__find_referencing_symbols for callers/references. "
+                "Do not work around this with python, cat, sed, grep, rg, or direct file inspection; "
+                "this block clears only after a Serena symbolic tool call."
             ),
         )
 
