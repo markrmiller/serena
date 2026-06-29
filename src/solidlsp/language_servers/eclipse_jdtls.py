@@ -1337,7 +1337,7 @@ class EclipseJDTLS(SolidLanguageServer):
                                 "enabled": gradle_import_enabled,
                                 "wrapper": {"enabled": gradle_wrapper_enabled},
                                 "version": None,
-                                "home": "abs(static/gradle-7.3.3)",
+                                "home": None,
                                 "offline": {"enabled": False},
                                 "arguments": None,
                                 "jvmArguments": None,
@@ -1455,9 +1455,14 @@ class EclipseJDTLS(SolidLanguageServer):
             assert os.path.exists(runtime["path"]), f"Runtime required for eclipse_jdtls at path {runtime['path']} does not exist"
 
         gradle_settings = initialize_params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore
-        # In upstream-jdtls mode we don't ship a Gradle distribution — Buildship will use the project's
-        # ./gradlew wrapper or a system-installed Gradle via its standard discovery rules.
-        if self.runtime_dependency_paths.gradle_path is not None:
+        # If the project wrapper is enabled, leave Gradle home unset so Buildship uses ./gradlew.
+        # Setting both wrapper.enabled=true and home=<Serena bundled Gradle> is ambiguous and can
+        # make legacy builds (e.g. Gradle 6.x projects) import with the wrong Gradle distribution.
+        if gradle_wrapper_enabled:
+            gradle_settings["home"] = None
+        elif self.runtime_dependency_paths.gradle_path is not None:
+            # In upstream-jdtls mode we don't ship a Gradle distribution — Buildship will use a
+            # system-installed Gradle via its standard discovery rules.
             gradle_settings["home"] = self.runtime_dependency_paths.gradle_path
         gradle_settings["java"] = {"home": gradle_java_home if gradle_java_home is not None else self.runtime_dependency_paths.jre_path}
         return cast(InitializeParams, initialize_params)

@@ -590,6 +590,29 @@ class TestInitializeParams:
         gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
         assert gradle_settings["annotationProcessing"]["enabled"] is True
 
+    def test_gradle_wrapper_enabled_leaves_gradle_home_unset(self, tmp_path: Path) -> None:
+        """When wrapper import is enabled, do not force Serena's bundled Gradle distribution."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path, {"gradle_wrapper_enabled": True})
+
+        params = ls._get_initialize_params(str(repo))
+
+        gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
+        assert gradle_settings["wrapper"]["enabled"] is True
+        assert gradle_settings["home"] is None
+
+    def test_gradle_wrapper_disabled_uses_serena_gradle_home(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path, {"gradle_wrapper_enabled": False})
+
+        params = ls._get_initialize_params(str(repo))
+
+        gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
+        assert gradle_settings["wrapper"]["enabled"] is False
+        assert gradle_settings["home"] == str(tmp_path / "gradle")
+
     def test_gradle_annotation_processing_sync_can_be_disabled(self, tmp_path: Path) -> None:
         """Users retain an escape hatch for Gradle/AP sync combinations that are incompatible."""
         repo = tmp_path / "repo"
