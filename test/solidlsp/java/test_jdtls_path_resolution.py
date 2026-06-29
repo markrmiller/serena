@@ -480,6 +480,8 @@ class TestComputeWorkspaceHash:
             SolidLSPSettings.CustomLSSettings(
                 {
                     "java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
+                    "maven_import_enabled": True,
+                    "gradle_import_enabled": True,
                     "gradle_wrapper_enabled": False,
                     "gradle_java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
                     "gradle_annotation_processing_enabled": True,
@@ -492,6 +494,8 @@ class TestComputeWorkspaceHash:
             SolidLSPSettings.CustomLSSettings(
                 {
                     "java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
+                    "maven_import_enabled": False,
+                    "gradle_import_enabled": False,
                     "gradle_wrapper_enabled": True,
                     "gradle_java_home": "/usr/lib/jvm/java-11-openjdk-amd64",
                     "gradle_annotation_processing_enabled": False,
@@ -603,6 +607,8 @@ class TestInitializeParams:
         ls = _make_jdtls_for_initialize_params(
             tmp_path,
             {
+                "maven_import_enabled": False,
+                "gradle_import_enabled": False,
                 "import_exclusions": ["**/.claude/**", "**/.omx/**"],
                 "resource_filters": ["\\.claude", "\\.omx"],
                 "autobuild_enabled": False,
@@ -612,6 +618,8 @@ class TestInitializeParams:
         params = ls._get_initialize_params(str(repo))
 
         java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        assert java_settings["import"]["maven"]["enabled"] is False
+        assert java_settings["import"]["gradle"]["enabled"] is False
         assert "**/.claude/**" in java_settings["import"]["exclusions"]
         assert "**/.omx/**" in java_settings["import"]["exclusions"]
         assert "\\.claude" in java_settings["project"]["resourceFilters"]

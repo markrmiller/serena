@@ -262,6 +262,8 @@ class EclipseJDTLS(SolidLanguageServer):
         General settings (apply in both modes):
         - maven_user_settings: Path to Maven settings.xml file (default: ~/.m2/settings.xml)
         - gradle_user_home: Path to Gradle user home directory (default: ~/.gradle)
+        - maven_import_enabled: Whether JDTLS imports Maven projects (default: true)
+        - gradle_import_enabled: Whether JDTLS imports Gradle projects (default: true)
         - gradle_wrapper_enabled: Whether to use the project's Gradle wrapper (default: false)
         - gradle_java_home: Path to JDK for Gradle (default: null, uses bundled JRE)
         - gradle_annotation_processing_enabled: Whether JDTLS should synchronize Gradle annotation processing
@@ -305,6 +307,8 @@ class EclipseJDTLS(SolidLanguageServer):
         # maven_user_settings: 'C:\\Users\\YourName\\.m2\\settings.xml'  # Windows (use single quotes!)
         gradle_user_home: "/home/user/.gradle"  # Unix/Linux/Mac
         # gradle_user_home: 'C:\\Users\\YourName\\.gradle'  # Windows (use single quotes!)
+        maven_import_enabled: true
+        gradle_import_enabled: true  # set false for very large Gradle builds where source navigation should not wait for import
         gradle_wrapper_enabled: true  # set to true for projects with custom plugins/repositories
         # gradle_annotation_processing_enabled: false  # optional escape hatch for incompatible Gradle/AP sync setups
         gradle_java_home: "/path/to/jdk"  # set to override Gradle's JDK
@@ -911,6 +915,8 @@ class EclipseJDTLS(SolidLanguageServer):
                         "jdtls_path",
                         "vscode_java_version",
                         "gradle_version",
+                        "maven_import_enabled",
+                        "gradle_import_enabled",
                         "gradle_wrapper_enabled",
                         "gradle_java_home",
                         "gradle_user_home",
@@ -1081,6 +1087,8 @@ class EclipseJDTLS(SolidLanguageServer):
         additional_import_exclusions = list(self._custom_settings.get("import_exclusions", []))
         additional_resource_filters = list(self._custom_settings.get("resource_filters", []))
         autobuild_enabled = self._custom_settings.get("autobuild_enabled", True)
+        maven_import_enabled = self._custom_settings.get("maven_import_enabled", True)
+        gradle_import_enabled = self._custom_settings.get("gradle_import_enabled", True)
 
         # Lombok-generated symbols (getX/setX/builder()/equals/hashCode/toString/...): JDTLS filters
         # these out of documentSymbol results by default. Without them, find_symbol/get_symbols_overview
@@ -1321,12 +1329,12 @@ class EclipseJDTLS(SolidLanguageServer):
                         "trace": {"server": "verbose"},
                         "import": {
                             "maven": {
-                                "enabled": True,
+                                "enabled": maven_import_enabled,
                                 "offline": {"enabled": False},
                                 "disableTestClasspathFlag": False,
                             },
                             "gradle": {
-                                "enabled": True,
+                                "enabled": gradle_import_enabled,
                                 "wrapper": {"enabled": gradle_wrapper_enabled},
                                 "version": None,
                                 "home": "abs(static/gradle-7.3.3)",
