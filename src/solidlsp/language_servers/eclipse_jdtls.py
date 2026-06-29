@@ -236,8 +236,9 @@ class EclipseJDTLS(SolidLanguageServer):
     Two installation modes are supported:
 
     1. **Default vscode-java VSIX mode** (no extra config required) — Serena downloads the platform-specific
-       vscode-java VSIX bundle (~500 MB: JDTLS + bundled JRE 21 + Lombok + IntelliCode), Gradle distribution
-       and IntelliCode VSIX from public hosts. Suitable when public network access is available.
+       vscode-java VSIX bundle (~500 MB: JDTLS + bundled JRE + Lombok + IntelliCode), Gradle distribution
+       and IntelliCode VSIX from public hosts. Suitable when public network access is available. If
+       ``ls_specific_settings.java.java_home`` is set, that JDK is used to launch JDTLS instead of the bundled JRE.
 
     2. **Upstream JDTLS mode** (activated by setting both ``jdtls_path`` and ``lombok_path``) — uses an
        existing JDTLS installation and the system JDK. Nothing is downloaded. Suitable for restricted-network
@@ -254,7 +255,8 @@ class EclipseJDTLS(SolidLanguageServer):
                        or download from https://projectlombok.org/downloads/).
 
         Optional in upstream-jdtls mode:
-        - java_home: Path to JDK 21+ home directory. Falls back to JAVA_HOME env, then 'which java'.
+        - java_home: Path to JDK 21+ home directory used for launching JDTLS. Falls back to JAVA_HOME env,
+          then 'which java' in upstream mode. In default VSIX mode it overrides the bundled JRE.
 
         General settings (apply in both modes):
         - maven_user_settings: Path to Maven settings.xml file (default: ~/.m2/settings.xml)
@@ -592,6 +594,15 @@ class EclipseJDTLS(SolidLanguageServer):
             assert os.path.exists(jdtls_launcher_jar_path)
             assert os.path.exists(jdtls_readonly_config_path)
 
+            if custom_settings.get("java_home") or (custom_settings.get("use_system_java_home", False) and os.environ.get("JAVA_HOME")):
+                resolved_jre_home_path, resolved_jre_path = EclipseJDTLS.DependencyProvider._resolve_system_jdk(custom_settings)
+                log.info(
+                    "Using configured system JDK for default vscode-java JDTLS launcher: "
+                    f"java.home={resolved_jre_home_path}; java_exe={resolved_jre_path}"
+                )
+                jre_home_path = resolved_jre_home_path
+                jre_path = resolved_jre_path
+
             dependency = runtime_dependencies["intellicode"]["platform-agnostic"]
             intellicode_directory_path = str(PurePath(ls_resources_dir, cast(str, dependency["relative_extraction_path"])))
             os.makedirs(intellicode_directory_path, exist_ok=True)
@@ -857,9 +868,9 @@ class EclipseJDTLS(SolidLanguageServer):
             """
             Compute the JDTLS workspace directory name.
 
-            The launcher jar path is mixed in so that switching JDTLS versions (default
-            vscode-java VSIX bump or upstream install change) lands in a separate ws_dir
-            and avoids stale OSGi configs from the previous version blocking startup.
+            The launcher jar path and configured JDK identity are mixed in so that switching JDTLS versions
+            (default vscode-java VSIX bump or upstream install change), or switching the launcher JVM,
+            lands in a separate ws_dir and avoids stale OSGi configs from the previous version blocking startup.
 
             Exception: legacy default-mode users on INITIAL_VSCODE_JAVA_VERSION keep the
             original ``md5(repository_root_path)`` format. These are users who installed
@@ -874,7 +885,10 @@ class EclipseJDTLS(SolidLanguageServer):
             if is_legacy_initial:
                 ws_hash_input = repository_root_path.encode()
             else:
-                ws_hash_input = (repository_root_path + "|" + jdtls_launcher_jar_path).encode()
+                jdk_identity = custom_settings.get("java_home") or (
+                    os.environ.get("JAVA_HOME", "") if custom_settings.get("use_system_java_home", False) else ""
+                )
+                ws_hash_input = (repository_root_path + "|" + jdtls_launcher_jar_path + "|" + str(jdk_identity)).encode()
             return hashlib.md5(ws_hash_input).hexdigest()
 
         def create_launch_command(self) -> list[str]:
@@ -959,16 +973,8 @@ class EclipseJDTLS(SolidLanguageServer):
             return cmd
 
         def create_launch_command_env(self) -> dict[str, str]:
-            use_system_java_home = self._custom_settings.get("use_system_java_home", False)
-            if use_system_java_home:
-                system_java_home = os.environ.get("JAVA_HOME")
-                if system_java_home:
-                    log.info(f"Using system JAVA_HOME for JDTLS: {system_java_home}")
-                    return {"syntaxserver": "false", "JAVA_HOME": system_java_home}
-                else:
-                    log.warning("use_system_java_home is set but JAVA_HOME is not set in environment, falling back to bundled JRE")
             java_home = self.runtime_dependency_paths.jre_home_path
-            log.info(f"Using bundled JRE for JDTLS: {java_home}")
+            log.info(f"Using JAVA_HOME for JDTLS: {java_home}")
             return {"syntaxserver": "false", "JAVA_HOME": java_home}
 
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:

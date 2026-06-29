@@ -458,6 +458,33 @@ class TestComputeWorkspaceHash:
         h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash(self.REPO, self.UPSTREAM_LAUNCHER, empty_settings)
         assert h1 != h2
 
+    def test_default_mode_non_initial_includes_configured_java_home(self) -> None:
+        """Switching the JDTLS launcher JDK must land in a fresh workspace."""
+        h1 = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            self.REPO,
+            self.DEFAULT_LAUNCHER,
+            SolidLSPSettings.CustomLSSettings({"java_home": "/usr/lib/jvm/java-21-openjdk-amd64"}),
+        )
+        h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            self.REPO,
+            self.DEFAULT_LAUNCHER,
+            SolidLSPSettings.CustomLSSettings({"java_home": "/usr/lib/jvm/java-25-openjdk-amd64"}),
+        )
+        assert h1 != h2
+
+    def test_initial_default_mode_legacy_hash_ignores_configured_java_home(self) -> None:
+        """Legacy INITIAL hash remains byte-for-byte compatible even if new settings are present."""
+        import hashlib
+
+        from solidlsp.language_servers.eclipse_jdtls import INITIAL_VSCODE_JAVA_VERSION
+
+        settings = SolidLSPSettings.CustomLSSettings(
+            {"vscode_java_version": INITIAL_VSCODE_JAVA_VERSION, "java_home": "/usr/lib/jvm/java-25-openjdk-amd64"}
+        )
+        expected = hashlib.md5(self.REPO.encode()).hexdigest()
+        result = EclipseJDTLS.DependencyProvider._compute_workspace_hash(self.REPO, self.DEFAULT_LAUNCHER, settings)
+        assert result == expected
+
     def test_upstream_mode_includes_launcher_path(self) -> None:
         """When jdtls_path is set, different launcher paths must produce different hashes."""
         settings = SolidLSPSettings.CustomLSSettings({"jdtls_path": "/opt/homebrew/Cellar/jdtls/1.50.0/libexec"})
@@ -480,6 +507,21 @@ class TestComputeWorkspaceHash:
         h1 = EclipseJDTLS.DependencyProvider._compute_workspace_hash("/a/repo", self.DEFAULT_LAUNCHER, empty_settings)
         h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash("/b/repo", self.DEFAULT_LAUNCHER, empty_settings)
         assert h1 != h2
+
+
+# ----------------------------------------------------------------------------
+# create_launch_command_env
+# ----------------------------------------------------------------------------
+
+
+class TestLaunchCommandEnv:
+    def test_uses_runtime_dependency_jre_home_for_java_home(self, tmp_path: Path) -> None:
+        ls = _make_jdtls_for_initialize_params(tmp_path)
+
+        env = EclipseJDTLS.DependencyProvider.create_launch_command_env(ls)  # type: ignore[arg-type]
+
+        assert env["JAVA_HOME"] == ls.runtime_dependency_paths.jre_home_path
+        assert env["syntaxserver"] == "false"
 
 
 # ----------------------------------------------------------------------------
