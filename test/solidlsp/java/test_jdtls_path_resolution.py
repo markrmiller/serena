@@ -472,6 +472,34 @@ class TestComputeWorkspaceHash:
         )
         assert h1 != h2
 
+    def test_default_mode_non_initial_includes_gradle_import_settings(self) -> None:
+        """Switching Buildship/Gradle import settings must land in a fresh Eclipse workspace."""
+        h1 = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            self.REPO,
+            self.DEFAULT_LAUNCHER,
+            SolidLSPSettings.CustomLSSettings(
+                {
+                    "java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
+                    "gradle_wrapper_enabled": False,
+                    "gradle_java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
+                    "gradle_annotation_processing_enabled": True,
+                }
+            ),
+        )
+        h2 = EclipseJDTLS.DependencyProvider._compute_workspace_hash(
+            self.REPO,
+            self.DEFAULT_LAUNCHER,
+            SolidLSPSettings.CustomLSSettings(
+                {
+                    "java_home": "/usr/lib/jvm/java-25-openjdk-amd64",
+                    "gradle_wrapper_enabled": True,
+                    "gradle_java_home": "/usr/lib/jvm/java-11-openjdk-amd64",
+                    "gradle_annotation_processing_enabled": False,
+                }
+            ),
+        )
+        assert h1 != h2
+
     def test_initial_default_mode_legacy_hash_ignores_configured_java_home(self) -> None:
         """Legacy INITIAL hash remains byte-for-byte compatible even if new settings are present."""
         import hashlib

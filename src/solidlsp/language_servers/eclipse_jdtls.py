@@ -888,7 +888,35 @@ class EclipseJDTLS(SolidLanguageServer):
                 jdk_identity = custom_settings.get("java_home") or (
                     os.environ.get("JAVA_HOME", "") if custom_settings.get("use_system_java_home", False) else ""
                 )
-                ws_hash_input = (repository_root_path + "|" + jdtls_launcher_jar_path + "|" + str(jdk_identity)).encode()
+                # Eclipse workspace metadata also captures Gradle import/runtime settings. Reusing the same
+                # workspace after switching between Serena's bundled Gradle/JRE defaults and a project's
+                # wrapper/JDK can leave stale or corrupted OSGi/resource metadata that prevents JDTLS from
+                # starting. Keep the hash stable for irrelevant settings, but force a fresh workspace when
+                # settings that affect JDTLS or Buildship project import change.
+                workspace_setting_identity = tuple(
+                    (key, custom_settings.get(key))
+                    for key in (
+                        "java_home",
+                        "use_system_java_home",
+                        "jdtls_path",
+                        "vscode_java_version",
+                        "gradle_version",
+                        "gradle_wrapper_enabled",
+                        "gradle_java_home",
+                        "gradle_user_home",
+                        "gradle_annotation_processing_enabled",
+                    )
+                    if custom_settings.get(key) is not None
+                )
+                ws_hash_input = (
+                    repository_root_path
+                    + "|"
+                    + jdtls_launcher_jar_path
+                    + "|"
+                    + str(jdk_identity)
+                    + "|"
+                    + repr(workspace_setting_identity)
+                ).encode()
             return hashlib.md5(ws_hash_input).hexdigest()
 
         def create_launch_command(self) -> list[str]:
