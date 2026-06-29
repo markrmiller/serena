@@ -1297,6 +1297,19 @@ class TestPromptProvision:
             assert match is None, f"Expected no project activation message in result:\n{result}"
 
     @pytest.mark.parametrize("serena_agent", [Language.PYTHON], indirect=True)
+    def test_initial_instructions_bypass_serial_task_executor(self, serena_agent: SerenaAgent, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Initial instructions must be available while startup tasks such as LS initialization are still running."""
+
+        def fail_issue_task(*_args, **_kwargs):
+            raise AssertionError("initial_instructions must not be queued behind the serial task executor")
+
+        monkeypatch.setattr(serena_agent, "issue_task", fail_issue_task)
+
+        result = self._call_tool(serena_agent, InitialInstructionsTool, session_id="startup-session")
+
+        assert "Serena" in result
+
+    @pytest.mark.parametrize("serena_agent", [Language.PYTHON], indirect=True)
     def test_initial_instructions_provide_project_activation_message_once_per_session(self, serena_agent: SerenaAgent) -> None:
         """
         Tests that the project activation message is provided on the first call to InitialInstructionsTool for a session,

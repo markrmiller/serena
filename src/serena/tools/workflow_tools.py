@@ -4,7 +4,7 @@ Tools supporting the general workflow of the agent
 
 import platform
 
-from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
+from serena.tools import Tool, ToolMarkerCanRunDuringStartup, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
 
 
 class OnboardingTool(Tool):
@@ -29,7 +29,7 @@ class OnboardingTool(Tool):
         return self.prompt_factory.create_onboarding_prompt(system=system, memory_maintenance_name=memory_maintenance_name)
 
 
-class InitialInstructionsTool(Tool, ToolMarkerDoesNotRequireActiveProject):
+class InitialInstructionsTool(Tool, ToolMarkerCanRunDuringStartup, ToolMarkerDoesNotRequireActiveProject):
     """
     Provides instructions Serena usage (i.e. the 'Serena Instructions Manual')
     for clients that do not read the initial instructions when the MCP server is connected.

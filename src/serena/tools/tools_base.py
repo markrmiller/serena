@@ -96,6 +96,17 @@ class ToolMarkerDoesNotRequireActiveProject(ToolMarker):
     pass
 
 
+class ToolMarkerCanRunDuringStartup(ToolMarker):
+    """
+    Marker for tools that are safe to execute directly while the agent's serialized task executor
+    is busy with startup work such as language-server initialization.
+
+    This should only be used for tools that do not touch project state, language servers, editors,
+    or mutable caches. It prevents informational bootstrap tools from being queued behind a slow
+    or stuck language-server startup.
+    """
+
+
 class ToolMarkerOptional(ToolMarker):
     """
     Marker class for optional tools that are disabled by default.
@@ -472,6 +483,12 @@ class Tool(Component):
                 log.error(f"Error saving language server cache: {e}")
 
             return result
+
+        # Most tools run in the agent's serialized task executor so they do not race with each
+        # other or with language-server state. A small set of bootstrap-only tools may opt out so
+        # they can still answer while startup work such as JDTLS/Gradle import is in progress.
+        if isinstance(self, ToolMarkerCanRunDuringStartup):
+            return task()
 
         # execute the tool in the agent's task executor, with timeout
         try:
