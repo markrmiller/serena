@@ -196,7 +196,15 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             path = cls._get_persistence_path(hook)
             try:
                 with open(path, "rb") as f:
-                    return pickle.load(f)
+                    counter = pickle.load(f)
+                # Existing live sessions may have pickled ToolUseCounter objects
+                # from before Codex enforcement fields existed. Add defaults on
+                # load so the next hook in an old session does not crash.
+                if not hasattr(counter, "serena_required"):
+                    counter.serena_required = False
+                if not hasattr(counter, "serena_required_reason"):
+                    counter.serena_required_reason = ""
+                return counter
             except Exception:
                 return cls()
 

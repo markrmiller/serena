@@ -509,6 +509,21 @@ class TestToolUseCounter:
         assert loaded.n_recent_grep_uses == 2
         assert loaded.n_recent_read_file_uses == 1
 
+    def test_load_migrates_old_counter_pickle_without_codex_enforcement_fields(self, tmp_path: Path):
+        counter = ToolUseCounter(n_recent_grep_uses=2)
+        delattr(counter, "serena_required")
+        delattr(counter, "serena_required_reason")
+
+        hook_stub = type("HookStub", (), {"session_persistence_dir": str(tmp_path)})()
+        path = tmp_path / ToolUseCounter._FILE_NAME
+        path.write_bytes(pickle.dumps(counter))
+
+        loaded = ToolUseCounter.load(hook_stub)  # type: ignore[arg-type]
+
+        assert loaded.n_recent_grep_uses == 2
+        assert loaded.serena_required is False
+        assert loaded.serena_required_reason == ""
+
     def test_load_returns_fresh_counter_on_missing_file(self, tmp_path: Path):
         hook_stub = type("HookStub", (), {"session_persistence_dir": str(tmp_path / "nonexistent")})()
         loaded = ToolUseCounter.load(hook_stub)  # type: ignore[arg-type]
