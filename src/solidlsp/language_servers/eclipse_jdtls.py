@@ -279,7 +279,7 @@ class EclipseJDTLS(SolidLanguageServer):
         - resource_filters: Additional resource filter names for java.project.resourceFilters.
         - autobuild_enabled: Whether JDTLS/Eclipse autobuild is enabled (default: true)
         - generates_metadata_files_at_project_root: Whether JDTLS/Buildship may use Eclipse
-              metadata files such as .project at the project root (default: false). When true,
+              metadata files such as .project at the project root (default: true). When true,
               Serena pre-seeds the .project resource filters before JDTLS starts so Buildship's
               initial root refresh avoids filtered local-state directories.
         - intellicode_enabled: Whether to synchronously enable vscode-java IntelliCode integration
@@ -326,7 +326,7 @@ class EclipseJDTLS(SolidLanguageServer):
         import_exclusions: []  # additional java.import.exclusions globs
         resource_filters: []  # additional java.project.resourceFilters names
         autobuild_enabled: true
-        generates_metadata_files_at_project_root: false
+        generates_metadata_files_at_project_root: true
         intellicode_enabled: false
         intellicode_xmx: "1G"  # maximum heap size for the IntelliCode embedded JVM
         intellicode_xms: "100m"  # initial heap size for the IntelliCode embedded JVM
@@ -995,7 +995,7 @@ class EclipseJDTLS(SolidLanguageServer):
             ]:
                 assert os.path.exists(static_path), static_path
 
-            generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", False)
+            generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", True)
 
             cmd = [
                 jre_path,
@@ -1103,7 +1103,7 @@ class EclipseJDTLS(SolidLanguageServer):
         autobuild_enabled = self._custom_settings.get("autobuild_enabled", True)
         maven_import_enabled = self._custom_settings.get("maven_import_enabled", True)
         gradle_import_enabled = self._custom_settings.get("gradle_import_enabled", True)
-        generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", False)
+        generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", True)
 
         # Lombok-generated symbols (getX/setX/builder()/equals/hashCode/toString/...): JDTLS filters
         # these out of documentSymbol results by default. Without them, find_symbol/get_symbols_overview
@@ -1664,7 +1664,7 @@ class EclipseJDTLS(SolidLanguageServer):
         Eclipse metadata at project roots, write the same regex filter JDTLS would later create into
         each detected build project directory before JDTLS starts.
         """
-        if not self._custom_settings.get("generates_metadata_files_at_project_root", False):
+        if not self._custom_settings.get("generates_metadata_files_at_project_root", True):
             return
 
         root = Path(self.repository_root_path)

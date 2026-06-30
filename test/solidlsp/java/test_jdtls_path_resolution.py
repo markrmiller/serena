@@ -636,6 +636,29 @@ class TestInitializeParams:
         gradle_settings = params["initializationOptions"]["settings"]["java"]["import"]["gradle"]  # type: ignore[index]
         assert gradle_settings["annotationProcessing"]["enabled"] is False
 
+    def test_metadata_files_at_project_root_are_enabled_by_default(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path, {})
+
+        params = ls._get_initialize_params(str(repo))
+
+        java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        assert java_settings["import"]["generatesMetadataFilesAtProjectRoot"] is True
+
+    def test_metadata_files_at_project_root_can_be_disabled(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        ls = _make_jdtls_for_initialize_params(tmp_path, {"generates_metadata_files_at_project_root": False})
+        ls.repository_root_path = str(repo)
+
+        params = ls._get_initialize_params(str(repo))
+        ls._ensure_eclipse_project_filters()
+
+        java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
+        assert java_settings["import"]["generatesMetadataFilesAtProjectRoot"] is False
+        assert not (repo / ".project").exists()
+
     def test_additional_import_exclusions_resource_filters_and_autobuild_setting_are_applied(self, tmp_path: Path) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
