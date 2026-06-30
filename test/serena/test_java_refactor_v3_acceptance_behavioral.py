@@ -46,8 +46,11 @@ _READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "deadCodeScan",
         "resourceProviders",
         "frameworkDetect",
+        "frameworkReferences",
+        "frameworkParticipate",
         "scanMigrationOpportunities",
         "impactReport",
+        "transformationReport",
     }
 )
 
@@ -57,13 +60,39 @@ _READ_ONLY_TOOLS: frozenset[str] = frozenset(
 # family's codes below the threshold does.
 _REFUSAL_FAMILY_PREFIXES: dict[str, tuple[str, ...]] = {
     "workspace": ("workspace_",),
-    "deadcode/delete": ("deadcode_", "delete_", "source_root_", "no_roots", "invalid_min_confidence"),
-    "package": ("package_",),
-    "extract": ("extract_", "member_not_found", "no_members"),
+    "deadcode/delete": (
+        "deadcode_", "max_cascade_",
+        "delete_",
+        "source_root_",
+        "no_roots",
+        "invalid_min_confidence",
+        "malformed_move_source_root",
+    ),
+    "package": (
+        "package_",
+        "malformed_move_package",
+        "malformed_rename_package",
+        "move_package_failed",
+        "rename_package_failed",
+        "build_file_rewrite_unsupported",
+    ),
+    "extract": (
+        "extract_",
+        "member_not_found",
+        "no_members",
+        "insufficient_classes",
+        "source_type_not_found",
+        "unsupported_source_kind",
+        "ambiguous_member",
+        "invalid_member",
+        "no_sources",
+    ),
     "delegation": ("delegation_", "replace_inheritance_"),
     "inline": ("inline_", "not_private"),
     "anon/lambda": ("anon_", "lambda_"),
-    "recipe": ("recipe_",),
+    "recipe": ("recipe_", "malformed_recipe"),
+    "resource": ("resource_", "unsupported_resource_kind", "malformed_resource_edit_map"),
+    "sidecar/protocol": ("io_error", "missing_field", "unparseable_source", "non_editable_target"),
     # Cross-cutting refusals the live sidecar emits without a legacy planner prefix: the SPI reference-scan input
     # checks (resource/framework providers) and the javac diagnostic-delta validation gate any edit tool runs through.
     "scan/validation": ("resource_target_unresolved", "framework_target_unresolved", "new_compiler_errors"),
@@ -72,15 +101,17 @@ _REFUSAL_FAMILY_PREFIXES: dict[str, tuple[str, ...]] = {
 # Minimum number of distinct codes each family must register. These are conservative floors (the live catalogue has
 # more), chosen so the assertion fails if a whole family's registration is dropped or gutted.
 _REFUSAL_FAMILY_MIN_CODES: dict[str, int] = {
-    "workspace": 5,
-    "deadcode/delete": 4,
-    "package": 4,
-    "extract": 8,
-    "delegation": 8,
-    "inline": 10,
-    "anon/lambda": 8,
-    "recipe": 5,
-    "scan/validation": 3,
+    'workspace': 5,
+    'deadcode/delete': 4,
+    'package': 4,
+    'extract': 8,
+    'delegation': 8,
+    'inline': 10,
+    'anon/lambda': 8,
+    'recipe': 5,
+    'scan/validation': 3,
+    'resource': 2,
+    'sidecar/protocol': 4,
 }
 
 
@@ -189,7 +220,7 @@ def test_provenance_partition_matches_independent_tool_classification() -> None:
     # INDEPENDENTLY-declared split of the tool surface into edit-emitting (javac-delta) vs read-only (javac-facts).
     # If a regression mislabels a tool — tagging a read-only scan as javac-delta or an edit tool as javac-facts —
     # the two partitions diverge and this fails. Nothing here trusts the matrix's own booleans.
-    provenance = {row["tool"]: row["provenance"] for row in acceptance_matrix()}
+    provenance: dict[str, str] = {str(row["tool"]): str(row["provenance"]) for row in acceptance_matrix()}
 
     delta_tools = {tool for tool, prov in provenance.items() if prov == "javac-delta"}
     facts_tools = {tool for tool, prov in provenance.items() if prov == "javac-facts"}
@@ -208,7 +239,7 @@ def test_read_only_tools_carry_javac_facts_and_emit_no_edit() -> None:
     # Every read-only tool in the matrix carries provenance "javac-facts" — i.e. it is honestly NOT delta-validated
     # (it emits no edit) yet is still compiler-backed. Checked against the independent read-only set, so a read-only
     # tool that was wrongly promoted to an edit provenance is caught.
-    provenance = {row["tool"]: row["provenance"] for row in acceptance_matrix()}
+    provenance: dict[str, str] = {str(row["tool"]): str(row["provenance"]) for row in acceptance_matrix()}
     for tool in _READ_ONLY_TOOLS:
         assert tool in provenance, f"read-only tool {tool!r} is missing from the acceptance matrix"
         assert provenance[tool] == "javac-facts", f"{tool} is read-only but tagged {provenance[tool]!r}"
@@ -219,13 +250,15 @@ def test_edit_emitting_tools_are_exactly_the_delta_provenance_rows() -> None:
     # provenance partition must agree, and must be DISJOINT from the read-only surface. This cross-checks two
     # independently-maintained declarations of the same partition: a one-sided edit (adding a tool to the delta
     # registry but not the matrix, or vice versa) fails here.
-    delta_registry = set(edit_emitting_tools())
+    delta_registry: set[str] = {str(tool) for tool in edit_emitting_tools()}
     assert delta_registry, "edit-emitting tool registry must not be empty"
     assert delta_registry.isdisjoint(_READ_ONLY_TOOLS), (
         f"a tool is declared both edit-emitting and read-only: {delta_registry & _READ_ONLY_TOOLS}"
     )
 
-    matrix_delta = {row["tool"] for row in acceptance_matrix() if row["provenance"] == "javac-delta"}
+    matrix_delta: set[str] = {
+        str(row["tool"]) for row in acceptance_matrix() if row["provenance"] == "javac-delta"
+    }
     assert matrix_delta == delta_registry, (
         f"edit-emitting registry diverged from matrix javac-delta rows; "
         f"only-in-registry={delta_registry - matrix_delta}, only-in-matrix={matrix_delta - delta_registry}"
@@ -236,7 +269,7 @@ def test_every_matrix_tool_is_classified_edit_or_read_only() -> None:
     # Completeness: every tool that appears in the matrix is accounted for by exactly one of the two independent
     # behavioural partitions. A new tool added to the matrix without being classified as edit-emitting or read-only
     # is caught (it would otherwise carry an unverified provenance claim).
-    matrix_tools = {row["tool"] for row in acceptance_matrix()}
+    matrix_tools: set[str] = {str(row["tool"]) for row in acceptance_matrix()}
     classified = set(edit_emitting_tools()) | _READ_ONLY_TOOLS
     assert matrix_tools == classified, (
         f"matrix tools not behaviourally classified: unclassified={matrix_tools - classified}, "

@@ -165,6 +165,16 @@ class _JavaRefactorToolBase(EditingToolWithDiagnostics, ToolMarkerSymbolicEdit, 
         return self._finalize_result(result)
 
 
+class _JavaRefactorReadOnlyToolBase(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional, ToolMarkerBeta):
+    """Shared helpers for Java refactor tools that only inspect/report state."""
+
+    def _get_manager(self) -> JavaRefactorManager:
+        return self.create_java_refactor_client()
+
+    def _finalize_result(self, result: dict) -> str:
+        return json.dumps(result, indent=2)
+
+
 class JavaRefactorStatusTool(Tool, ToolMarkerSymbolicRead, ToolMarkerOptional, ToolMarkerBeta):
     """Reports readiness and diagnostics for Serena's optional Java-only refactoring sidecar."""
 

@@ -55,7 +55,8 @@ public final class TransformationWorkspaceManager {
         String build(String semanticTargetJson,
                      List<io.serena.javarefactor.edits.PlannerSupport.TextEdit> edits,
                      List<io.serena.javarefactor.edits.ResponseBuilder.FileOperation> fileOperations,
-                     List<String> warnings);
+                     List<String> warnings,
+                     String riskFactsJson);
     }
 
     /** Captures an opaque project-revision token over the workspace's touched files (clean-revision guard input). */
@@ -86,6 +87,7 @@ public final class TransformationWorkspaceManager {
     private final EditComposer composer;
 
     private final Map<String, TransformationWorkspace> workspaces = new LinkedHashMap<>();
+    private final Map<String, List<OperationRequest>> workspaceOperations = new LinkedHashMap<>();
     private final AtomicLong sequence = new AtomicLong(0);
 
     public TransformationWorkspaceManager(
@@ -146,7 +148,7 @@ public final class TransformationWorkspaceManager {
         }
 
         String previewJson = previewBuilder.build(
-                composed.semanticTargetJson(), composed.edits(), composed.fileOperations(), composed.warnings());
+                composed.semanticTargetJson(), composed.edits(), composed.fileOperations(), composed.warnings(), composed.riskFactsJson());
         String validatedJson = validator.validate("transformation", previewJson);
         if (!isAccepted(validatedJson)) {
             // Validation refused (the composed after-state did not compile): surface that refusal verbatim.
@@ -167,6 +169,7 @@ public final class TransformationWorkspaceManager {
                 workspaceId, goal, projectRoot, composed, revision, nowMillis);
         workspace.setValidatedAcceptedJson(validatedJson);
         workspaces.put(workspaceId, workspace);
+        workspaceOperations.put(workspaceId, List.copyOf(operations));
 
         TransformationWorkspace.Stats stats = workspace.computeStats();
         String summary = summaryFor(goal, stats);
@@ -180,6 +183,53 @@ public final class TransformationWorkspaceManager {
     // ── preview ────────────────────────────────────────────────────────────────────────────────────────────────────
 
     /** Returns the composed, validated workspace edit plus stats (the authoritative accepted JSON, augmented). */
+    public String addOperation(String workspaceId, OperationRequest operation, long nowMillis) {
+        evictExpired(nowMillis);
+        TransformationWorkspace existing = workspaces.get(workspaceId);
+        if (existing == null) {
+            return refusal("workspace_not_found", "transformation.addOperation requires an open workspaceId.");
+        }
+        if (existing.status() != TransformationWorkspace.Status.PREVIEW_READY) {
+            return refusal("workspace_not_open", "transformation.addOperation requires a preview-ready workspace.");
+        }
+        List<OperationRequest> operations = new ArrayList<>(workspaceOperations.getOrDefault(workspaceId, List.of()));
+        operations.add(operation);
+
+        List<TransformationStep> steps = new ArrayList<>();
+        for (OperationRequest request : operations) {
+            StepResult result = stepPlanner.plan(request.operation(), request.arguments());
+            if (result.isRefused()) {
+                return result.refusalJson();
+            }
+            steps.add(result.step());
+        }
+
+        EditComposer.ComposedEdit composed;
+        try {
+            composed = composer.compose(steps);
+        } catch (EditComposer.ComposeConflict conflict) {
+            return refusal("workspace_edit_conflict", conflict.getMessage());
+        }
+
+        String acceptedJson = previewBuilder.build(
+                composed.semanticTargetJson(), composed.edits(), composed.fileOperations(), composed.warnings(), composed.riskFactsJson());
+        String validatedJson = validator.validate("transformation", acceptedJson);
+        if (!isAccepted(validatedJson)) {
+            return validatedJson;
+        }
+        String revision = revisionCapturer.capture(touchedRelativePaths(composed));
+        if (revision == null || revision.isBlank()) {
+            return refusal("project_revision_unavailable", "Project revision capture failed for transformation workspace.");
+        }
+
+        TransformationWorkspace workspace = new TransformationWorkspace(
+                workspaceId, existing.goal(), projectRoot, composed, revision, existing.createdAtMillis());
+        workspace.setValidatedAcceptedJson(validatedJson);
+        workspaces.put(workspaceId, workspace);
+        workspaceOperations.put(workspaceId, List.copyOf(operations));
+        return augmentWithWorkspaceMeta(workspace, workspace.validatedAcceptedJson());
+    }
+
     public String preview(String workspaceId, long nowMillis) {
         evictExpired(nowMillis);
         TransformationWorkspace workspace = workspaces.get(workspaceId);
@@ -193,7 +243,8 @@ public final class TransformationWorkspaceManager {
 
     /**
      * Enforces the non-bypassable clean-revision guard, then returns the authoritative validated edit for the Python
-     * applier. The sidecar never writes files; the workspace is marked applied so a second apply refuses.
+     * applier. The sidecar never writes files and therefore never terminalizes the workspace as applied; the Python
+     * transactional applier owns the disk commit and retry semantics.
      *
      * @param expectedProjectRevision optional caller-pinned revision token to match the captured one
      */
@@ -225,16 +276,32 @@ public final class TransformationWorkspaceManager {
                     "expectedProjectRevision does not match the revision captured when the workspace was created.");
         }
 
-        workspace.markApplied();
         return augmentWithWorkspaceMeta(workspace, workspace.validatedAcceptedJson());
     }
 
     // ── cancel ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
+    /** Marks a prepared workspace applied after the external transactional disk commit has succeeded. */
+    public String ackApplied(String workspaceId, long nowMillis) {
+        evictExpired(nowMillis);
+        TransformationWorkspace workspace = workspaces.get(workspaceId);
+        if (workspace == null) {
+            return refusal("workspace_not_found", "No open transformation workspace '" + workspaceId + "' to acknowledge.");
+        }
+        if (workspace.status() == TransformationWorkspace.Status.CANCELLED) {
+            return refusal("workspace_cancelled", "Transformation workspace '" + workspaceId + "' was cancelled.");
+        }
+        if (workspace.status() != TransformationWorkspace.Status.APPLIED) {
+            workspace.markApplied();
+        }
+        return "{\"accepted\":true,\"workspaceId\":" + JsonUtil.quote(workspaceId) + ",\"status\":\"applied\"}";
+    }
+
     /** Evicts a workspace. Idempotent: a missing workspace yields a terminal refusal rather than an error. */
     public String cancel(String workspaceId, long nowMillis) {
         evictExpired(nowMillis);
         TransformationWorkspace removed = workspaces.remove(workspaceId);
+        workspaceOperations.remove(workspaceId);
         if (removed == null) {
             return refusal("workspace_not_found",
                     "No open transformation workspace '" + workspaceId + "' to cancel.");
@@ -297,7 +364,12 @@ public final class TransformationWorkspaceManager {
         // TestGraph supplies the authoritative likely-affected tests for every touched type, which the report merges
         // into its tests section. Building the graph routes through the shared ReachabilityGraphCache the facts analyzer
         // already populated, so this reuses — never duplicates — the project walk.
-        Set<String> graphLikelyAffectedTests = graphLikelyAffectedTests(model, touched);
+        Set<String> graphLikelyAffectedTests;
+        try {
+            graphLikelyAffectedTests = graphLikelyAffectedTests(model, touched);
+        } catch (IllegalStateException ex) {
+            return refusal("impact_report_graph_unavailable", ex.getMessage());
+        }
         String operation = workspace.goal() == null || workspace.goal().isBlank()
                 ? "transformation" : workspace.goal();
         String reportJson = TransformationImpactReport.build(
@@ -330,9 +402,8 @@ public final class TransformationWorkspaceManager {
                 }
             }
         } catch (Exception ignored) {
-            // The graph is an enrichment source for the tests section; if it cannot be built, the report still stands on
-            // the facts-derived likelyAffectedTests. Never let graph construction fail an otherwise-valid report.
-            return Set.of();
+            // V3 impact reports are complete-or-refused: graph-backed test impact must not silently degrade to zero.
+            throw new IllegalStateException("graph_unavailable");
         }
         return result;
     }
@@ -358,7 +429,7 @@ public final class TransformationWorkspaceManager {
         workspaces.entrySet().removeIf(entry -> nowMillis - entry.getValue().createdAtMillis() > ttlMillis);
     }
 
-    private static List<String> touchedRelativePaths(EditComposer.ComposedEdit composed) {
+    private List<String> touchedRelativePaths(EditComposer.ComposedEdit composed) {
         java.util.LinkedHashSet<String> touched = new java.util.LinkedHashSet<>();
         for (var op : composed.fileOperations()) {
             if (op.path() != null) {
@@ -375,7 +446,10 @@ public final class TransformationWorkspaceManager {
         // via their string form only when the composer already produced relative file-op paths. Edits' files are covered
         // by their owning file operations for moved files; for in-place edits the capturer also accepts absolute paths.
         for (var edit : composed.edits()) {
-            touched.add(edit.file().toAbsolutePath().normalize().toString());
+            Path path = edit.file().toAbsolutePath().normalize();
+            touched.add(path.startsWith(projectRoot)
+                    ? projectRoot.relativize(path).toString().replace('\\', '/')
+                    : path.toString());
         }
         return new ArrayList<>(touched);
     }

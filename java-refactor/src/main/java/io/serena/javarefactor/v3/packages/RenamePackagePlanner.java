@@ -541,9 +541,48 @@ public final class RenamePackagePlanner {
         Set<String> names = new LinkedHashSet<>();
         Matcher matcher = TYPE_DECL.matcher(source);
         while (matcher.find()) {
-            names.add(matcher.group(1));
+            if (braceDepth(source, matcher.start()) == 0) {
+                names.add(matcher.group(1));
+            }
         }
         return names;
+    }
+
+    private static int braceDepth(String source, int endExclusive) {
+        int depth = 0;
+        boolean inString = false;
+        boolean inChar = false;
+        boolean inLineComment = false;
+        boolean inBlockComment = false;
+        for (int i = 0; i < endExclusive; i++) {
+            char c = source.charAt(i);
+            char next = i + 1 < endExclusive ? source.charAt(i + 1) : '\0';
+            if (inLineComment) {
+                if (c == '\n') inLineComment = false;
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') { inBlockComment = false; i++; }
+                continue;
+            }
+            if (inString) {
+                if (c == '\\') i++;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (inChar) {
+                if (c == '\\') i++;
+                else if (c == '\'') inChar = false;
+                continue;
+            }
+            if (c == '/' && next == '/') { inLineComment = true; i++; continue; }
+            if (c == '/' && next == '*') { inBlockComment = true; i++; continue; }
+            if (c == '"') { inString = true; continue; }
+            if (c == '\'') { inChar = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}' && depth > 0) depth--;
+        }
+        return depth;
     }
 
     // ── Path helpers ───────────────────────────────────────────────────────────────────────────────────────────────

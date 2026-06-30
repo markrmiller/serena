@@ -1,5 +1,6 @@
 package io.serena.javarefactor.v3.packages;
 
+import io.serena.javarefactor.v3.graph.GraphCacheLimits;
 import java.util.Map;
 
 /**
@@ -38,11 +39,14 @@ public record PackageRewritePolicy(
         boolean scanJson,
         boolean scanServiceLoader,
         boolean rewriteExactClassNames,
-        boolean rewritePackagePrefixes) {
+        boolean rewritePackagePrefixes,
+        boolean applyMediumConfidence,
+        long maxResourceFileBytes) {
 
     /** The all-defaults policy, matching the Python {@code V3PackagesConfig}/{@code V3ResourcesConfig} field defaults. */
     public static PackageRewritePolicy defaults() {
-        return new PackageRewritePolicy(true, true, false, true, true, true, true, true, true, true, false);
+        return new PackageRewritePolicy(true, true, false, true, true, true, true, true, true, true, false, false,
+                GraphCacheLimits.DEFAULT_MAX_RESOURCE_FILE_BYTES);
     }
 
     /**
@@ -62,10 +66,25 @@ public record PackageRewritePolicy(
             javaRefactor = asMap(effectiveConfig.get("javaRefactor"));
         }
         Map<?, ?> v3 = asMap(javaRefactor.get("v3"));
+        if (v3.isEmpty()) {
+            v3 = asMap(effectiveConfig.get("v3"));
+        }
         Map<?, ?> packages = asMap(v3.get("packages"));
         Map<?, ?> resources = asMap(v3.get("resources"));
+        Map<?, ?> graph = asMap(v3.get("graph"));
         // A disabled resources block turns resource rewriting off regardless of the packages.rewrite_resources flag.
         boolean resourcesEnabled = boolValue(resources.get("enabled"), true);
+        Object rewriteExactClassNames = resources.containsKey("rewrite_exact_class_names")
+                ? resources.get("rewrite_exact_class_names")
+                : packages.get("rewrite_exact_class_names");
+        boolean resourcePackagePrefixes = boolValue(
+                resources.get("rewrite_package_prefixes"),
+                d.rewritePackagePrefixes);
+        boolean packagePrefixes = boolValue(packages.get("rewrite_package_prefixes"), false);
+        String autoApplyConfidence = String.valueOf(
+                resources.containsKey("auto_apply_confidence")
+                        ? resources.get("auto_apply_confidence")
+                        : "high");
         return new PackageRewritePolicy(
                 boolValue(packages.get("rewrite_module_info"), d.rewriteModuleInfo),
                 resourcesEnabled && boolValue(packages.get("rewrite_resources"), d.rewriteResources),
@@ -76,8 +95,12 @@ public record PackageRewritePolicy(
                 boolValue(resources.get("scan_yaml"), d.scanYaml),
                 boolValue(resources.get("scan_json"), d.scanJson),
                 boolValue(resources.get("scan_service_loader"), d.scanServiceLoader),
-                boolValue(packages.get("rewrite_exact_class_names"), d.rewriteExactClassNames),
-                boolValue(packages.get("rewrite_package_prefixes"), d.rewritePackagePrefixes));
+                boolValue(rewriteExactClassNames, d.rewriteExactClassNames),
+                resourcePackagePrefixes || packagePrefixes,
+                "medium".equals(autoApplyConfidence)
+                        || resourcePackagePrefixes
+                        || packagePrefixes,
+                numberValue(graph.get("max_resource_file_bytes"), d.maxResourceFileBytes));
     }
 
     /**
@@ -107,11 +130,27 @@ public record PackageRewritePolicy(
                 scanJson,
                 scanServiceLoader,
                 rewriteExactClassNames,
-                rewritePackagePrefixes);
+                rewritePackagePrefixes,
+                applyMediumConfidence,
+                maxResourceFileBytes);
     }
 
     private static Map<?, ?> asMap(Object value) {
         return value instanceof Map<?, ?> map ? map : Map.of();
+    }
+
+    private static long numberValue(Object value, long defaultValue) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Long.parseLong(text.trim());
+            } catch (NumberFormatException ignored) {
+                return defaultValue;
+            }
+        }
+        return defaultValue;
     }
 
     private static boolean boolValue(Object value, boolean defaultValue) {

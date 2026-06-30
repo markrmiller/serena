@@ -227,3 +227,32 @@ def test_deep_inline_max_call_sites_at_count_proceeds(
     assert result.get("accepted") is True, result
     assert result.get("diagnosticDeltaValidated") is True, result
     assert any(path.endswith("Main.java") for path in _changed_paths(result)), result
+
+def test_deep_inline_supports_method_name_only_and_plan_delete_alias(
+    sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str
+) -> None:
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Main.java",
+        "package com.acme;\n"
+        "final class Main {\n"
+        "    private int twice(int value) {\n"
+        "        return value * 2;\n"
+        "    }\n"
+        "    int run() {\n"
+        "        return twice(21);\n"
+        "    }\n"
+        "}\n",
+    )
+    with _inline(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.deep_inline_method(
+            "src/main/java/com/acme/Main.java",
+            0,
+            method_name="twice",
+            delete_inlined_method=True,
+        )
+
+    assert result.get("accepted") is True, result
+    assert result.get("diagnosticDeltaValidated") is True, result
+    changes = result.get("workspaceEdit", {}).get("changes", [])
+    assert any(change.get("path", "").endswith("Main.java") for change in changes), result

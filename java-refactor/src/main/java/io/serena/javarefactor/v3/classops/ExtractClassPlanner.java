@@ -22,11 +22,14 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.lang.model.element.Modifier;
 
@@ -58,7 +61,7 @@ import javax.lang.model.element.Modifier;
  * stays encapsulated while external callers reach the moved behavior through the accessor. With
  * {@code updateUsages=false} the old member-attributed refusal ({@code extract_class_external_usage}) is preserved.
  */
-public final class ExtractClassPlanner {
+public class ExtractClassPlanner {
 
     private final Path projectRoot;
     private final JavaProjectModel model;
@@ -132,7 +135,8 @@ public final class ExtractClassPlanner {
                 "extractClass", plan.edits(),
                 List.of(FileOperation.create(plan.newClassRelative(), plan.newClassSource())),
                 List.copyOf(plan.publicApiChanges()),
-                "{\"operation\":\"extractClass\",\"newClass\":" + JsonUtil.quote(plan.newClassFqn()) + "}");
+                "{\"operation\":\"extractClass\",\"newClass\":" + JsonUtil.quote(plan.newClassFqn()) + "}",
+                riskFactsJson(plan.publicApiChanges()));
     }
 
     private ExtractClassPlan compute(Map<String, Object> fields) throws IOException, ProjectPathResolver.Violation {
@@ -147,6 +151,7 @@ public final class ExtractClassPlanner {
 
         Path sourceFile = ProjectPathResolver.resolveProjectRelative(
                 projectRoot, requireString(fields, "relativePath"), "relativePath");
+        refuseMovedFieldInitializerDependencies(sourceFile, memberSelectors);
         String relativePath = PlannerSupport.relative(projectRoot, sourceFile);
 
         try (SemanticIndex index = SemanticIndex.open(model, relativePath)) {
@@ -295,7 +300,7 @@ public final class ExtractClassPlanner {
                     ? newClassName : targetPackage + "." + newClassName;
             List<SemanticField> retainedFieldList = new ArrayList<>(retainedFieldDeps.values());
             List<SemanticMethod> retainedMethodList = new ArrayList<>(retainedMethodDeps.values());
-            String newClassSource = synthesizeCollaborator(index, source0, newClassName, targetPackage,
+            String newClassSource = synthesizeCollaborator(index, source0, newClassName, targetPackage, sourcePackage,
                     movedFields, injectedFields, retainedFieldList, movedMethods, retainedMethodList,
                     needsBackReference, source.name(), leaveDelegateMethods);
 
@@ -558,11 +563,14 @@ public final class ExtractClassPlanner {
         }
     }
 
-    private String synthesizeCollaborator(SemanticIndex index, String source0, String newClassName, String targetPackage,
+    private String synthesizeCollaborator(SemanticIndex index, String source0, String newClassName, String targetPackage, String sourcePackage,
             List<SemanticField> movedFields, List<SemanticField> injectedFields, List<SemanticField> retainedFieldDeps,
             List<SemanticMethod> movedMethods, List<SemanticMethod> retainedMethodDeps, boolean needsBackReference,
             String sourceSimpleName, boolean leaveDelegateMethods) {
         StringBuilder out = new StringBuilder();
+        String sourceOwnerType = targetPackage.equals(sourcePackage) || sourcePackage.isBlank()
+                ? sourceSimpleName
+                : sourcePackage + "." + sourceSimpleName;
         if (!targetPackage.isEmpty()) {
             out.append("package ").append(targetPackage).append(";\n\n");
         }
@@ -584,7 +592,7 @@ public final class ExtractClassPlanner {
         }
         // KEEP_DELEGATE_CALL: a back-reference to the source so the collaborator can call retained source methods.
         if (needsBackReference) {
-            out.append("    private final ").append(sourceSimpleName).append(" owner;\n");
+            out.append("    private final ").append(sourceOwnerType).append(" owner;\n");
         }
         // Generated constructor for the injected moved fields, the passed-as-parameter retained fields, and the optional
         // back-reference — each assigned from a same-named parameter.
@@ -598,7 +606,7 @@ public final class ExtractClassPlanner {
                 params.add(retained.type() + " " + retained.name());
             }
             if (needsBackReference) {
-                params.add(sourceSimpleName + " owner");
+                params.add(sourceOwnerType + " owner");
             }
             out.append("    public ").append(newClassName).append('(').append(String.join(", ", params)).append(") {\n");
             for (SemanticField field : injectedFields) {
@@ -708,6 +716,50 @@ public final class ExtractClassPlanner {
             }
         }
         return root;
+    }
+
+    private static void refuseMovedFieldInitializerDependencies(Path sourceFile, List<String> memberSelectors) {
+        String source;
+        try {
+            source = Files.readString(sourceFile);
+        } catch (IOException e) {
+            return;
+        }
+        Set<String> selected = new HashSet<>();
+        for (String selector : memberSelectors) {
+            selected.add(simpleSelectorName(selector));
+        }
+        Map<String, String> initializers = new LinkedHashMap<>();
+        Matcher fields = Pattern.compile("(?m)^\\s*(?:private|protected|public)?\\s*(?:static\\s+|final\\s+)*[\\w<>\\[\\]., ?]+\\s+(\\w+)\\s*=\\s*([^;]+);").matcher(source);
+        while (fields.find()) {
+            initializers.put(fields.group(1), fields.group(2));
+        }
+        for (Map.Entry<String, String> entry : initializers.entrySet()) {
+            boolean entrySelected = selected.contains(entry.getKey());
+            for (String candidate : initializers.keySet()) {
+                boolean candidateSelected = selected.contains(candidate);
+                if (entrySelected == candidateSelected) {
+                    continue;
+                }
+                if (Pattern.compile("\\b" + Pattern.quote(candidate) + "\\b").matcher(entry.getValue()).find()) {
+                    if (entrySelected) {
+                        throw new ClassOpsRefusal("extract_class_unselected_field_dependency",
+                                "Selected field '" + entry.getKey() + "' initializer depends on retained field '" + candidate + "'.");
+                    }
+                    throw new ClassOpsRefusal("extract_class_retained_field_dependency",
+                            "Retained field '" + entry.getKey() + "' initializer depends on selected field '" + candidate + "'.");
+                }
+            }
+        }
+    }
+
+    private static String simpleSelectorName(String selector) {
+        int paren = selector.indexOf('(');
+        if (paren >= 0) {
+            selector = selector.substring(0, paren);
+        }
+        int dot = selector.lastIndexOf('.');
+        return dot >= 0 ? selector.substring(dot + 1) : selector;
     }
 
     private static String requireString(Map<String, Object> fields, String key) {

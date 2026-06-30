@@ -80,12 +80,14 @@ public final class DeepInlineMethodPlanner {
         int line = InlineRefactorSupport.intField(fields, "line", -1);
         int column = InlineRefactorSupport.intField(fields, "column", -1);
         String methodName = InlineRefactorSupport.optionalString(fields, "methodName");
-        boolean deleteMethod = InlineRefactorSupport.boolField(fields, "deleteMethod", false);
+        boolean deleteMethod = InlineRefactorSupport.boolField(fields, "deleteMethod", false)
+                || InlineRefactorSupport.boolField(fields, "deleteInlinedMethod", false)
+                || InlineRefactorSupport.boolField(fields, "delete_inlined_method", false);
         // Effective limit: explicit per-call value wins, then configured default (injected by Main as maxCallSites from
         // java_refactor.v3.inline.max_call_sites), then the hard-coded fallback.
         int maxCallSites = InlineRefactorSupport.intField(fields, "maxCallSites", DEFAULT_MAX_CALL_SITES);
-        if (line <= 0) {
-            throw new InlineRefactorRefusal("missing_field", "line (1-based) is required.");
+        if (line <= 0 && (methodName == null || methodName.isBlank())) {
+            throw new InlineRefactorRefusal("missing_field", "line (1-based) is required unless methodName is supplied.");
         }
         try (SemanticIndex index = SemanticIndex.open(model, relativePath)) {
             DeepInlineResult result = new DeepInlineIndex(index)

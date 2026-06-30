@@ -36,12 +36,21 @@ final class PreviewDiagnosticValidator {
         try {
             Map<String, Object> preview = Json.parseObject(previewJson);
             Charset charset = SemanticIndex.charsetOf(model);
+            OverlayProtocol staged = overlayProtocolFromPreview(model.projectRoot(), preview, charset);
             JavacSession.DiagnosticReport before = javac.collectDiagnosticReport(model, emptyOverlay(model));
-            JavacSession.DiagnosticReport after = javac.collectDiagnosticReport(model, overlayFromPreview(model.projectRoot(), preview, charset));
+            JavacSession.DiagnosticReport after = javac.collectDiagnosticReport(model, staged.overlay());
             DiagnosticDelta delta = DiagnosticDelta.from(before, after);
             if (!delta.newErrors().isEmpty()) {
                 return refusalJson(operation, delta, applyRequested, "new_compiler_errors",
                         "Refactor would introduce javac ERROR diagnostics.");
+            }
+            io.serena.javarefactor.v3.validation.V3ValidationFindings.Result validationFindings =
+                    io.serena.javarefactor.v3.validation.V3ValidationFindings.collect(
+                            model, staged.changedFiles(), staged.deletedFiles(), staged.renamedFiles());
+            if (!validationFindings.isReady()) {
+                return refusalJson(operation, delta, applyRequested, "validation_findings_not_ready",
+                        "Refactor would leave blocking non-compiler validation findings:\n"
+                                + String.join("\n", validationFindings.blockingFindings()));
             }
             // G002: under complete-analysis (the default), an accepted preview/apply must leave the after-state with NO
             // javac errors — not merely no NEW errors. Pre-existing errors that the refactor neither introduced nor
@@ -71,17 +80,31 @@ final class PreviewDiagnosticValidator {
     }
 
     private FileOverlay overlayFromPreview(Path projectRoot, Map<String, Object> preview, Charset charset) throws IOException {
+        return overlayProtocolFromPreview(projectRoot, preview, charset).overlay();
+    }
+
+    private OverlayProtocol overlayProtocolFromPreview(Path projectRoot, Map<String, Object> preview, Charset charset)
+            throws IOException {
         Object workspaceEditValue = preview.get("workspaceEdit");
         if (!(workspaceEditValue instanceof Map<?, ?> workspaceEdit)) {
-            return FileOverlay.fromProtocol(projectRoot, Map.of(), List.of(), List.of());
+            return new OverlayProtocol(FileOverlay.fromProtocol(projectRoot, Map.of(), List.of(), List.of()),
+                    Map.of(), List.of(), List.of());
         }
 
         Map<String, Object> changedFiles = changedFiles(projectRoot, workspaceEdit, charset);
         List<Object> deletedFiles = new ArrayList<>();
         List<Object> renamedFiles = new ArrayList<>();
         collectFileOperations(projectRoot, workspaceEdit, changedFiles, deletedFiles, renamedFiles, charset);
-        return FileOverlay.fromProtocol(projectRoot, changedFiles, deletedFiles, renamedFiles);
+        return new OverlayProtocol(
+                FileOverlay.fromProtocol(projectRoot, changedFiles, deletedFiles, renamedFiles),
+                changedFiles, deletedFiles, renamedFiles);
     }
+
+    private record OverlayProtocol(
+            FileOverlay overlay,
+            Map<String, Object> changedFiles,
+            List<Object> deletedFiles,
+            List<Object> renamedFiles) {}
 
     private Map<String, Object> changedFiles(Path projectRoot, Map<?, ?> workspaceEdit, Charset charset) throws IOException {
         Map<String, Object> changedFiles = new LinkedHashMap<>();

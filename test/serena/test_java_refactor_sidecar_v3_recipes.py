@@ -6,7 +6,7 @@ transactional edit). Unlike the pure-Python unit tests in ``test_java_refactor_v
 and engine in isolation), these prove the two manager contracts:
 
 * ``scan_migration_opportunities`` resolves a built-in or inline recipe, returns the grouped matches, and writes NOTHING
-  (no javac — there is no edit to validate), mirroring ``find_dead_code``;
+  (no before/after javac diagnostic delta — there is no edit to validate; analysis still uses javac facts), mirroring ``find_dead_code``;
 * ``apply_refactor_recipe`` composes a transactional edit and routes it through the JAVAC VALIDATION BRIDGE so an accepted
   result carries a REAL before/after diagnostic delta (``diagnosticDeltaValidated`` true) plus the grouped ``matches`` /
   ``summary``, while an edit that would break compilation is REFUSED with newly-introduced compiler errors.
@@ -447,6 +447,7 @@ def test_recipe_apply_allows_review_required_matches_only_with_explicit_approval
         "recipeId": "demo",
         "stats": {"matches": 1, "applied": 1, "skipped": 0, "refused": 0},
         "matches": [{"risk": "REVIEW_REQUIRED"}],
+        "groups": {"byRisk": [{"key": "REVIEW_REQUIRED", "matches": [{"risk": "REVIEW_REQUIRED"}]}]},
         "summary": {"filesChanged": 1},
         "edit": {"format": "serena-workspace-edit-v1", "changes": []},
     }

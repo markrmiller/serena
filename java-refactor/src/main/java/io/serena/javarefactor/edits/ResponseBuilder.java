@@ -41,6 +41,10 @@ public final class ResponseBuilder {
             return new FileOperation("delete", path, null, null, oldSha256, null);
         }
 
+        public static FileOperation deleteDirectory(String path) {
+            return new FileOperation("deleteDirectory", path, null, null, null, null);
+        }
+
         public static FileOperation rename(String oldPath, String newPath, String oldSha256) {
             return new FileOperation("rename", null, oldPath, newPath, oldSha256, null);
         }
@@ -51,6 +55,7 @@ public final class ResponseBuilder {
                         + ",\"content\":" + JsonUtil.quote(content == null ? "" : content) + "}";
                 case "delete" -> "{\"kind\":\"delete\",\"path\":" + JsonUtil.quote(path)
                         + ",\"oldSha256\":" + JsonUtil.quote(oldSha256) + "}";
+                case "deleteDirectory" -> "{\"kind\":\"deleteDirectory\",\"path\":" + JsonUtil.quote(path) + "}";
                 case "rename" -> "{\"kind\":\"rename\",\"oldPath\":" + JsonUtil.quote(oldPath)
                         + ",\"newPath\":" + JsonUtil.quote(newPath) + ",\"oldSha256\":" + JsonUtil.quote(oldSha256) + "}";
                 default -> throw new IllegalArgumentException("unknown file operation kind: " + kind);

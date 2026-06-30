@@ -21,6 +21,22 @@ final class FrameworkPlugins {
     private FrameworkPlugins() {
     }
 
+    private static String ownerType(String symbol) {
+        if (symbol == null) {
+            return null;
+        }
+        int marker = symbol.indexOf('#');
+        return marker > 0 ? symbol.substring(0, marker) : symbol;
+    }
+
+    private static String memberName(String symbol) {
+        if (symbol == null) {
+            return null;
+        }
+        int marker = symbol.indexOf('#');
+        return marker > 0 && marker + 1 < symbol.length() ? symbol.substring(marker + 1) : null;
+    }
+
     /** Base plugin holding the framework id + annotation→role map sourced from the shared catalog. */
     private abstract static class BasePlugin implements FrameworkPlugin {
         private final String id;
@@ -206,6 +222,14 @@ final class FrameworkPlugins {
                             validateEntityMetadata(occ, context, out);
                         }
                     }
+                    case RENAME_FIELD, ENCAPSULATE_FIELD -> {
+                        String ownerType = ownerType(change.targetFqn());
+                        if (entityType && enclosing.equals(ownerType)) {
+                            out.warn("JPA access strategy risk on '" + change.targetFqn()
+                                    + "': field/property access can change persistence semantics; review @Access, @Id placement, "
+                                    + "and persistence/ORM XML before applying this member refactor.");
+                        }
+                    }
                     default -> {
                         // no participation for other kinds
                     }
@@ -260,18 +284,27 @@ final class FrameworkPlugins {
         @Override
         public FrameworkParticipation participate(SymbolChange change, TransformationContext context) {
             FrameworkParticipation.Builder out = new FrameworkParticipation.Builder();
-            if (change.kind() != SymbolChange.Kind.RENAME_TYPE) {
+            if (change.kind() != SymbolChange.Kind.RENAME_TYPE
+                    && change.kind() != SymbolChange.Kind.RENAME_FIELD
+                    && change.kind() != SymbolChange.Kind.ENCAPSULATE_FIELD) {
                 return out.build();
             }
+            String affectedType = change.kind() == SymbolChange.Kind.RENAME_TYPE ? change.targetFqn() : ownerType(change.targetFqn());
+            String affectedMember = memberName(change.targetFqn());
             for (AnnotationOccurrence occ : context.annotations()) {
                 if (!owns(occ.annotationFqn())) {
                     continue;
                 }
-                if (!occ.enclosingTypeFqn().equals(change.targetFqn())) {
+                if (!occ.enclosingTypeFqn().equals(affectedType)) {
                     continue;
                 }
                 String role = roleOf(occ.annotationFqn());
-                if ("JSON_TYPE_NAME".equals(role) || "JSON_SUB_TYPES".equals(role)) {
+                if ((change.kind() == SymbolChange.Kind.RENAME_FIELD || change.kind() == SymbolChange.Kind.ENCAPSULATE_FIELD)
+                        && affectedMember != null && affectedMember.equals(occ.elementName())) {
+                    out.warn("Jackson @" + occ.annotationFqn() + " on '" + change.targetFqn()
+                            + "': field rename/encapsulation can change serialized property access semantics; preserve "
+                            + "the wire name explicitly with @JsonProperty or review the JSON contract.");
+                } else if ("JSON_TYPE_NAME".equals(role) || "JSON_SUB_TYPES".equals(role)) {
                     out.warn("Jackson @" + occ.annotationFqn() + " on '" + occ.enclosingTypeFqn()
                             + "': the serialized type name is NOT changed by this rename — confirm wire compatibility"
                             + " before changing the JSON type id.");

@@ -34,17 +34,19 @@ class CapabilityRegistryTest {
     // the refactorSessions capability, and every V2 op (all blockers G001-G017 resolved). Any divergence from this set
     // -- a dropped op or a newly-added op -- must be reflected here, making registry changes test-visible.
     private static final Set<String> EXPECTED_READY_OPERATIONS = Set.of(
-            // V1 stable
+            // V1/V2 ready operations
             "semanticRename", "safeDelete", "moveTopLevelType", "inlineLocalVariable", "inlineConstant",
-            // session capability
-            "refactorSessions",
-            // stable alias of semanticRename advertised for V2 plan parity (G003)
-            "rename",
-            // V2 operations (every entry of V2_OPERATIONS)
-            "inlineMethod", "changeSignature", "introduceParameter", "moveStaticMember", "moveInstanceMethod",
-            "pullUpMember", "pushDownMember", "extractMethod", "extractInterface", "introduceField", "encapsulateField",
-            // V3 operations (validated like V2: real javac before/after delta required before an accepted preview)
-            "renamePackage", "movePackage", "moveSourceRoot");
+            "inlineMethod", "refactorSessions", "moveStaticMember", "moveInstanceMethod", "extractInterface",
+            "introduceField", "encapsulateField", "changeSignature", "introduceParameter", "pullUpMember",
+            "pushDownMember", "extractMethod", "rename",
+            // V3 ready operations
+            "renamePackage", "movePackage", "moveSourceRoot", "transformation.createWorkspace",
+            "transformation.addOperation", "transformation.addSession", "transformation.preview", "transformation.apply", "transformation.ackApply", "transformation.cancel",
+            "transformation.list", "transformation.report", "deletion.propagateSafeDelete", "deletion.findDeadCode",
+            "classRefactor.extractClass", "classRefactor.extractSuperclass", "classRefactor.replaceInheritanceWithDelegation",
+            "conversions.anonymousToLambda", "conversions.lambdaToMethodReference", "inlineRefactor.deepInlineMethod",
+            "recipes.scanMigrationOpportunities", "recipes.applyRecipe", "resources.findReferences", "resources.planEdits",
+            "frameworks.detect", "frameworks.findReferences", "frameworks.participate", "impact.facts", "graph.build");
 
     @SuppressWarnings("unchecked")
     private static Set<String> readyOperations() throws Exception {

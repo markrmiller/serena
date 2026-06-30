@@ -29,7 +29,11 @@ public record SymbolChange(Kind kind, String targetFqn, String newName) {
         /** A package is being renamed. */
         RENAME_PACKAGE,
         /** A whole-project dead-code scan is running; plugins contribute framework-managed reachability roots. */
-        DEAD_CODE_SCAN
+        DEAD_CODE_SCAN,
+        /** A field/member is being renamed; {@link #targetFqn()} is encoded as {@code owner.Type#field}. */
+        RENAME_FIELD,
+        /** A field is being encapsulated behind accessors; {@link #targetFqn()} is encoded as {@code owner.Type#field}. */
+        ENCAPSULATE_FIELD
     }
 
     /** A pending safe-delete of {@code targetFqn}. */
@@ -50,5 +54,15 @@ public record SymbolChange(Kind kind, String targetFqn, String newName) {
     /** A whole-project dead-code scan; plugins contribute their framework-managed reachability roots. */
     public static SymbolChange deadCodeScan() {
         return new SymbolChange(Kind.DEAD_CODE_SCAN, null, null);
+    }
+
+    /** A pending field/member rename in {@code ownerTypeFqn#fieldName}. */
+    public static SymbolChange renameField(String ownerTypeFqn, String fieldName, String newName) {
+        return new SymbolChange(Kind.RENAME_FIELD, ownerTypeFqn + "#" + fieldName, newName);
+    }
+
+    /** A pending field encapsulation in {@code ownerTypeFqn#fieldName}. */
+    public static SymbolChange encapsulateField(String ownerTypeFqn, String fieldName) {
+        return new SymbolChange(Kind.ENCAPSULATE_FIELD, ownerTypeFqn + "#" + fieldName, null);
     }
 }

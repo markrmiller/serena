@@ -23,7 +23,7 @@ have two tools and both are exercised):
     G002 transformationGraph       manager.transformation_graph()                            (javac-facts)
     G003 renamePackage / movePackage / moveSourceRoot   sidecar preview ops                 (javac-delta)
     G004 propagatingSafeDelete / deadCodeScan           manager safe-delete + dead-code scan (delta / facts)
-    G005 resourceProviders / frameworkDetect            resources.findReferences / frameworks.detect (facts)
+    G005 resourceProviders / frameworkDetect / frameworkReferences  resources.findReferences / frameworks.detect (facts)
     G006 extractClass / extractSuperclass               manager extract ops                  (javac-delta)
     G007 replaceInheritanceWithDelegation               manager delegation op                (javac-delta)
     G008 deepInlineMethod                               manager inline op                    (javac-delta)
@@ -645,12 +645,12 @@ def test_g009_convert_lambda_to_method_reference_invariants_from_live_result(
     sidecar_jar: Path, tmp_path: Path, monkeypatch
 ) -> None:
     project = tmp_path / "g009_lambda"
-    # a pass-through lambda `s -> System.out.println(s)` converts to `System.out::println`.
+    # a pass-through lambda over an effectively-final receiver converts to a bound method reference.
     _write(
         project,
         f"{JDIR}/Main.java",
         "package com.acme.app;\nimport java.util.function.Consumer;\npublic class Main {\n"
-        "    public Consumer<String> make() {\n        return s -> System.out.println(s);\n    }\n}\n",
+        "    public Consumer<String> make(java.io.PrintStream out) {\n        return s -> out.println(s);\n    }\n}\n",
     )
     # a non-pass-through lambda (transforms its argument) is refused.
     _write(
@@ -835,6 +835,7 @@ def test_g001_g011_workspace_and_impact_report_invariants_from_live_result(
 _HARNESS_DRIVEN_TOOLS = frozenset(
     {
         "transformationWorkspace",
+        "transformationReport",
         "transformationGraph",
         "renamePackage",
         "movePackage",
@@ -843,6 +844,8 @@ _HARNESS_DRIVEN_TOOLS = frozenset(
         "deadCodeScan",
         "resourceProviders",
         "frameworkDetect",
+        "frameworkReferences",
+        "frameworkParticipate",
         "extractClass",
         "extractSuperclass",
         "replaceInheritanceWithDelegation",

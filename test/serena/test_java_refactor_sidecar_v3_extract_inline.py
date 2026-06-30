@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 
 from serena.config.serena_config import JavaRefactorConfig, LanguageBackend
+from serena.java_refactor.client import JavaRefactorClient
 from serena.java_refactor.manager import JavaRefactorManager
+from serena.java_refactor.models import JavaRefactorInitializeParams
+from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
 from solidlsp.ls_config import Language
 from test.serena._java_refactor_sidecar_helpers import sidecar_jar  # noqa: F401
 
@@ -132,9 +135,8 @@ def test_sidecar_extract_class_passes_planner_refusals_through(sidecar_jar: Path
 
 # --- G006 extract superclass (multi-sibling) --------------------------------------------------------------------------
 #
-# CONTRACT CHANGE (Design Y): extract-superclass adopts the sidecar's native multi-sibling semantics — it hoists a member
-# COMMON to two or more sibling classes into a new shared abstract superclass. (The former single-class agent contract is
-# gone; a lone class has no common member to hoist.)
+# CONTRACT CHANGE (Design Y): extract-superclass supports the plan's single-class case and multi-sibling case.
+# Multi-sibling hoists common members; single-class extracts selected members into a new superclass for that class.
 
 _CIRCLE = (
     "package com.acme.app;\n"
@@ -153,6 +155,52 @@ _SQUARE = (
 
 _SIBLINGS = [f"{JDIR}/Circle.java", f"{JDIR}/Square.java"]
 
+
+
+
+def test_sidecar_extract_superclass_preview_accepts_single_class(sidecar_jar: Path, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(JavaRefactorManager.ENV_JAR, str(sidecar_jar.resolve()))
+    project = tmp_path / "extract_super_single"
+    _write(project, f"{JDIR}/Circle.java", _CIRCLE)
+    manager = _manager(project)
+
+    result = manager.extract_superclass([f"{JDIR}/Circle.java"], "Shape", ["method:describe()"], apply=False)
+
+    assert result.get("accepted") is True, result
+    assert result.get("applied") is False, result
+    assert result.get("diagnosticDeltaValidated") is True, result
+    assert result["operation"] == "extractSuperclass", result
+    touched = set(result["preview"]["touchedFiles"])
+    assert f"{JDIR}/Circle.java" in touched, touched
+    assert f"{JDIR}/Shape.java" in touched, touched
+    assert not (project / f"{JDIR}/Shape.java").exists()
+
+
+def test_sidecar_extract_superclass_accepts_fqn_direct_client(sidecar_jar: Path, tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "extract_super_fqn_direct"
+    _write(project, f"{JDIR}/Circle.java", _CIRCLE)
+    client = JavaRefactorClient(sidecar_jar, java_command="java")
+    client.start()
+    try:
+        client.initialize(
+            JavaRefactorInitializeParams(
+                project_root=str(project),
+                config={
+                    "buildToolMode": "explicit",
+                    "sourceRoots": ["src/main/java"],
+                    "allowIncompleteAnalysis": True,
+                },
+            )
+        )
+        result = ClassRefactorClient(client).extract_superclass(
+            ["com.acme.app.Circle"], "Shape", ["method:describe()"], make_abstract=True
+        )
+    finally:
+        client.shutdown()
+
+    assert result.get("accepted") is True, result
+    touched = {change["path"] for change in result["workspaceEdit"]["changes"]}
+    assert f"{JDIR}/Circle.java" in touched, result
 
 def test_sidecar_extract_superclass_preview_validates(sidecar_jar: Path, tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv(JavaRefactorManager.ENV_JAR, str(sidecar_jar.resolve()))
@@ -183,7 +231,9 @@ def test_sidecar_extract_superclass_apply_inserts_extends(sidecar_jar: Path, tmp
 
     manager = _manager(project)
     try:
-        result = manager.extract_superclass(_SIBLINGS, "Shape", ["method:describe()"], apply=True)
+        result = manager.extract_superclass(
+            _SIBLINGS, "Shape", ["method:describe()"], apply=True, allow_review_required=True
+        )
     finally:
         manager.shutdown()
 
@@ -271,7 +321,7 @@ def test_sidecar_replace_inheritance_apply_rewrites_to_composition(
     manager = _manager(project)
     try:
         result = manager.replace_inheritance_with_delegation(
-            f"{JDIR}/Dog.java", confirm_public_api_change=True, apply=True
+            f"{JDIR}/Dog.java", confirm_public_api_change=True, apply=True, allow_review_required=True
         )
     finally:
         manager.shutdown()
@@ -337,7 +387,7 @@ def test_sidecar_replace_inheritance_adapts_base_constructor_args(
     manager = _manager(project)
     try:
         result = manager.replace_inheritance_with_delegation(
-            f"{JDIR}/Car.java", confirm_public_api_change=True, apply=True
+            f"{JDIR}/Car.java", confirm_public_api_change=True, apply=True, allow_review_required=True
         )
     finally:
         manager.shutdown()
@@ -387,7 +437,7 @@ def test_sidecar_replace_inheritance_rewrites_super_method_call(
     manager = _manager(project)
     try:
         result = manager.replace_inheritance_with_delegation(
-            f"{JDIR}/Loud.java", confirm_public_api_change=True, apply=True
+            f"{JDIR}/Loud.java", confirm_public_api_change=True, apply=True, allow_review_required=True
         )
     finally:
         manager.shutdown()
@@ -459,7 +509,7 @@ def test_sidecar_replace_inheritance_preserves_implements_clause(
     manager = _manager(project)
     try:
         result = manager.replace_inheritance_with_delegation(
-            f"{JDIR}/Bird.java", confirm_public_api_change=True, apply=True
+            f"{JDIR}/Bird.java", confirm_public_api_change=True, apply=True, allow_review_required=True
         )
     finally:
         manager.shutdown()
@@ -504,7 +554,7 @@ def test_sidecar_replace_inheritance_cross_package_uses_import(
     manager = _manager(project)
     try:
         result = manager.replace_inheritance_with_delegation(
-            f"{JDIR}/Truck.java", confirm_public_api_change=True, apply=True
+            f"{JDIR}/Truck.java", confirm_public_api_change=True, apply=True, allow_review_required=True
         )
     finally:
         manager.shutdown()
@@ -682,3 +732,34 @@ def test_sidecar_extract_class_refuses_dropping_delegates_for_public_api(
     assert applied["refusal"]["code"] == "extract_class_public_api_without_delegates", applied
     assert not (project / f"{JDIR}/Totals.java").exists()
     assert "public void addToTotal(int price)" in (project / f"{JDIR}/Cart.java").read_text(encoding="utf-8")
+
+
+def test_sidecar_deep_inline_refuses_synchronized_and_yield(sidecar_jar, tmp_path, monkeypatch):
+    monkeypatch.setenv("SERENA_JAVA_REFACTOR_JAR", str(sidecar_jar))
+    root = tmp_path
+    _write(
+        root,
+        f"{JDIR}/Guards.java",
+        """package com.acme.app;
+public class Guards {
+  private synchronized int locked() { return 1; }
+  private int block() { synchronized (this) { return 2; } }
+  private int yields(int x) { return switch (x) { default -> { yield 3; } }; }
+  int a() { return locked(); }
+  int b() { return block(); }
+  int c() { return yields(1); }
+}
+""",
+    )
+    manager = _manager(root)
+
+    locked = manager.deep_inline_method(f"{JDIR}/Guards.java", 3, apply=False)
+    block = manager.deep_inline_method(f"{JDIR}/Guards.java", 4, apply=False)
+    yields = manager.deep_inline_method(f"{JDIR}/Guards.java", 5, apply=False)
+
+    assert locked["accepted"] is False
+    assert "synchronized_method_unsupported" in str(locked)
+    assert block["accepted"] is False
+    assert "synchronized_block_unsupported" in str(block)
+    assert yields["accepted"] is False
+    assert "yield_unsupported" in str(yields)

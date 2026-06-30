@@ -113,6 +113,9 @@ class _FakeClient:
     def status(self, refresh: bool = False) -> _ReadyStatus:
         return _ReadyStatus()
 
+    def validate_edit(self, overlay: dict[str, Any]) -> dict[str, Any]:
+        return {"accepted": True, "ready": True, "compilerErrors": [], "compilerWarnings": [], "resourceFindings": []}
+
 
 def _manager_for_bridge(tmp_path: Path, monkeypatch) -> JavaRefactorManager:
     """Builds a manager whose _bridge_v3_edit collaborators are stubbed so only the policy decision is exercised."""
@@ -303,3 +306,23 @@ def test_composition_resource_or_framework_aggregate_blocks_apply(tmp_path: Path
     assert applied["accepted"] is True, applied
     assert applied["applied"] is True, applied
     assert _FakeApplier.committed is True, "the SAFE counterpart of the same op must apply"
+
+
+def test_route_carries_sidecar_risk_facts_for_class_refactors(tmp_path, monkeypatch) -> None:
+    manager = _manager_for_bridge(tmp_path, monkeypatch)
+    risk_facts = {"publicApiChanges": ["com.acme.PriceService#tax(int)"]}
+    result = manager._route_sidecar_v3_edit(
+        "extractClass",
+        {
+            "accepted": True,
+            "riskClassification": "SAFE",
+            "risk": "safe",
+            "workspaceEdit": {"changes": [], "fileOperations": []},
+            "riskFacts": risk_facts,
+        },
+        apply=False,
+        validate=False,
+        carry=("riskFacts",),
+    )
+
+    assert result["riskFacts"] == risk_facts

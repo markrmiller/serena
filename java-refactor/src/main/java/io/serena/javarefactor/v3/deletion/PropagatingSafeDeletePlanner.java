@@ -1,5 +1,6 @@
 package io.serena.javarefactor.v3.deletion;
 
+import io.serena.javarefactor.v3.graph.GraphCacheLimits;
 import io.serena.javarefactor.ast.RefactorAnalysisResult;
 import io.serena.javarefactor.compiler.DanglingImports;
 import io.serena.javarefactor.compiler.ReachabilityGraph;
@@ -65,9 +66,9 @@ public class PropagatingSafeDeletePlanner {
 
     /** Caller options mirroring the {@code java_propagate_safe_delete} tool signature (§4.2). */
     public record Options(boolean deletePrivateOnly, boolean includeTests, boolean includeResources,
-            int maxCascadeDepth) {
+            int maxCascadeDepth, long maxResourceFileBytes) {
         public static Options defaults() {
-            return new Options(true, false, true, 5);
+            return new Options(true, false, true, 5, GraphCacheLimits.DEFAULT_MAX_RESOURCE_FILE_BYTES);
         }
     }
 
@@ -100,7 +101,7 @@ public class PropagatingSafeDeletePlanner {
      * #plan} (standalone JSON) and {@link #planStep} (workspace composition) so both carry the identical edits/deletes.
      */
     private record DeletionResult(WorkspaceEdit workspaceEdit, List<String> allWarnings, String deletePlanJson,
-            String statsJson, List<String> incompleteResourceFiles) {
+            String statsJson, List<String> incompleteResourceFiles, String riskFactsJson) {
     }
 
     public String plan(JavaProjectModel model, List<RootSpec> roots, Options options) throws IOException {
@@ -116,17 +117,8 @@ public class PropagatingSafeDeletePlanner {
         // it must escalate to needs_review. Emit BOTH the existing top-level boolean (resourceScanIncomplete) AND a
         // structured riskFacts.analysisIncomplete array (shared contract 1, exact key names); CanonicalEnvelope
         // .classifyRisk escalates on either, blocking SAFE auto-apply of the delete.
-        List<String> incompleteResourceFiles = result.incompleteResourceFiles();
-        boolean resourceScanIncomplete = !incompleteResourceFiles.isEmpty();
-        String riskFactsJson = "";
-        if (resourceScanIncomplete) {
-            List<String> analysisIncomplete = new ArrayList<>();
-            for (String file : incompleteResourceFiles) {
-                analysisIncomplete.add("Resource scan incomplete: '" + file
-                        + "' could not be examined for references to the deleted types.");
-            }
-            riskFactsJson = "\"riskFacts\":{\"analysisIncomplete\":" + JsonUtil.array(analysisIncomplete) + "},";
-        }
+        boolean resourceScanIncomplete = !result.incompleteResourceFiles().isEmpty();
+        String riskFactsJson = result.riskFactsJson().isBlank() ? "" : "\"riskFacts\":" + result.riskFactsJson() + ",";
         return "{"
                 + "\"accepted\":true,"
                 + "\"operation\":\"propagateSafeDelete\","
@@ -163,7 +155,7 @@ public class PropagatingSafeDeletePlanner {
         }
         return new TransformationStep(
                 "propagateSafeDelete", workspaceEdit.edits(), workspaceEdit.fileOperations(), warnings,
-                "{\"operation\":\"propagateSafeDelete\"}");
+                "{\"operation\":\"propagateSafeDelete\"}", result.riskFactsJson());
     }
 
     private DeletionResult compute(JavaProjectModel model, List<RootSpec> roots, Options options) throws IOException {
@@ -262,6 +254,11 @@ public class PropagatingSafeDeletePlanner {
                     }
                 }
             }
+            List<String> cascadeFrontier = cascadeFrontier(graph, deleted, honorPublicApi);
+            if (!cascadeFrontier.isEmpty()) {
+                throw new DeletionRefusal("max_cascade_depth_exceeded", "Cascade delete exceeded maxCascadeDepth="
+                        + Math.max(1, options.maxCascadeDepth()) + "; frontier: " + String.join(", ", cascadeFrontier));
+            }
 
             // Blocked-by-live-referrer: symbols a deleted symbol referenced but that a non-deleted symbol still needs.
             for (ReachabilityGraph.Node node : graph.nodes()) {
@@ -295,7 +292,7 @@ public class PropagatingSafeDeletePlanner {
             }
 
             WorkspaceEdit workspaceEdit =
-                    computeEdit(graph, deleted, projectRoot, model, charset, options.includeResources());
+                    computeEdit(graph, deleted, projectRoot, model, charset, options.includeResources(), options.maxResourceFileBytes());
 
             List<String> allWarnings = new ArrayList<>(publicApiWarnings);
             allWarnings.addAll(frameworkWarnings);
@@ -316,11 +313,42 @@ public class PropagatingSafeDeletePlanner {
                     + "}";
 
             return new DeletionResult(workspaceEdit, allWarnings, deletePlanJson, statsJson,
-                    workspaceEdit.incompleteResourceFiles());
+                    workspaceEdit.incompleteResourceFiles(), riskFactsJson(publicApiWarnings, workspaceEdit.incompleteResourceFiles()));
         }
     }
 
     // ── cascade helpers ────────────────────────────────────────────────────────────────────────────────────────────
+
+    private static String riskFactsJson(List<String> publicApiWarnings, List<String> incompleteResourceFiles) {
+        List<String> fields = new ArrayList<>();
+        if (!publicApiWarnings.isEmpty()) {
+            fields.add("\"publicApiChanges\":" + JsonUtil.array(publicApiWarnings));
+        }
+        if (!incompleteResourceFiles.isEmpty()) {
+            List<String> analysisIncomplete = new ArrayList<>();
+            for (String file : incompleteResourceFiles) {
+                analysisIncomplete.add("Resource scan incomplete: '" + file
+                        + "' could not be examined for references to the deleted types.");
+            }
+            fields.add("\"analysisIncomplete\":" + JsonUtil.array(analysisIncomplete));
+        }
+        return fields.isEmpty() ? "{}" : "{" + String.join(",", fields) + "}";
+    }
+
+    private static List<String> cascadeFrontier(ReachabilityGraph graph, Set<String> deleted, boolean honorPublicApi) {
+        List<String> frontier = new ArrayList<>();
+        for (ReachabilityGraph.Node node : graph.nodes()) {
+            String key = node.key();
+            if (deleted.contains(key) || node.isCascadeRoot(honorPublicApi)) {
+                continue;
+            }
+            Set<String> incoming = graph.incoming(key);
+            if (!incoming.isEmpty() && deleted.containsAll(incoming)) {
+                frontier.add(describe(node));
+            }
+        }
+        return frontier;
+    }
 
     private static String cascadeReason(ReachabilityGraph graph, Set<String> incoming) {
         for (String referrer : incoming) {
@@ -374,15 +402,19 @@ public class PropagatingSafeDeletePlanner {
         String fileOperationsJson() {
             List<String> objects = new ArrayList<>();
             for (FileOperation op : fileOperations) {
-                objects.add("{\"kind\":\"delete\",\"path\":" + JsonUtil.quote(op.path())
-                        + ",\"oldSha256\":" + JsonUtil.quote(op.oldSha256()) + "}");
+                if ("deleteDirectory".equals(op.kind())) {
+                    objects.add("{\"kind\":\"deleteDirectory\",\"path\":" + JsonUtil.quote(op.path()) + "}");
+                } else {
+                    objects.add("{\"kind\":\"delete\",\"path\":" + JsonUtil.quote(op.path())
+                            + ",\"oldSha256\":" + JsonUtil.quote(op.oldSha256()) + "}");
+                }
             }
             return "[" + String.join(",", objects) + "]";
         }
     }
 
     private WorkspaceEdit computeEdit(ReachabilityGraph graph, Set<String> deleted, Path projectRoot,
-            JavaProjectModel model, Charset charset, boolean includeResources) throws IOException {
+            JavaProjectModel model, Charset charset, boolean includeResources, long maxResourceFileBytes) throws IOException {
         List<PlannerSupport.TextEdit> edits = new ArrayList<>();
         List<FileOperation> fileOps = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
@@ -457,13 +489,16 @@ public class PropagatingSafeDeletePlanner {
             edits.addAll(rewriteServiceLoaderFiles(projectRoot, charset, deletedTypeFqns, warnings,
                     incompleteResourceFiles));
             edits.addAll(removeUnambiguousBeanDefinitions(projectRoot, model, deletedTypeFqns, warnings,
-                    incompleteResourceFiles));
+                    incompleteResourceFiles, maxResourceFileBytes));
             warnings.addAll(danglingResourceReferenceWarnings(projectRoot, model, deletedTypeFqns,
-                    incompleteResourceFiles));
+                    incompleteResourceFiles, maxResourceFileBytes));
         }
 
         // Plan §7.3 step 7 / §19.2: package directories that the cascade has emptied are removed too.
         List<String> removedDirectories = emptyPackageDirectories(model, projectRoot, filesToDelete);
+        for (String directory : removedDirectories) {
+            fileOps.add(FileOperation.deleteDirectory(directory));
+        }
 
         return new WorkspaceEdit(edits, fileOps, warnings, removedDirectories,
                 new ArrayList<>(incompleteResourceFiles), projectRoot);
@@ -634,9 +669,9 @@ public class PropagatingSafeDeletePlanner {
      */
     private static List<PlannerSupport.TextEdit> removeUnambiguousBeanDefinitions(Path projectRoot,
             JavaProjectModel model, Set<String> deletedTypeFqns, List<String> warnings,
-            Set<String> incompleteResourceFiles) throws IOException {
+            Set<String> incompleteResourceFiles, long maxResourceFileBytes) throws IOException {
         ResourcePlanner.BeanRemovalPlan plan =
-                new ResourcePlanner(projectRoot, model).beanRemovalEdits(deletedTypeFqns, ResourceScanScope.all());
+                new ResourcePlanner(projectRoot, model, maxResourceFileBytes).beanRemovalEdits(deletedTypeFqns, ResourceScanScope.all());
         warnings.addAll(plan.warnings());
         List<PlannerSupport.TextEdit> edits = new ArrayList<>();
         // Story R06 gate: an incomplete resource scan means the delete's bean participation could not be fully
@@ -656,7 +691,7 @@ public class PropagatingSafeDeletePlanner {
     }
 
     private static List<String> danglingResourceReferenceWarnings(Path projectRoot, JavaProjectModel model,
-            Set<String> deletedTypeFqns, Set<String> incompleteResourceFiles) throws IOException {
+            Set<String> deletedTypeFqns, Set<String> incompleteResourceFiles, long maxResourceFileBytes) throws IOException {
         List<ResourceQuery> queries = new ArrayList<>();
         for (String fqn : deletedTypeFqns) {
             queries.add(new ResourceQuery(fqn, false));
@@ -667,7 +702,7 @@ public class PropagatingSafeDeletePlanner {
         // type, so its incompleteness is surfaced and propagated to the result (forcing needs_review) rather than
         // letting the delete classify "safe" on an unread file.
         ResourcePlanner.ReferenceScan scan =
-                new ResourcePlanner(projectRoot, model).referencesToChecked(queries, ResourceScanScope.all());
+                new ResourcePlanner(projectRoot, model, maxResourceFileBytes).referencesToChecked(queries, ResourceScanScope.all());
         if (!scan.completeness().isComplete()) {
             incompleteResourceFiles.addAll(scan.completeness().incompleteFiles());
             warnings.add("Resource scan was incomplete (" + String.join(", ", scan.completeness().incompleteFiles())

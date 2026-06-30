@@ -9,7 +9,7 @@ to a temp project for the apply path.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, cast
 
 import pytest
 
@@ -19,7 +19,7 @@ from serena.java_refactor_v3 import (
     V3OperationPlan,
     WorkspaceStatus,
 )
-from serena.java_refactor_v3.models import V3_REFUSAL_REGISTRY, RiskLevel
+from serena.java_refactor_v3.models import V3_REFUSAL_REGISTRY, WORKSPACE_UNSAFE_EDIT, RiskLevel
 
 
 class StubDriver:
@@ -42,6 +42,39 @@ class StubDriver:
 
     def program_v3(self, plan: V3OperationPlan | dict[str, Any]) -> None:
         self._v3_queue.append(plan)
+
+    def validate_v3_workspace_edit(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        workspace_edit = kwargs.get("workspace_edit")
+        if workspace_edit is None and args:
+            # Support both protocol shapes used by the V3 workspace manager: direct edit argument and
+            # (workspace_id, edit) style calls.
+            workspace_edit = args[-1]
+        if workspace_edit is None:
+            return {
+                "accepted": False,
+                "refusal": {
+                    "code": WORKSPACE_UNSAFE_EDIT,
+                    "message": "No workspace edit was provided for validation.",
+                },
+                "validationMode": "javac-delta",
+            }
+        applier = TransactionalWorkspaceEditApplier(self.project_root)
+        try:
+            staged = applier.stage(cast(RefactorWorkspaceEdit, workspace_edit))
+        except ValueError as exc:
+            return {
+                "accepted": False,
+                "refusal": {"code": WORKSPACE_UNSAFE_EDIT, "message": str(exc)},
+                "validationMode": "javac-delta",
+            }
+        return {
+            "accepted": True,
+            "validationMode": "javac-delta",
+            "validated": True,
+            "diagnosticDelta": {"resolvedErrors": 0, "newErrors": 0},
+            "workspaceEdit": workspace_edit,
+            "staged": staged,
+        }
 
     def create_v2_refactor_session(self, operation: str, params: dict[str, Any], validate: bool | None = None) -> dict[str, Any]:
         self.created_ops.append(operation)
@@ -678,3 +711,24 @@ def test_every_emitted_refusal_code_is_registered(project: Path) -> None:
         "workspace_apply_failed",
     ):
         assert V3_REFUSAL_REGISTRY.get(code)
+
+
+def test_workspace_preview_refuses_without_javac_validation_bridge(tmp_path: Path) -> None:
+    """Edit-emitting V3 workspaces fail closed when javac validation is unavailable."""
+
+    (tmp_path / "A.txt").write_text("alpha", encoding="utf-8")
+    driver = StubDriver(tmp_path)
+    driver.validate_v3_workspace_edit = None  # type: ignore[method-assign]
+    driver.program_v3(_v3_plan(tmp_path, "validated.edit", "A.txt", 0, 5, "beta"))
+    manager = TransformationWorkspaceManager(driver)
+    workspace = manager.create_workspace()
+
+    add_result = manager.add_operation(workspace.workspace_id, "validated.edit", {})
+    assert add_result["accepted"] is True
+
+    preview = manager.preview(workspace.workspace_id)
+
+    assert preview["accepted"] is False
+    assert preview["refusal"]["code"] == WORKSPACE_UNSAFE_EDIT
+    assert "javac validation bridge" in preview["refusal"]["message"]
+    assert (tmp_path / "A.txt").read_text(encoding="utf-8") == "alpha"

@@ -408,14 +408,15 @@ def test_extract_superclass_refuses_existing_super(sidecar_jar: Path, tmp_path: 
 # ── §9 (F11) extract superclass: a single source class is a legal target (no two-sibling minimum) ────────────────
 
 
-def test_extract_superclass_refuses_single_class(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
+def test_extract_superclass_accepts_single_class(sidecar_jar: Path, sidecar_java_cmd: str, tmp_path: Path) -> None:
     _write(
         tmp_path,
         "src/main/java/com/acme/Robot.java",
-        "package com.acme;\n"
-        "public class Robot {\n"
-        "    String describe() { return \"robot\"; }\n"
-        "}\n",
+        """package com.acme;
+public class Robot {
+    public String describe() { return "robot"; }
+}
+""",
     )
     with _class_refactor(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
         result = client.extract_superclass(
@@ -424,9 +425,12 @@ def test_extract_superclass_refuses_single_class(sidecar_jar: Path, tmp_path: Pa
             ["method:describe()"],
         )
 
-    assert result.get("accepted") is False, result
-    assert "refusal" in result, result
-
+    assert result["accepted"] is True
+    assert result["risk"] == "needs_review"
+    touched = {change["path"] for change in result["workspaceEdit"]["changes"]}
+    touched |= {op["path"] for op in result["workspaceEdit"]["fileOperations"]}
+    assert "src/main/java/com/acme/Robot.java" in touched
+    assert "src/main/java/com/acme/Machine.java" in touched
 
 def test_extract_superclass_interposes_shared_superclass(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
     # Circle and Square both already extend Shape. The new superclass is slotted *between* them and Shape: the generated
@@ -886,6 +890,7 @@ def test_extract_class_into_target_package(sidecar_jar: Path, tmp_path: Path, si
             "TaxCalc",
             ["field:rate", "method:tax(double)"],
             target_package="com.acme.calc",
+            confirm_public_api_change=True,
         )
 
     assert result.get("accepted") is True, result
@@ -1237,3 +1242,162 @@ def test_extract_superclass_refuses_target_is_selected_class(sidecar_jar: Path, 
 
     assert result.get("accepted") is False, result
     assert result["refusal"]["code"] == "extract_superclass_target_is_source", result
+
+
+def test_extract_superclass_refuses_divergent_same_name_methods(sidecar_jar, tmp_path, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/A.java",
+        """package com.acme;
+public class A {
+  public String name() { return "A"; }
+}
+""",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/B.java",
+        """package com.acme;
+public class B {
+  public String name() { return "B"; }
+}
+""",
+    )
+    with _class_refactor(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.extract_superclass(
+            ["com.acme.A", "com.acme.B"],
+            "BaseName",
+            ["name"],
+            make_abstract=False,
+        )
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "extract_superclass_member_not_equivalent", result
+
+
+def test_extract_superclass_refuses_ambiguous_overloaded_selector(sidecar_jar, tmp_path, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/A.java",
+        "package com.acme;\npublic class A {\n  public String name() { return \"same\"; }\n  public String name(String suffix) { return suffix; }\n}\n",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/B.java",
+        "package com.acme;\npublic class B {\n  public String name() { return \"same\"; }\n  public String name(String suffix) { return suffix; }\n}\n",
+    )
+    with _class_refactor(sidecar_jar, tmp_path, sidecar_java_cmd) as client:
+        result = client.extract_superclass(
+            ["com.acme.A", "com.acme.B"],
+            "BaseName",
+            ["name"],
+        )
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "extract_superclass_member_ambiguous", result
+
+
+def test_extract_class_refuses_moved_field_initializer_dependency(sidecar_jar, tmp_path, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Source.java",
+        """package com.acme;
+public class Source {
+  private int seed = 1;
+  private int moved = seed + 1;
+}
+""",
+    )
+    with _class_refactor(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.extract_class(
+            "src/main/java/com/acme/Source.java",
+            "Extracted",
+            ["moved"],
+        )
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "extract_class_unselected_field_dependency", result
+
+
+def test_extract_class_refuses_retained_field_initializer_dependency(sidecar_jar, tmp_path, sidecar_java_cmd):
+    source = "src/main/java/com/acme/Source.java"
+    _write(
+        tmp_path,
+        source,
+        "package com.acme;\npublic class Source {\n  private int moved = 1;\n  private int retained = moved + 1;\n}\n",
+    )
+    with _class_refactor(sidecar_jar, tmp_path, sidecar_java_cmd) as client:
+        result = client.extract_class(source, "Extracted", ["moved"])
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "extract_class_retained_field_dependency", result
+
+
+def test_replace_inheritance_refuses_inherited_generic_method(sidecar_jar, tmp_path, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Base.java",
+        """package com.acme;
+public class Base {
+  public <T> T id(T value) { return value; }
+}
+""",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Child.java",
+        """package com.acme;
+public class Child extends Base {
+}
+""",
+    )
+    with _class_refactor(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.replace_inheritance_with_delegation(
+            "src/main/java/com/acme/Child.java",
+            confirm_public_api_change=True,
+        )
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "replace_inheritance_generic_method", result
+
+
+def test_extract_class_cross_package_qualifies_owner_back_reference(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/PriceService.java",
+        """
+package com.acme;
+
+public class PriceService {
+    public PriceService() {
+    }
+
+    public int helper(int cents) {
+        return cents / 10;
+    }
+
+    public int tax(int cents) {
+        return helper(cents);
+    }
+
+    public int total(int cents) {
+        return tax(cents);
+    }
+}
+""".strip(),
+    )
+
+    with _class_refactor(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.extract_class(
+            "src/main/java/com/acme/PriceService.java",
+            "TaxCalc",
+            ["method:tax(int)"],
+            target_package="com.acme.calc",
+            confirm_public_api_change=True,
+        )
+
+    assert result.get("accepted"), result
+    created = _created_text(result)
+    assert "package com.acme.calc;" in created
+    assert "private final com.acme.PriceService owner;" in created
+    assert "TaxCalc(com.acme.PriceService owner)" in created

@@ -117,11 +117,11 @@ def test_sidecar_enumerates_every_v3_dispatch_operation(sidecar_jar: Path, tmp_p
     )
 
     for operation in _EXPECTED_V3_DISPATCH_OPERATIONS:
-        assert capabilities[operation] == "experimental", (operation, capabilities[operation])
+        assert capabilities[operation] == "beta", (operation, capabilities[operation])
         detail = details[operation]
-        assert detail["level"] == "experimental", (operation, detail)
+        assert detail["level"] == "beta", (operation, detail)
         # Default config gates nothing and none of these are ready yet, so each must truthfully report "preview".
-        assert detail["status"] == "preview", (operation, detail)
+        assert detail["status"] == "supported", (operation, detail)
         assert isinstance(detail["description"], str) and detail["description"].strip(), (operation, detail)
 
 
@@ -138,9 +138,9 @@ def test_sidecar_v3_operation_reports_disabled_when_section_flag_gates_it(sideca
 
     assert details["deletion.propagateSafeDelete"]["status"] == "disabled", details["deletion.propagateSafeDelete"]
     # A sibling V3 op not covered by that flag is unaffected.
-    assert details["transformation.preview"]["status"] == "preview", details["transformation.preview"]
+    assert details["transformation.preview"]["status"] == "supported", details["transformation.preview"]
     # And a V3 op in a different section is likewise unaffected.
-    assert details["frameworks.detect"]["status"] == "preview", details["frameworks.detect"]
+    assert details["frameworks.detect"]["status"] == "supported", details["frameworks.detect"]
 
 
 def test_sidecar_frameworks_participate_negotiates_and_reports_disabled_when_gated(sidecar_jar: Path, tmp_path: Path) -> None:
@@ -155,8 +155,8 @@ def test_sidecar_frameworks_participate_negotiates_and_reports_disabled_when_gat
 
     default_details = cast(dict[str, dict[str, Any]], _capability_payload(sidecar_jar, project_root)["capabilityDetails"])
     assert "frameworks.participate" in default_details, sorted(default_details)
-    assert default_details["frameworks.participate"]["level"] == "experimental", default_details["frameworks.participate"]
-    assert default_details["frameworks.participate"]["status"] == "preview", default_details["frameworks.participate"]
+    assert default_details["frameworks.participate"]["level"] == "beta", default_details["frameworks.participate"]
+    assert default_details["frameworks.participate"]["status"] == "supported", default_details["frameworks.participate"]
 
     configuration = json.dumps({"java_refactor": {"v3": {"frameworks": {"enabled": False}}}})
     gated_details = cast(
@@ -166,7 +166,7 @@ def test_sidecar_frameworks_participate_negotiates_and_reports_disabled_when_gat
     assert gated_details["frameworks.participate"]["status"] == "disabled", gated_details["frameworks.participate"]
     # The whole frameworks section is gated, so the read-only siblings degrade too; a V3 op in another section does not.
     assert gated_details["frameworks.detect"]["status"] == "disabled", gated_details["frameworks.detect"]
-    assert gated_details["transformation.preview"]["status"] == "preview", gated_details["transformation.preview"]
+    assert gated_details["transformation.preview"]["status"] == "supported", gated_details["transformation.preview"]
 
 
 def test_sidecar_pure_v1_operations_are_not_gated(sidecar_jar: Path, tmp_path: Path) -> None:
@@ -197,10 +197,9 @@ def test_sidecar_v3_master_switch_disables_every_dispatch_operation(sidecar_jar:
 
     for operation in _EXPECTED_V3_DISPATCH_OPERATIONS:
         assert details[operation]["status"] == "disabled", (operation, details[operation])
-    # The V3 package operations are NOT gated by the v3 dispatch master switch (they are V2-contract ops); they stay
-    # supported even when the dedicated V3 dispatch surface is disabled.
+    # Package operations are part of the V3 whole-repo surface and honor the V3 master switch too.
     for operation in _PACKAGE_OPERATIONS:
-        assert details[operation]["status"] == "supported", (operation, details[operation])
+        assert details[operation]["status"] == "disabled", (operation, details[operation])
 
 
 def test_sidecar_package_operations_report_supported(sidecar_jar: Path, tmp_path: Path) -> None:

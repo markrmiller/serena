@@ -46,6 +46,10 @@ def _config(v3_overrides: dict[str, Any]) -> str:
 _CASES = [
     pytest.param("impact.facts", {}, {"enabled": False}, id="global-v3-enabled"),
     pytest.param("transformation.list", {}, {"enabled": False}, id="global-gates-transformation"),
+    pytest.param("transformation.report", {"workspaceId": "missing"}, {"enabled": False}, id="global-gates-transformation-report"),
+    pytest.param("renamePackage", {"oldPackage": "com.acme", "newPackage": "com.acme2"}, {"packages": {"rename_enabled": False}}, id="packages.rename_enabled"),
+    pytest.param("movePackage", {"sourcePackage": "com.acme", "targetPackage": "com.acme2"}, {"packages": {"move_enabled": False}}, id="packages.move_enabled"),
+    pytest.param("moveSourceRoot", {"sourceRoot": "src/main/java", "targetSourceRoot": "src/other/java"}, {"packages": {"move_enabled": False}}, id="packages.move_source_root_enabled"),
     pytest.param(
         "deletion.findDeadCode", {"scope": "project"}, {"enabled": False}, id="global-gates-find-dead-code"
     ),
@@ -107,6 +111,7 @@ _CASES = [
         "resources.findReferences", {}, {"resources": {"enabled": False}}, id="resources.enabled"
     ),
     pytest.param("frameworks.detect", {}, {"frameworks": {"enabled": False}}, id="frameworks.enabled-detect"),
+    pytest.param("frameworks.participate", {"changeKind": "renameType"}, {"frameworks": {"enabled": False}}, id="frameworks.enabled-participate"),
     pytest.param(
         "frameworks.findReferences", {}, {"frameworks": {"enabled": False}}, id="frameworks.enabled-find"
     ),
@@ -146,3 +151,15 @@ def test_v3_op_refused_when_disabled_by_config(
     with _sidecar(sidecar_jar, tmp_path, "default", java_command=sidecar_java_cmd) as client:
         enabled = client._request(method, request)
     assert _refusal_code(enabled) != "operation_disabled", enabled
+
+
+def test_transformation_add_session_is_advertised_as_sidecar_capability() -> None:
+    from serena.java_refactor.manager import _V3_CAPABILITY_OPERATIONS
+    from serena.tools.java_refactor_v3_tools import JAVA_REFACTOR_V3_CAPABILITY_TOOLS
+
+    assert "transformation.addSession" in _V3_CAPABILITY_OPERATIONS
+    assert "transformation.addSession" in JAVA_REFACTOR_V3_CAPABILITY_TOOLS.values()
+    assert "transformation.report" in _V3_CAPABILITY_OPERATIONS
+    assert "transformation.report" in JAVA_REFACTOR_V3_CAPABILITY_TOOLS.values()
+    assert "frameworks.participate" in _V3_CAPABILITY_OPERATIONS
+    assert "frameworks.participate" in JAVA_REFACTOR_V3_CAPABILITY_TOOLS.values()

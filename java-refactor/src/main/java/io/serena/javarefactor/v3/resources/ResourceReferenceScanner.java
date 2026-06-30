@@ -166,14 +166,17 @@ public final class ResourceReferenceScanner {
 
         List<ResourceReference> references = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
+        List<String> unreadableFiles = new ArrayList<>();
+        List<String> overCapFiles = new ArrayList<>();
         for (Path file : ResourceSupport.resourceFiles(model)) {
             ResourceReferenceProvider provider = registry.providerFor(file);
             if (provider == null) {
                 continue;
             }
+            String relative = PlannerSupport.relative(projectRoot, file);
             if (exceedsCap(file)) {
-                // Surfaced, never silently dropped: warn so the over-cap file is reviewed manually (R05 acceptance #2).
-                warnings.add("Resource " + PlannerSupport.relative(projectRoot, file)
+                overCapFiles.add(relative);
+                warnings.add("Resource " + relative
                         + " exceeds the configured max-file-size cap (" + maxFileBytes
                         + " bytes) and was not scanned; review it manually for references.");
                 continue;
@@ -182,7 +185,8 @@ public final class ResourceReferenceScanner {
             try {
                 content = Files.readString(file);
             } catch (IOException | RuntimeException unreadable) {
-                warnings.add("Skipped unreadable resource " + PlannerSupport.relative(projectRoot, file)
+                unreadableFiles.add(relative);
+                warnings.add("Skipped unreadable resource " + relative
                         + " (" + unreadable.getClass().getSimpleName() + ").");
                 continue;
             }
@@ -193,7 +197,9 @@ public final class ResourceReferenceScanner {
             }
         }
 
-        return envelope(query, references, warnings);
+        ResourcePlanner.ScanCompleteness completeness = new ResourcePlanner.ScanCompleteness(
+                List.copyOf(unreadableFiles), List.copyOf(overCapFiles));
+        return envelope(query, references, warnings, completeness);
     }
 
     private ResourceQuery resolveQuery(Map<String, Object> fields) {
@@ -228,18 +234,23 @@ public final class ResourceReferenceScanner {
         return kinds;
     }
 
-    private String envelope(ResourceQuery query, List<ResourceReference> references, List<String> warnings) {
+    private String envelope(ResourceQuery query, List<ResourceReference> references, List<String> warnings,
+            ResourcePlanner.ScanCompleteness completeness) {
         StringBuilder refs = new StringBuilder("[");
         Set<String> kindsSeen = new LinkedHashSet<>();
+        Set<String> filesSeen = new LinkedHashSet<>();
         for (int i = 0; i < references.size(); i++) {
             if (i > 0) {
                 refs.append(",");
             }
-            refs.append(referenceJson(references.get(i)));
-            kindsSeen.add(references.get(i).kind().name());
+            ResourceReference reference = references.get(i);
+            refs.append(referenceJson(reference));
+            kindsSeen.add(reference.kind().name());
+            filesSeen.add(PlannerSupport.relative(projectRoot, reference.file()));
         }
         refs.append("]");
 
+        boolean incomplete = !completeness.isComplete();
         return "{"
                 + "\"accepted\":true,"
                 + "\"operation\":\"findResourceReferences\","
@@ -247,8 +258,22 @@ public final class ResourceReferenceScanner {
                 + "\"targetIsPackage\":" + query.isPackage() + ","
                 + "\"references\":" + refs + ","
                 + "\"stats\":{\"count\":" + references.size()
+                + ",\"files\":" + filesSeen.size()
                 + ",\"distinctKinds\":" + kindsSeen.size() + "},"
+                + "\"scanCompleteness\":" + completenessJson(completeness) + ","
+                + "\"resourceScanIncomplete\":" + incomplete + ","
+                + "\"riskFacts\":{\"analysisIncomplete\":"
+                + JsonUtil.array(completeness.incompleteFiles()) + "},"
                 + "\"warnings\":" + PlannerSupport.warningsJson(warnings)
+                + "}";
+    }
+
+    private static String completenessJson(ResourcePlanner.ScanCompleteness completeness) {
+        return "{"
+                + "\"complete\":" + completeness.isComplete() + ","
+                + "\"unreadableFiles\":" + JsonUtil.array(completeness.unreadable()) + ","
+                + "\"overCapFiles\":" + JsonUtil.array(completeness.overCap()) + ","
+                + "\"incompleteFiles\":" + JsonUtil.array(completeness.incompleteFiles())
                 + "}";
     }
 

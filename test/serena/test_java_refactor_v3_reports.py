@@ -237,9 +237,11 @@ def test_acceptance_matrix_javac_validated_is_universal_with_honest_provenance()
         "resourceProviders",
         "frameworkDetect",
         "frameworkReferences",
+        "frameworkParticipate",
         "scanMigrationOpportunities",
         "impactReport",
         "transformationGraph",
+        "transformationReport",
     }
     # provenance is one of the two honest, compiler-backed kinds — never an "unvalidated" marker.
     assert set(provenance.values()) == {"javac-delta", "javac-facts"}

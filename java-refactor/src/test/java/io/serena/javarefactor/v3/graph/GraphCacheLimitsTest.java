@@ -171,6 +171,35 @@ class GraphCacheLimitsTest {
         assertTrue(json.contains("\"accepted\":true"), "diagnostic op must succeed");
         assertTrue(json.contains("exceeds the configured max-file-size cap"),
                 "an over-cap file must surface a warning, not be silently skipped: " + json);
+        assertTrue(json.contains("\"scanCompleteness\""));
+        assertTrue(json.contains("\"resourceScanIncomplete\":true"));
+        assertTrue(json.contains("huge.properties"));
+    }
+
+    @Test
+    void graphCacheInvalidatesOnResourceOnlyChange(@TempDir Path tmp) throws IOException {
+        Path src = tmp.resolve("src/main/java/app");
+        Path resources = tmp.resolve("src/main/resources");
+        Files.createDirectories(src);
+        Files.createDirectories(resources);
+        Path target = src.resolve("Target.java");
+        Path other = src.resolve("Other.java");
+        write(target, "package app; public class Target {}\n");
+        write(other, "package app; public class Other {}\n");
+        Path props = resources.resolve("beans.properties");
+        write(props, "bean.class=app.Target\n");
+
+        GraphInvalidation cache = GraphInvalidation.INSTANCE;
+        cache.invalidate();
+        GraphCacheLimits limits = new GraphCacheLimits(3, 0L);
+        TransformationGraph first = cache.get(model(tmp, tmp.resolve("src/main/java"), List.of(target, other)), limits);
+        assertTrue(first.resources().references().stream().anyMatch(r -> r.target().equals("app.Target")));
+        assertFalse(first.resources().references().stream().anyMatch(r -> r.target().equals("app.Other")));
+
+        write(props, "bean.class=app.Other\n");
+        TransformationGraph second = cache.get(model(tmp, tmp.resolve("src/main/java"), List.of(target, other)), limits);
+        assertFalse(second.resources().references().stream().anyMatch(r -> r.target().equals("app.Target")));
+        assertTrue(second.resources().references().stream().anyMatch(r -> r.target().equals("app.Other")));
     }
 
     private static Path write(Path file, String content) throws IOException {

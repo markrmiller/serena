@@ -12,6 +12,8 @@ import io.serena.javarefactor.shared.JavaStyleProfile;
 import io.serena.javarefactor.shared.ProjectPathResolver;
 import io.serena.javarefactor.shared.SemanticTargetGate;
 import io.serena.javarefactor.shared.SourceText;
+import io.serena.javarefactor.v3.frameworks.FrameworkParticipationCoordinator;
+import io.serena.javarefactor.v3.frameworks.SymbolChange;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -163,8 +165,12 @@ public final class EncapsulateFieldPlanner {
             // JPA mapping annotation (field-access entity) or a Jackson member binding the new accessors could alter.
             javax.lang.model.element.Element fieldOwner = field.element().getEnclosingElement();
             if (fieldOwner instanceof javax.lang.model.element.TypeElement ownerType) {
-                warnings.addAll(FrameworkEncapsulationReview.reviewWarnings(
-                        index, ownerType.getQualifiedName().toString(), field.element().getSimpleName().toString()));
+                String ownerFqn = ownerType.getQualifiedName().toString();
+                String frameworkFieldName = field.element().getSimpleName().toString();
+                warnings.addAll(FrameworkEncapsulationReview.reviewWarnings(index, ownerFqn, frameworkFieldName));
+                warnings.addAll(new FrameworkParticipationCoordinator()
+                        .participate(model, SymbolChange.encapsulateField(ownerFqn, frameworkFieldName))
+                        .warnings());
             }
             return ResponseBuilder.acceptedResult(projectRoot, "encapsulateField", apply,
                     "{\"identity\":" + encapsulateKeyJson + ",\"semanticKey\":" + encapsulateKeyJson + "}",

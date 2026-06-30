@@ -86,7 +86,7 @@ final class ResourceRewriter {
         ResourceScanScope scope = new ResourceScanScope(
                 policy.scanXml(), policy.scanProperties(), policy.scanYaml(), policy.scanJson(),
                 policy.scanServiceLoader());
-        ResourcePlanner.ResourcePlan plan = new ResourcePlanner(projectRoot, model).plan(request, scope);
+        ResourcePlanner.ResourcePlan plan = new ResourcePlanner(projectRoot, model, policy.maxResourceFileBytes()).plan(request, scope);
 
         // Story R06 gate: when the resource scan was incomplete (an in-scope file was unreadable, so we could not
         // determine whether it references a moved type) NO resource edit may be auto-applied — the package move's
@@ -101,7 +101,7 @@ final class ResourceRewriter {
         List<PlannerSupport.TextEdit> edits = new ArrayList<>();
         if (!scanIncomplete) {
             for (ResourceEdit edit : plan.edits()) {
-                if (!ResourceApplyPolicy.autoApplies(edit.confidence(), policy.rewritePackagePrefixes())) {
+                if (!ResourceApplyPolicy.autoApplies(edit.confidence(), policy.applyMediumConfidence())) {
                     continue;
                 }
                 edits.add(new PlannerSupport.TextEdit(edit.file(), edit.startOffset(), edit.endOffset(), edit.newText(),

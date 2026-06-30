@@ -5,16 +5,26 @@ import io.serena.javarefactor.compiler.FrameworkAnnotationIndex.AnnotationOccurr
 import io.serena.javarefactor.compiler.SemanticIndex;
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.project.JavaProjectModel;
+import io.serena.javarefactor.project.ResourceRootModel;
 import io.serena.javarefactor.project.SourceSet;
 import io.serena.javarefactor.protocol.JsonUtil;
+import io.serena.javarefactor.v3.resources.ResourceConfidence;
+import io.serena.javarefactor.v3.resources.ResourceReference;
+import io.serena.javarefactor.v3.resources.ResourceReferenceKind;
+import io.serena.javarefactor.v3.resources.ResourceReferenceScanner;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Entry point for the read-only framework SPI ops {@code frameworks.detect} and {@code frameworks.findReferences}
@@ -74,11 +84,13 @@ public final class FrameworkScanner {
             }
         }
 
+        List<String> resourceEvidence = resourceFrameworkEvidence(null);
         StringBuilder frameworks = new StringBuilder("[");
         boolean first = true;
         for (FrameworkPlugin plugin : registry.plugins()) {
             Map<String, Integer> annoCounts = evidence.get(plugin.id());
-            boolean detected = annoCounts != null && !annoCounts.isEmpty();
+            List<String> pluginResourceEvidence = resourceEvidenceFor(resourceEvidence, plugin.id());
+            boolean detected = (annoCounts != null && !annoCounts.isEmpty()) || !pluginResourceEvidence.isEmpty();
             if (!first) {
                 frameworks.append(",");
             }
@@ -86,7 +98,8 @@ public final class FrameworkScanner {
             frameworks.append("{")
                     .append("\"framework\":").append(JsonUtil.quote(plugin.id())).append(",")
                     .append("\"detected\":").append(detected).append(",")
-                    .append("\"evidence\":").append(evidenceJson(annoCounts))
+                    .append("\"evidence\":").append(evidenceJson(annoCounts)).append(",")
+                    .append("\"resourceEvidence\":").append(rawJsonArray(pluginResourceEvidence))
                     .append("}");
         }
         frameworks.append("]");
@@ -121,6 +134,7 @@ public final class FrameworkScanner {
                 }
             }
         }
+        references.addAll(resourceFrameworkEvidence(fqn));
 
         StringBuilder refs = new StringBuilder("[");
         for (int i = 0; i < references.size(); i++) {
@@ -155,6 +169,124 @@ public final class FrameworkScanner {
                 + "\"elementName\":" + JsonUtil.quote(occ.elementName()) + ","
                 + "\"confidence\":" + JsonUtil.quote(confidence)
                 + "}";
+    }
+
+
+    private List<String> resourceFrameworkEvidence(String targetFqn) throws IOException {
+        List<String> facts = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        if (targetFqn != null && !targetFqn.isBlank()) {
+            ResourceReferenceScanner.ScanResult scan = new ResourceReferenceScanner(projectRoot, model).referencesFor(Set.of(targetFqn));
+            for (ResourceReference ref : scan.references()) {
+                addResourceFact(facts, seen, ref, targetFqn);
+            }
+        }
+        for (Path file : resourceFiles()) {
+            String relative = PlannerSupport.relative(projectRoot, file);
+            String lowerPath = relative.toLowerCase(Locale.ROOT);
+            String content;
+            try {
+                content = Files.readString(file);
+            } catch (IOException | RuntimeException ignored) {
+                continue;
+            }
+            String lower = content.toLowerCase(Locale.ROOT);
+            if ((targetFqn == null || content.contains(targetFqn)) && lowerPath.endsWith(".xml")
+                    && lower.contains("<bean") && lower.contains("class=")) {
+                addRawResourceFact(facts, seen, "spring", "SPRING_XML_BEAN_CLASS", relative,
+                        targetFqn == null ? "detects" : "names", "HIGH", targetFqn);
+            }
+            if ((targetFqn == null || content.contains(targetFqn))
+                    && (lowerPath.endsWith("persistence.xml") || lowerPath.endsWith("orm.xml")
+                    || lower.contains("<entity-mappings") || lower.contains("<persistence"))) {
+                addRawResourceFact(facts, seen, "jpa", "JPA_XML_CLASS", relative,
+                        targetFqn == null ? "detects" : "names", "HIGH", targetFqn);
+            }
+            if (targetFqn != null && (lower.contains("select ") || lower.contains(" from ") || lower.contains(" join "))
+                    && content.contains(targetFqn)) {
+                addRawResourceFact(facts, seen, "jpa", "JPQL_STRING_CANDIDATE", relative,
+                        "names", "LOW", targetFqn);
+            }
+        }
+        return facts;
+    }
+
+    private List<Path> resourceFiles() throws IOException {
+        List<Path> files = new ArrayList<>();
+        for (Path root : ResourceRootModel.resourceRoots(model)) {
+            if (!Files.isDirectory(root)) {
+                continue;
+            }
+            try (Stream<Path> walk = Files.walk(root)) {
+                walk.filter(Files::isRegularFile)
+                        .map(path -> path.toAbsolutePath().normalize())
+                        .forEach(files::add);
+            }
+        }
+        return files;
+    }
+
+    private void addResourceFact(List<String> facts, Set<String> seen, ResourceReference ref, String targetFqn) {
+        FrameworkRegistry.Owner owner = ownerForResource(ref);
+        if (owner == null) {
+            return;
+        }
+        String confidence = ref.confidence() == ResourceConfidence.HIGH ? "HIGH"
+                : ref.confidence() == ResourceConfidence.MEDIUM ? "MEDIUM" : "LOW";
+        addRawResourceFact(facts, seen, owner.frameworkId(), ref.kind().name(),
+                PlannerSupport.relative(projectRoot, ref.file()), "names", confidence, targetFqn);
+    }
+
+    private FrameworkRegistry.Owner ownerForResource(ResourceReference ref) {
+        if (ref.kind() == ResourceReferenceKind.SPRING_BEAN_CLASS) {
+            return new FrameworkRegistry.Owner("spring", "XML_BEAN");
+        }
+        if (ref.kind() == ResourceReferenceKind.JPA_ENTITY_CLASS) {
+            return new FrameworkRegistry.Owner("jpa", "XML_ENTITY");
+        }
+        String path = PlannerSupport.relative(projectRoot, ref.file()).toLowerCase(Locale.ROOT);
+        if (path.endsWith("persistence.xml") || path.endsWith("orm.xml")) {
+            return new FrameworkRegistry.Owner("jpa", "XML_ENTITY");
+        }
+        return null;
+    }
+
+    private static void addRawResourceFact(List<String> facts, Set<String> seen, String framework, String kind,
+                                           String relativePath, String matchKind, String confidence, String targetFqn) {
+        String key = framework + "|" + kind + "|" + relativePath + "|" + matchKind + "|" + targetFqn;
+        if (!seen.add(key)) {
+            return;
+        }
+        facts.add("{"
+                + "\"framework\":" + JsonUtil.quote(framework) + ","
+                + "\"role\":" + JsonUtil.quote(kind) + ","
+                + "\"matchKind\":" + JsonUtil.quote(matchKind) + ","
+                + "\"path\":" + JsonUtil.quote(relativePath) + ","
+                + "\"confidence\":" + JsonUtil.quote(confidence)
+                + (targetFqn == null ? "" : ",\"target\":" + JsonUtil.quote(targetFqn))
+                + "}");
+    }
+
+    private static String rawJsonArray(List<String> jsonObjects) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < jsonObjects.size(); i++) {
+            if (i > 0) {
+                out.append(",");
+            }
+            out.append(jsonObjects.get(i));
+        }
+        return out.append("]").toString();
+    }
+
+    private static List<String> resourceEvidenceFor(List<String> facts, String frameworkId) {
+        List<String> selected = new ArrayList<>();
+        String needle = "\"framework\":" + JsonUtil.quote(frameworkId);
+        for (String fact : facts) {
+            if (fact.contains(needle)) {
+                selected.add(fact);
+            }
+        }
+        return selected;
     }
 
     private static String evidenceJson(Map<String, Integer> annoCounts) {

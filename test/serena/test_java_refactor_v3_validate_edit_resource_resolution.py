@@ -39,6 +39,50 @@ def _findings(result: dict[str, Any]) -> list[str]:
     return list(result.get("resourceFindings") or [])
 
 
+def _framework_findings(result: dict[str, Any]) -> list[str]:
+    return list(result.get("frameworkFindings") or [])
+
+
+def _build_findings(result: dict[str, Any]) -> list[str]:
+    return list(result.get("buildFindings") or [])
+
+
+def test_validate_edit_flags_framework_findings_for_annotated_type_delete(sidecar_jar: Path, tmp_path: Path) -> None:
+    project = tmp_path / "framework_findings"
+    annotation = "src/main/java/org/springframework/stereotype/Component.java"
+    service = "src/main/java/com/acme/Service.java"
+    _write(
+        project,
+        annotation,
+        "package org.springframework.stereotype;\npublic @interface Component {}\n",
+    )
+    _write(
+        project,
+        service,
+        "package com.acme;\n"
+        "import org.springframework.stereotype.Component;\n"
+        "@Component\n"
+        "public class Service {}\n",
+    )
+
+    result = _validate(project, sidecar_jar, {"deletedFiles": [service]})
+    assert result.get("accepted") is True, result
+    findings = _framework_findings(result)
+    assert any("com.acme.Service" in finding for finding in findings), result
+    assert result.get("ready") is False, result
+
+
+def test_validate_edit_flags_build_findings_for_build_descriptor_change(sidecar_jar: Path, tmp_path: Path) -> None:
+    project = tmp_path / "build_findings"
+    _write(project, "src/main/java/com/acme/App.java", "package com.acme;\npublic class App {}\n")
+
+    result = _validate(project, sidecar_jar, {"changedFiles": {"pom.xml": "<project></project>\n"}})
+    assert result.get("accepted") is True, result
+    findings = _build_findings(result)
+    assert any("pom.xml" in finding for finding in findings), result
+    assert result.get("ready") is True, result
+
+
 def test_validate_edit_flags_dangling_spring_bean_after_rename_without_resource_rewrite(sidecar_jar: Path, tmp_path: Path) -> None:
     project = tmp_path / "dangling_spring_bean"
     rel = "src/main/java/com/acme/CustomerService.java"

@@ -359,6 +359,32 @@ def test_status_reports_v2_capabilities(sidecar_jar: Path, tmp_path: Path) -> No
         # before/after); a destination collision or type shadowing on the compile path is caught and refused rather
         # than silently applied, so the operation is safe-by-refusal and supported.
         "moveSourceRoot",
+        "transformation.createWorkspace",
+        "transformation.addOperation",
+        "transformation.addSession",
+        "transformation.preview",
+        "transformation.apply",
+        "transformation.ackApply",
+        "transformation.cancel",
+        "transformation.list",
+        "transformation.report",
+        "deletion.propagateSafeDelete",
+        "deletion.findDeadCode",
+        "classRefactor.extractClass",
+        "classRefactor.extractSuperclass",
+        "classRefactor.replaceInheritanceWithDelegation",
+        "conversions.anonymousToLambda",
+        "conversions.lambdaToMethodReference",
+        "inlineRefactor.deepInlineMethod",
+        "recipes.scanMigrationOpportunities",
+        "recipes.applyRecipe",
+        "resources.findReferences",
+        "resources.planEdits",
+        "frameworks.detect",
+        "frameworks.findReferences",
+        "frameworks.participate",
+        "graph.build",
+        "impact.facts",
     )
     for operation in supported_beta_ops:
         assert capabilities[operation] == "beta"

@@ -39,26 +39,18 @@ V3_INVARIANTS: tuple[str, ...] = (
 #                      (the sidecar's ``Trees``/``Elements`` model over the project), NOT from text heuristics. A
 #                      read-only row is therefore still compiler-backed and honestly carries ``javacValidated``.
 _DELTA_VALIDATED_TOOLS: frozenset[str] = frozenset({
-    "renamePackage",
+    "applyRefactorRecipe",
+    "convertAnonymousToLambda",
+    "convertLambdaToMethodReference",
+    "deepInlineMethod",
+    "extractClass",
+    "extractSuperclass",
     "movePackage",
     "moveSourceRoot",
     "propagatingSafeDelete",
-    "extractClass",
-    "extractSuperclass",
+    "renamePackage",
     "replaceInheritanceWithDelegation",
-    "deepInlineMethod",
-    "convertAnonymousToLambda",
-    "convertLambdaToMethodReference",
-    "applyRefactorRecipe",
     "transformationWorkspace",
-    # Analytic V3 tools validate against compiler-derived fact snapshots.
-    "deadCodeScan",
-    "resourceProviders",
-    "frameworkDetect",
-    "frameworkReferences",
-    "scanMigrationOpportunities",
-    "impactReport",
-    "transformationGraph",
 })
 
 _DELTA_INVARIANT_EVIDENCE: dict[str, str] = {
@@ -120,9 +112,11 @@ def _row_provenance(tool: str) -> str:
         "resourceProviders",
         "frameworkDetect",
         "frameworkReferences",
+        "frameworkParticipate",
         "scanMigrationOpportunities",
         "impactReport",
         "transformationGraph",
+        "transformationReport",
     }
     if tool in analytic_fact_validated:
         return "javac-facts"
@@ -153,6 +147,7 @@ ACCEPTANCE_MATRIX: tuple[dict[str, object], ...] = tuple(
     }
     for goal, tool in (
         ("G001", "transformationWorkspace"),
+        ("G001", "transformationReport"),
         ("G002", "transformationGraph"),
         ("G003", "renamePackage"),
         ("G003", "movePackage"),
@@ -162,6 +157,7 @@ ACCEPTANCE_MATRIX: tuple[dict[str, object], ...] = tuple(
         ("G005", "resourceProviders"),
         ("G005", "frameworkDetect"),
         ("G005", "frameworkReferences"),
+        ("G005", "frameworkParticipate"),
         ("G006", "extractClass"),
         ("G006", "extractSuperclass"),
         ("G007", "replaceInheritanceWithDelegation"),

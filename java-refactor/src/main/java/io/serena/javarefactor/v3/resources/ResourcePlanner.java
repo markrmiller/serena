@@ -1,5 +1,6 @@
 package io.serena.javarefactor.v3.resources;
 
+import io.serena.javarefactor.v3.graph.GraphCacheLimits;
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.project.JavaProjectModel;
 
@@ -42,7 +43,7 @@ public final class ResourcePlanner {
     private final long maxFileBytes;
 
     public ResourcePlanner(Path projectRoot, JavaProjectModel model) {
-        this(projectRoot, model, NO_FILE_SIZE_CAP);
+        this(projectRoot, model, GraphCacheLimits.DEFAULT_MAX_RESOURCE_FILE_BYTES);
     }
 
     /**

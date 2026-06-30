@@ -153,4 +153,35 @@ final class ResourceScanIncompleteGateTest {
         return new JavaProjectModel(
                 root, "test", List.of(sourceSet), List.of(), List.of(), List.of(), false, false, List.of());
     }
+
+    @Test
+    void planEditsEmitsWorkspaceEditForAutoApply(@TempDir Path root) throws IOException {
+        seedMovedType(root);
+        writeResource(root, "beans.xml", "<beans>\n  <bean id=\"impl\" class=\"com.acme.MyServiceImpl\"/>\n</beans>\n");
+
+        String json = new ResourceEditPlanner(root, model(root)).planEdits(
+                Map.of("typeFqnMap", Map.of("com.acme.MyServiceImpl", "com.other.MyServiceImpl")));
+        Map<String, Object> result = Json.parseObject(json);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> workspaceEdit = (Map<String, Object>) result.get("workspaceEdit");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> changes = (List<Map<String, Object>>) workspaceEdit.get("changes");
+        @SuppressWarnings("unchecked")
+        List<Object> fileOperations = (List<Object>) workspaceEdit.get("fileOperations");
+
+        assertFalse(changes.isEmpty(), "resources.planEdits must expose auto-apply edits as workspaceEdit.changes[]");
+        assertEquals("src/main/resources/beans.xml", changes.get(0).get("path"));
+        assertFalse(((List<?>) changes.get(0).get("edits")).isEmpty());
+        assertTrue(fileOperations.isEmpty());
+    }
+
+    @Test
+    void malformedRenameMapsAreStructuredRefusals(@TempDir Path root) throws IOException {
+        Map<String, Object> result = Json.parseObject(new ResourceEditPlanner(root, model(root))
+                .planEdits(Map.of("typeFqnMap", Map.of("com.acme.MyServiceImpl", 42))));
+
+        assertEquals(Boolean.FALSE, result.get("accepted"));
+        assertEquals("malformed_resource_edit_map", ((Map<?, ?>) result.get("refusal")).get("code"));
+    }
+
 }

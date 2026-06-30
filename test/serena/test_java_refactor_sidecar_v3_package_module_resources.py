@@ -145,16 +145,9 @@ def test_sidecar_rename_package_rewrites_resource_fqcn_and_warns_on_reflection(
 
 
 def test_sidecar_rename_package_respects_rewrite_resources_false(sidecar_jar: Path, tmp_path: Path) -> None:
-    # §5.5 per-call override: the same FQCN-in-beans.xml scenario, but the request explicitly opts out of resource
-    # rewriting (rewriteResources=false). The Java rename still moves the type and rewrites Java references (and still
-    # compiles — beans.xml is not on the compile path), but the resource is deliberately left untouched. This proves the
-    # new per-request parameter is honored as a real opt-out, not silently ignored.
+    # Exact Spring XML references cannot be silently left dangling when resource rewrites are disabled.
     project_root = tmp_path / "resource_rewrite_off"
-    _write(
-        project_root,
-        "src/main/java/com/acme/app/Service.java",
-        "package com.acme.app;\npublic class Service {\n    public int value() { return 1; }\n}\n",
-    )
+    _write(project_root, "src/main/java/com/acme/app/Service.java", "package com.acme.app;\npublic class Service { int value = 1; }\n")
     _write(
         project_root,
         "src/main/resources/META-INF/beans.xml",
@@ -168,25 +161,9 @@ def test_sidecar_rename_package_respects_rewrite_resources_false(sidecar_jar: Pa
         {"oldPackage": "com.acme.app", "newPackage": "com.acme.core", "rewriteResources": False},
     )
 
-    assert result.get("accepted") is True, result
-    assert result.get("diagnosticDeltaValidated") is True, result
-
-    # The Java type still moves (the rename itself is unaffected by the resource opt-out).
-    renames = {
-        (op["relativePath"].replace("\\", "/"), op["newRelativePath"].replace("\\", "/"))
-        for op in file_ops(result["workspaceEdit"])
-        if op["kind"] == "rename"
-    }
-    assert ("src/main/java/com/acme/app/Service.java", "src/main/java/com/acme/core/Service.java") in renames, renames
-
-    # ...but the resource is deliberately NOT rewritten: no edit targets beans.xml.
-    resource_rel = "src/main/resources/META-INF/beans.xml"
-    resource_edits = [
-        edit
-        for edit in text_edits(result["workspaceEdit"])
-        if edit["relativePath"].replace("\\", "/") == resource_rel
-    ]
-    assert resource_edits == [], resource_edits
+    assert result.get("accepted") is False
+    assert result.get("refusal", {}).get("code") == "validation_findings_not_ready"
+    assert "SPRING_BEAN_CLASS" in result.get("refusal", {}).get("message", "")
 
 
 def test_sidecar_move_package_rewrites_resource_fqcn(sidecar_jar: Path, tmp_path: Path) -> None:
@@ -225,15 +202,9 @@ def test_sidecar_move_package_rewrites_resource_fqcn(sidecar_jar: Path, tmp_path
 
 
 def test_sidecar_move_package_respects_rewrite_resources_false(sidecar_jar: Path, tmp_path: Path) -> None:
-    # §5.5 per-call override for movePackage: the same FQCN-in-beans.xml scenario with rewriteResources=false. The move
-    # still relocates the type and rewrites Java references (and still compiles — beans.xml is off the compile path), but
-    # the resource is deliberately left untouched. Proves the move op's per-request opt-out is honored, not ignored.
-    project_root = tmp_path / "move_resource_off"
-    _write(
-        project_root,
-        "src/main/java/com/acme/app/Service.java",
-        "package com.acme.app;\npublic class Service {\n    public int value() { return 1; }\n}\n",
-    )
+    # Exact Spring XML references cannot be silently left dangling when resource rewrites are disabled.
+    project_root = tmp_path / "move_resource_rewrite_off"
+    _write(project_root, "src/main/java/com/acme/app/Service.java", "package com.acme.app;\npublic class Service { int value = 1; }\n")
     _write(
         project_root,
         "src/main/resources/META-INF/beans.xml",
@@ -247,25 +218,9 @@ def test_sidecar_move_package_respects_rewrite_resources_false(sidecar_jar: Path
         {"sourcePackage": "com.acme.app", "targetPackage": "com.acme.core", "rewriteResources": False},
     )
 
-    assert result.get("accepted") is True, result
-    assert result.get("diagnosticDeltaValidated") is True, result
-
-    # The Java type still relocates (the move itself is unaffected by the resource opt-out).
-    renames = {
-        (op["relativePath"].replace("\\", "/"), op["newRelativePath"].replace("\\", "/"))
-        for op in file_ops(result["workspaceEdit"])
-        if op["kind"] == "rename"
-    }
-    assert ("src/main/java/com/acme/app/Service.java", "src/main/java/com/acme/core/Service.java") in renames, renames
-
-    # ...but the resource is deliberately NOT rewritten: no edit targets beans.xml.
-    resource_rel = "src/main/resources/META-INF/beans.xml"
-    resource_edits = [
-        edit
-        for edit in text_edits(result["workspaceEdit"])
-        if edit["relativePath"].replace("\\", "/") == resource_rel
-    ]
-    assert resource_edits == [], resource_edits
+    assert result.get("accepted") is False
+    assert result.get("refusal", {}).get("code") == "validation_findings_not_ready"
+    assert "SPRING_BEAN_CLASS" in result.get("refusal", {}).get("message", "")
 
 
 def test_sidecar_rename_package_respects_rewrite_module_info_false(sidecar_jar: Path, tmp_path: Path) -> None:

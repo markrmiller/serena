@@ -89,7 +89,9 @@ public final class CanonicalEnvelope {
             out.append(",\"impact\":").append(impact.json());
         }
         if (!hasRisk) {
-            out.append(",\"risk\":\"informational\"");
+            String risk = classifyReadOnlyRisk(root);
+            out.append(",\"risk\":").append(JsonUtil.quote(risk));
+            out.append(",\"riskClassification\":").append(JsonUtil.quote(risk));
         }
         return out.append('}').toString();
     }
@@ -120,6 +122,20 @@ public final class CanonicalEnvelope {
                 return new Impact(0, files, 0, 0, matches, 0);
             }
         }
+        // resources.findReferences / frameworks.findReferences: stats.{count,files}.
+        if (("findResourceReferences".equals(operation) || "findFrameworkReferences".equals(operation))
+                && root.get("stats") instanceof Map<?, ?> stats) {
+            int count = intValue(stats.get("count"));
+            int files = intValue(stats.get("files"));
+            int resourceFiles = "findResourceReferences".equals(operation) ? files : 0;
+            int javaFiles = "findFrameworkReferences".equals(operation) ? files : 0;
+            return new Impact(0, javaFiles, resourceFiles, 0, count, 0);
+        }
+        // frameworks.detect / frameworks.participate / graph.build are read-only provenance reports; their impact is zero.
+        if ("detectFrameworks".equals(operation) || "frameworks.participate".equals(operation)
+                || "participateFrameworks".equals(operation) || "graph.build".equals(operation)) {
+            return new Impact(0, 0, 0, 0, 0, 0);
+        }
         // transformation.report: report.summary is a §1.1 stats block
         if (root.get("report") instanceof Map<?, ?> report
                 && report.get("summary") instanceof Map<?, ?> summary
@@ -133,6 +149,17 @@ public final class CanonicalEnvelope {
                     intValue(summary.get("fileOperations")));
         }
         return null;
+    }
+
+    private static String classifyReadOnlyRisk(Map<String, Object> root) {
+        boolean needsReview = !asList(root.get("warnings")).isEmpty()
+                || !asList(root.get("structuredWarnings")).isEmpty()
+                || isTrue(root.get("resourceScanIncomplete"));
+        if (root.get("riskFacts") instanceof Map<?, ?> riskFacts
+                && !asList(riskFacts.get("analysisIncomplete")).isEmpty()) {
+            needsReview = true;
+        }
+        return needsReview ? "needs_review" : "informational";
     }
 
     /**
@@ -173,6 +200,7 @@ public final class CanonicalEnvelope {
         }
         if (!hasRisk) {
             out.append(",\"risk\":").append(JsonUtil.quote(risk));
+            out.append(",\"riskClassification\":").append(JsonUtil.quote(risk));
         }
         return out.append('}').toString();
     }

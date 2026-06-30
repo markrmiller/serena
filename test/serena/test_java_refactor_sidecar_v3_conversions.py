@@ -291,3 +291,24 @@ def test_sidecar_convert_lambda_to_method_reference_refuses_block_body(
 
     assert result.get("accepted") is False, result
     assert result["refusal"]["code"] == "lambda_not_single_call", result
+
+
+def test_sidecar_lambda_to_method_reference_uses_fqn_for_unimported_receiver(sidecar_jar, tmp_path, monkeypatch):
+    monkeypatch.setenv("SERENA_JAVA_REFACTOR_JAR", str(sidecar_jar))
+    root = tmp_path
+    _write(
+        root,
+        f"{JDIR}/Main.java",
+        """package com.acme.app;
+import java.util.function.Function;
+public class Main {
+  Function<java.util.Locale, String> f = l -> l.toLanguageTag();
+}
+""",
+    )
+    manager = _manager(root)
+
+    result = manager.convert_lambda_to_method_reference(f"{JDIR}/Main.java", 4, apply=True)
+
+    assert result["accepted"] is True, result
+    assert "java.util.Locale::toLanguageTag" in (root / f"{JDIR}/Main.java").read_text()

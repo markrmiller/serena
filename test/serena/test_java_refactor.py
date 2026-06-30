@@ -764,6 +764,8 @@ def test_impact_report_include_flags_are_presentation_only(tmp_path: Path, monke
             "mode": "impact_report",
             "workspaceId": workspace_id,
             "operation": "renameMember",
+            "projectRevision": "rev-1",
+            "javacFactsValidated": True,
             "risk": "needs_review",
             "report": dict(full_report),
         }
@@ -1614,7 +1616,8 @@ def _validate_knob_manager(tmp_path: Path, source: Path, overlays: list, config:
 
     def validate_edit(overlay: dict) -> dict:
         overlays.append(overlay)
-        errors = [] if _is_baseline_overlay(overlay) else ["Main.java:1: error: broken by edit"]
+        broken_on_disk = "Renamed" in source.read_text(encoding="utf-8")
+        errors = [] if _is_baseline_overlay(overlay) and not broken_on_disk else ["Main.java:1: error: broken by edit"]
         return {"accepted": True, "ready": not errors, "errors": errors, "compilerErrors": errors, "warnings": []}
 
     def status(refresh: bool = False) -> SimpleNamespace:
@@ -1661,11 +1664,16 @@ def test_validate_before_apply_false_skips_pre_commit_but_post_validation_rolls_
     source.write_text("class Main {}\n", encoding="utf-8")
     overlays: list = []
 
-    manager = _validate_knob_manager(tmp_path, source, overlays, JavaRefactorConfig(enabled=True, validate_before_apply=False))
+    manager = _validate_knob_manager(
+        tmp_path,
+        source,
+        overlays,
+        JavaRefactorConfig(enabled=True, validate_before_apply=False, allow_incomplete_analysis=False),
+    )
     result = manager.semantic_rename("Main.java", 1, 1, "Renamed", apply=True)
 
-    # Pre-commit validation was skipped entirely (no overlay reached the sidecar before commit).
-    assert overlays == []
+    # Staged pre-commit validation was skipped; only the baseline/post empty-overlay checks ran.
+    assert all(_is_baseline_overlay(overlay) for overlay in overlays)
     # ...but the apply gate still held: the broken commit was rolled back by post-validation.
     assert result["refusal"]["code"] == "post_validation_failed"
     assert result["accepted"] is False
@@ -1909,13 +1917,16 @@ def test_java_refactor_manager_rolls_back_on_post_validation_failure(tmp_path: P
 
     # status() is now called twice: once pre-apply (the H3 degraded-model gate, which must see a healthy non-degraded
     # model so apply proceeds) and once post-apply (the post-validation pass, which reports failure to force rollback).
-    # validate_edit() is the staged pre-commit pass: it reports clean here so the apply proceeds to commit, exercising
-    # the on-disk post-apply guard (whose javac sees an error the in-memory overlay validation did not model).
+    # validate_edit() is now the canonical pre/post gate: it reports clean before commit and fails after the disk write.
+    def validate_edit(overlay: dict) -> dict:
+        errors = ["post-validation error"] if "interface" in source.read_text(encoding="utf-8") else []
+        return {"accepted": True, "ready": not errors, "errors": errors, "compilerErrors": errors, "warnings": []}
+
     fake_client = SimpleNamespace(
         is_running=lambda: True,
         scan_references=_covered_scan_references,
         apply_refactor=lambda operation, params: {"accepted": True, "workspaceEdit": workspace_edit},
-        validate_edit=lambda overlay: {"accepted": True, "ready": True, "errors": [], "warnings": []},
+        validate_edit=validate_edit,
         status=lambda refresh=False: SimpleNamespace(
             ready=False, errors=["post-validation error"], project_model={"conventionalFallbackUsed": False, "warnings": []}
         ),
@@ -4239,6 +4250,76 @@ def test_preview_validation_reports_refused_validate_edit_as_not_ready(tmp_path:
     assert source.read_text(encoding="utf-8") == "class Main {}\n"
 
 
+def test_preview_validation_resource_findings_are_refused(tmp_path: Path) -> None:
+    source = tmp_path / "Main.java"
+    source.write_text("class Main {}\n", encoding="utf-8")
+    workspace_edit = _single_edit_workspace_edit(source)
+
+    fake_client = SimpleNamespace(
+        is_running=lambda: True,
+        preview=lambda operation, params: {"accepted": True, "workspaceEdit": workspace_edit},
+        validate_edit=lambda overlay: {
+            "accepted": True,
+            "ready": False,
+            "compilerErrors": [],
+            "errors": [],
+            "resourceFindings": ["src/main/resources/beans.xml -> com.acme.Missing"],
+        },
+        status=lambda refresh=False: SimpleNamespace(
+            ready=True, errors=[], project_model={"conventionalFallbackUsed": False, "warnings": []}
+        ),
+    )
+    manager = JavaRefactorManager(
+        str(tmp_path), LanguageBackend.LSP, [Language.JAVA], java_refactor_config=JavaRefactorConfig(enabled=True)
+    )
+    manager._client = fake_client  # type: ignore[assignment]
+
+    result = manager.semantic_rename("Main.java", 1, 1, "Renamed", apply=False, validate=True)
+
+    assert result["accepted"] is False
+    assert result["applied"] is False
+    assert result["refusal"]["code"] == "validation_findings_not_ready"
+    assert result["previewValidation"]["resourceFindings"] == ["src/main/resources/beans.xml -> com.acme.Missing"]
+    assert source.read_text(encoding="utf-8") == "class Main {}\n"
+
+
+def test_apply_prevalidation_resource_findings_refuse_before_write(tmp_path: Path) -> None:
+    source = tmp_path / "Main.java"
+    source.write_text("class Main {}\n", encoding="utf-8")
+    original = source.read_text(encoding="utf-8")
+    workspace_edit = _single_edit_workspace_edit(source)
+
+    fake_client = SimpleNamespace(
+        is_running=lambda: True,
+        scan_references=_covered_scan_references,
+        apply_refactor=lambda operation, params: {"accepted": True, "workspaceEdit": workspace_edit},
+        validate_edit=lambda overlay: {
+            "accepted": True,
+            "ready": False,
+            "compilerErrors": [],
+            "errors": [],
+            "resourceFindings": ["src/main/resources/beans.xml -> com.acme.Missing"],
+        },
+        status=lambda refresh=False: SimpleNamespace(
+            ready=True, errors=[], project_model={"conventionalFallbackUsed": False, "warnings": []}
+        ),
+    )
+    manager = JavaRefactorManager(
+        str(tmp_path), LanguageBackend.LSP, [Language.JAVA], java_refactor_config=JavaRefactorConfig(enabled=True)
+    )
+    manager._client = fake_client  # type: ignore[assignment]
+
+    result = manager.semantic_rename("Main.java", 1, 1, "Renamed", apply=True)
+
+    assert result["accepted"] is False
+    assert result["applied"] is False
+    assert result["editsAlreadyApplied"] is False
+    assert result["refusal"]["code"] == "pre_apply_validation_failed"
+    assert result["refusal"]["validation"]["code"] == "validation_findings_not_ready"
+    assert result["refusal"]["validation"]["resourceFindings"] == ["src/main/resources/beans.xml -> com.acme.Missing"]
+    assert source.read_text(encoding="utf-8") == original
+
+
 def test_apply_rolls_back_when_post_apply_revalidation_is_refused(tmp_path: Path) -> None:
     # Under allow_incomplete_analysis the post-apply guard re-validates the committed sources. If THAT validateEdit is
     # refused, the committed edit's validity is unknown — it must be treated as a post-validation failure and rolled
@@ -5105,3 +5186,67 @@ def test_tool_inclusion_excludes_everything_without_active_project(tmp_path: Pat
 
     assert not inclusion.included_optional_tools
     assert "java_change_signature" in set(inclusion.excluded_tools)
+
+
+def test_workspace_rejects_v3_operation_without_project_revision():
+    from serena.java_refactor.workspace_edit import RefactorWorkspaceEdit
+    from serena.java_refactor_v3.models import RiskLevel
+    from serena.java_refactor_v3.workspace import TransformationWorkspace, V3OperationPlan
+
+    class Driver:
+        def plan_v3_operation(self, operation, params):
+            return V3OperationPlan(
+                operation=operation,
+                project_revision=None,
+                workspace_edit=RefactorWorkspaceEdit(),
+                risk=RiskLevel.SAFE,
+                warnings=[],
+            )
+
+    result = TransformationWorkspace("w1", Driver()).add_operation("package.rename", {})
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "workspace_revision_mismatch"
+    assert "project revision" in result["refusal"]["message"]
+
+
+def test_impact_report_include_resources_filters_v3_resource_impact():
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    manager._config = SimpleNamespace(enabled=True)
+    manager._project_root = Path("/tmp/project")
+    manager._validate_supported_project = lambda: None
+    manager._get_or_start_client = lambda refresh=False: object()
+
+    class Workspaces:
+        def impact_report(self, workspace_id, build):
+            return {
+                "accepted": True,
+                "report": {
+                    "summary": {"changedFiles": 1},
+                    "semanticImpact": {"types": []},
+                    "resourceImpact": {"resources": ["src/main/resources/app.yml"]},
+                    "tests": {"incoming": []},
+                    "warnings": [],
+                },
+                "risk": "safe",
+                "projectRevision": "rev-1",
+                "javacFactsValidated": True,
+            }
+
+    manager._transformation_workspaces = Workspaces()
+
+    result = manager.transformation_workspace_impact_report("w1", include_resources=False)
+
+    assert result["accepted"] is True
+    assert "resourceImpact" not in result["report"]
+    assert "summary" in result["report"]
+
+
+def test_v3_analysis_invariants_fail_closed_without_project_revision():
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+
+    result = manager._with_v3_analysis_invariants({"accepted": True, "mode": "scan"}, "findDeadCode")
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "V3_ANALYSIS_INVARIANT_MISSING"
+    assert result["refusal"]["missing"] == ["projectRevision", "impact", "riskClassification", "validation"]

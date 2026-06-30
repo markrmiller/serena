@@ -152,6 +152,12 @@ WORKSPACE_REVIEW_REQUIRED = register_refusal_code(
 )
 
 
+MAX_CASCADE_DEPTH_EXCEEDED = register_refusal_code(
+    "max_cascade_depth_exceeded",
+    "Cascade delete would exceed the configured max cascade depth; no partial delete plan was accepted.",
+)
+
+
 @dataclass
 class FileEditStat:
     """Per-file impact summary for one file a workspace's composed edit touches.
@@ -296,10 +302,14 @@ class ImpactReport:
         if isinstance(value, RiskLevel):
             return value.value
         if isinstance(value, dict):
-            raw = value.get("level", value.get("risk", RiskLevel.SAFE.value))
+            if "level" not in value and "risk" not in value:
+                raise ValueError("ImpactReport risk must include level or risk")
+            raw = value.get("level", value.get("risk"))
+            if raw is None or str(raw).strip() == "":
+                raise ValueError("ImpactReport risk must not be empty")
             return raw.value if isinstance(raw, RiskLevel) else str(raw)
-        if value is None:
-            return RiskLevel.SAFE.value
+        if value is None or str(value).strip() == "":
+            raise ValueError("ImpactReport risk must be explicit")
         return value.value if isinstance(value, RiskLevel) else str(value)
 
     @staticmethod
@@ -419,4 +429,12 @@ class ImpactReport:
             "api": legacy_api,
             "risk": risk_dict,
         }
+        public_summary = sections.get("summary")
+        if isinstance(public_summary, dict):
+            files_changed = public_summary.get("filesChanged")
+            if isinstance(files_changed, list):
+                public_summary.setdefault("changedFiles", files_changed)
+                public_summary["filesChanged"] = len(files_changed)
+            public_summary.setdefault("changedFileCount", public_summary.get("filesChanged", 0))
+
         return V3ImpactReportDict(sections, aliases)

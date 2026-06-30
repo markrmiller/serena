@@ -753,24 +753,44 @@ class V3ConversionsConfig:
 class V3ResourcesConfig:
     """Resource-provider scan scope (design §20)."""
 
+    rewrite_exact_class_names: bool = True
+    rewrite_package_prefixes: bool = False
+
     enabled: bool = True
     scan_xml: bool = True
     scan_properties: bool = True
     scan_yaml: bool = True
     scan_json: bool = True
     scan_service_loader: bool = True
-    auto_apply_confidence: str = "high"  # high | medium | low
+    auto_apply_confidence: str = "high"  # high | medium
     report_reflection_candidates: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "V3ResourcesConfig":
         config = _validated_from_dict(cls, data, domain="resources")
-        valid_confidence = {"high", "medium", "low"}
+        valid_confidence = {"high", "medium"}
         if config.auto_apply_confidence not in valid_confidence:
             raise ValueError(
                 f"Invalid resources.auto_apply_confidence value {config.auto_apply_confidence!r}; "
                 f"expected one of {sorted(valid_confidence)}."
             )
+        return config
+
+
+@dataclass
+class V3GraphConfig:
+    """Graph cache and resource scan limits (design §20)."""
+
+    max_graph_cache_entries: int = 1
+    max_resource_file_bytes: int = 1024 * 1024
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "V3GraphConfig":
+        config = _validated_from_dict(cls, data, domain="graph")
+        if config.max_graph_cache_entries < 0:
+            raise ValueError("Invalid graph.max_graph_cache_entries value; expected >= 0.")
+        if config.max_resource_file_bytes < 0:
+            raise ValueError("Invalid graph.max_resource_file_bytes value; expected >= 0.")
         return config
 
 
@@ -845,6 +865,7 @@ class JavaRefactorV3Config:
     conversions: V3ConversionsConfig = field(default_factory=V3ConversionsConfig)
     resources: V3ResourcesConfig = field(default_factory=V3ResourcesConfig)
     frameworks: V3FrameworksConfig = field(default_factory=V3FrameworksConfig)
+    graph: V3GraphConfig = field(default_factory=V3GraphConfig)
     recipes: V3RecipesConfig = field(default_factory=V3RecipesConfig)
     validation: V3ValidationConfig = field(default_factory=V3ValidationConfig)
 
@@ -879,6 +900,7 @@ _V2_NESTED_DATACLASSES: dict[tuple[type, str], type] = {
     (JavaRefactorV3Config, "conversions"): V3ConversionsConfig,
     (JavaRefactorV3Config, "resources"): V3ResourcesConfig,
     (JavaRefactorV3Config, "frameworks"): V3FrameworksConfig,
+    (JavaRefactorV3Config, "graph"): V3GraphConfig,
     (JavaRefactorV3Config, "recipes"): V3RecipesConfig,
     (JavaRefactorV3Config, "validation"): V3ValidationConfig,
 }

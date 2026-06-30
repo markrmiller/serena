@@ -53,26 +53,35 @@ either `accepted: true` or a structured `refusal`. Nothing is written until the 
 
 ```python
 from serena.java_refactor.workspace_edit import TransactionalWorkspaceEditApplier
-from serena.java_refactor_v3.graph import TransformationGraphBuilder
-from serena.java_refactor_v3.recipes import RecipeEngine, load_builtin_recipe
+from serena.java_refactor.client import JavaRefactorClient
+from serena.java_refactor_v3.impact_facts_client import ImpactFactsClient
+from serena.java_refactor_v3 import RecipeEngineClient
 from serena.java_refactor_v3.reports import ImpactReportBuilder
+from serena.java_refactor_v3.reports.sidecar_facts import SidecarFactsGraph, facts_to_graph_input
 
-graph = TransformationGraphBuilder(project_root).build("rev-1")
+client = JavaRefactorClient(sidecar_jar)
+client.start()
 
 # 1) preview a named migration recipe (no disk writes)
-recipe = load_builtin_recipe("junit4-to-junit5-annotations")
-plan = RecipeEngine(project_root, graph).plan(recipe)
-assert plan.accepted                      # or inspect plan.refusal.{code, message}
-print(plan.risk, plan.grouped())          # risk + byRule/byFile/byRisk preview counts
+# Built-in recipe ids (for example, the legacy ``load_builtin_recipe("junit4-to-junit5-basic")`` id) are passed by name.
+plan = RecipeEngineClient(client).apply_recipe(
+    recipe="junit4-to-junit5-basic", apply_needs_review=False
+)
+assert plan["accepted"]                   # or inspect plan["refusal"]["code"/"message"]
+print(plan["riskClassification"], plan["groups"])
 
 # 2) inspect the whole-repo impact before applying
+edit = plan["workspaceEdit"]
+touched = [change["path"] for change in edit.get("changes", [])]
+raw_facts = ImpactFactsClient(client).facts(touched)
+graph = SidecarFactsGraph(facts_to_graph_input(raw_facts))
 report = ImpactReportBuilder(project_root, graph).build(
-    plan.workspace_edit, risk=plan.risk, operation="applyRefactorRecipe"
+    edit, risk=plan["riskClassification"], operation="applyRefactorRecipe"
 ).to_dict()
 print(report["api"]["boundaryCrossed"], report["tests"]["impacted"])
 
 # 3) apply transactionally (all-or-nothing, revision-guarded by old_hash)
-TransactionalWorkspaceEditApplier(project_root).apply(plan.workspace_edit)
+TransactionalWorkspaceEditApplier(project_root).apply(edit)
 ```
 
 ## Impact reports
@@ -124,3 +133,114 @@ fan-out. These guarantees are executable: `test/serena/test_java_refactor_v3_per
 on a repeated same-revision build (the graph is not re-materialized), holds impact-report construction over a large
 synthetic repo (500 touched types) under a second, and checks that doubling the input does not grow construction
 time super-linearly.
+
+## Operator failure modes and refusal codes
+
+V3 refusals are structured and should be handled by `refusal.code`, not string matching. Common codes include:
+
+- `java_refactor_v3_disabled`, `operation_disabled`: config gate disabled the V3 surface or operation.
+- `project_revision_mismatch`, `workspace_already_applied`, `workspace_not_found`: workspace lifecycle/revision guard failed.
+- `V3_ANALYSIS_INVARIANT_MISSING`: a read-only V3 result did not carry explicit `projectRevision`, `impact`, `riskClassification`/`risk`, and `validation`/`provenance`.
+- `resource_target_unresolved`, `unsupported_resource_kind`, `malformed_resource_edit_map`: resource query/edit input is malformed.
+- `framework_target_unresolved`, `unsupported_framework_change`: framework SPI input is incomplete or unsupported.
+- Planner-specific safety refusals, such as public API deletion, unresolved target symbols, unsafe inline control flow, or invalid member selectors, are returned in the same envelope.
+
+Incomplete resource/framework scans are not warnings-only: V3 returns structured scan completeness and escalates risk.
+
+## Configuration reference
+
+The V3 tree lives under `java_refactor.v3`:
+
+- `enabled`: master V3 gate.
+- `packages.rename_enabled`, `packages.move_enabled`: package rename/move gates.
+- `packages.rewrite_module_info`, `packages.rewrite_resources`: package rewrite participation knobs.
+- `resources.enabled`, `resources.rewrite_exact_class_names`, `resources.rewrite_package_prefixes`: resource scan/edit behavior.
+- `frameworks.enabled`, `frameworks.spring`, `frameworks.jakarta_persistence`, `frameworks.jackson`, `frameworks.junit`: framework SPI enablement; per-framework value `off` disables that plugin.
+- `graph.max_graph_cache_entries`, `graph.max_resource_file_bytes`: graph cache size and resource scan cap. A resource-only edit, resource inventory change, provider identity change, or cap change invalidates the graph cache.
+- `recipes.builtins_enabled`, `recipes.allow_user_recipes`: recipe source policy.
+
+## V1/V2 migration notes
+
+V3 keeps V1/V2 entrypoints available, but whole-repo transformations should use V3 preview-first tools and transformation workspaces. Legacy V2 sessions can be enrolled only through the compatibility workspace adapter; authoritative multi-operation composition, impact reporting, revision guards, and final apply validation are V3 concerns.
+
+## Performance harness
+
+`test/serena/test_java_refactor_v3_perf.py` contains the runnable performance harness. It covers generated package-rename, safe-delete, recipe-scan, graph-cache warm/cold, and impact-report workloads through the public sidecar/manager paths, with CI-tolerant budgets and the plan's large-repo thresholds documented in the test module.
+
+## Per-tool example shape
+
+All public V3 read-only examples must include explicit provenance:
+
+```json
+{
+  "accepted": true,
+  "operation": "resources.findReferences",
+  "projectRevision": "<whole-project-token>",
+  "impact": {"summary": {"textEdits": 1}},
+  "risk": "informational",
+  "validation": {"kind": "resource-scan", "scanComplete": true}
+}
+```
+
+Edit-producing examples additionally include `workspaceEdit`, `diagnosticDeltaValidated`, and apply only through the transactional Python applier.
+
+## Release hardening evidence
+
+The shipped V3 surface is backed by implementation-facing examples and regression tests rather than by the plan text alone:
+
+- Framework read-only facts include annotation evidence plus resource-backed Spring XML bean classes, JPA `persistence.xml` / ORM XML class entries, and report-only JPQL string candidates. These facts are exposed by `frameworks.detect` / `frameworks.findReferences` with source locations, confidence, and framework roles.
+- Framework participation includes type/package changes and field-level member changes. JPA flags field/property access-strategy risk for field rename or encapsulation, and Jackson flags serialized-property compatibility risk for field rename or encapsulation.
+- Validation combines javac deltas with non-compiler channels: exact resource references, framework participation findings, build/classpath findings, and the final `ready` bit. Apply paths treat those findings as blocking when validation is enabled.
+- Build-tool validation, when enabled, scopes Maven and Gradle commands to affected modules/projects when the sidecar model can map touched source or resource paths to module roots. Root fallback is explicit (`scope: rootFallback`) when the module scope cannot be resolved.
+- Direct sidecar transformation workspaces capture a whole-project Java/resource revision token for apply, matching the public Python workspace's clean-revision requirement rather than relying only on touched-file hashes.
+
+### Operator examples
+
+Preview before apply remains the default for every edit-producing V3 tool:
+
+```python
+preview = manager.rename_package("com.acme.old", "com.acme.new", apply=False)
+assert preview["accepted"] is True
+assert preview["projectRevision"]
+assert preview["riskClassification"] in {"SAFE", "REVIEW_REQUIRED"}
+```
+
+Review-required edits must be explicitly allowed at apply time:
+
+```python
+result = manager.extract_superclass(
+    classes=["com.acme.OrderService", "com.acme.InvoiceService"],
+    superclass_name="AbstractBillingService",
+    selected_members=["calculateTotal"],
+    apply=True,
+    allow_review_required=True,
+)
+```
+
+Framework/resource scans are read-only but still carry V3 provenance and risk evidence:
+
+```python
+facts = manager.frameworks_find_references(target="com.acme.Customer")
+# facts["references"] may include SPRING_XML_BEAN_CLASS, JPA_XML_CLASS, and JPQL_STRING_CANDIDATE entries.
+```
+
+### Failure-mode and config quick reference
+
+- `java_refactor_v3_disabled`: global `java_refactor.v3.enabled` is false.
+- `*_disabled`: per-domain gate such as `packages.rename_enabled`, `packages.move_enabled`, `frameworks.enabled`, or `resources.enabled` is false.
+- `V3_ANALYSIS_INVARIANT_MISSING`: a supported V3 analysis endpoint did not emit required revision, impact, validation, or risk data.
+- `build_tool_validation_failed` / `build_tool_validation_timeout`: javac validation passed but the configured Maven/Gradle compile/test stage failed or timed out.
+- `workspace_revision_mismatch`: the project/model revision changed after preview; recreate the preview/workspace.
+- `resource_scan_incomplete` / resource validation findings: unreadable, over-cap, or dangling exact resource references prevent safe auto-apply.
+
+V3 config sections are documented by the typed config model and must remain aligned with the public tool surface: `packages`, `deletion`, `class_refactors`, `inline`, `conversions`, `resources`, `frameworks`, `graph`, `recipes`, `transformations`, and `validation`.
+
+### Performance evidence
+
+Large-repo performance checks are intentionally separated from normal unit tests. Run the gated performance harness before release qualification:
+
+```bash
+.venv/bin/python -m pytest -q test/serena/test_java_refactor_v3_perf.py
+```
+
+The harness records graph cold/warm behavior, package rename, safe-delete, recipe-scan, and report generation on generated fixtures. Release notes should copy the measured thresholds from that run instead of claiming plan-level targets without fresh measurements.

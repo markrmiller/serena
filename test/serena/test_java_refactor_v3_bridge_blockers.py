@@ -176,17 +176,12 @@ def test_revision_prefers_model_hash() -> None:
     assert JavaRefactorManager._v3_project_revision({"modelHash": "abc123"}) == "abc123"
 
 
-def test_revision_is_deterministic_fingerprint_without_model_hash() -> None:
-    # Without a modelHash the revision is a DETERMINISTIC structural fingerprint: the same on-disk model yields the
-    # same pin (so two ops over one model agree), and a different model yields a different pin.
-    model_a = {"sourceRoots": ["src/main/java"], "javaFiles": ["A.java"], "javaFileCount": 1}
-    model_b = {"sourceRoots": ["src/main/java"], "javaFiles": ["A.java", "B.java"], "javaFileCount": 2}
-    rev_a1 = JavaRefactorManager._v3_project_revision(dict(model_a))
-    rev_a2 = JavaRefactorManager._v3_project_revision(dict(model_a))
-    rev_b = JavaRefactorManager._v3_project_revision(dict(model_b))
-    assert rev_a1 is not None and rev_a1.startswith("derived:")
-    assert rev_a1 == rev_a2, "the same model must pin to the same deterministic revision"
-    assert rev_a1 != rev_b, "a structurally different model must pin to a different revision"
+def test_revision_fails_closed_without_model_hash() -> None:
+    assert JavaRefactorManager._v3_project_revision({"modelHash": "abc123"}) == "abc123"
+    assert JavaRefactorManager._v3_project_revision({"projectRevision": "rev-1"}) == "rev-1"
+    assert JavaRefactorManager._v3_project_revision({"sourceRoots": ["src/main/java"], "javaFiles": 1}) is None
+
+
 
 
 def test_revision_none_when_no_usable_fields() -> None:
@@ -213,24 +208,33 @@ def test_plan_refuses_enrollment_when_revision_unavailable(tmp_path: Path, monke
     assert result["refusal"]["code"] == "project_revision_unavailable"
 
 
-def test_plan_pins_deterministic_revision_when_model_hash_absent(tmp_path: Path, monkeypatch) -> None:
-    # When the modelHash is absent but the model carries a structural fingerprint, enrollment is NOT refused: it
-    # pins the deterministic derived revision.
-    model = {"sourceRoots": ["src/main/java"], "javaFiles": ["A.java"], "javaFileCount": 1}
-    manager = _manager(tmp_path, monkeypatch, project_model=model)
-    real_dispatch = manager._v3_plan_dispatch
+def test_plan_refuses_when_model_hash_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    manager._project_root = tmp_path
 
-    def _stub_dispatch() -> dict[str, Any]:
-        table = real_dispatch()
-        table["extractClass"] = lambda client, params: _accepted_payload()
-        return table
+    class Status:
+        project_model = {"sourceRoots": ["src/main/java"], "javaFiles": 1}
 
-    monkeypatch.setattr(manager, "_v3_plan_dispatch", _stub_dispatch)
+    class Client:
+        def status(self, refresh: bool = False):
+            return Status()
 
-    plan = manager.plan_v3_operation("extractClass", {})
-    assert isinstance(plan, V3OperationPlan), plan
-    assert plan.project_revision == JavaRefactorManager._v3_project_revision(model)
-    assert plan.project_revision.startswith("derived:")
+    monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: Client())
+    monkeypatch.setattr(manager, "_v3_disabled_refusal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(manager, "_validate_supported_project", lambda: None)
+    monkeypatch.setattr(
+        manager,
+        "_v3_plan_dispatch",
+        lambda: {"extractClass": lambda *args, **kwargs: {"accepted": True}},
+    )
+    monkeypatch.setattr(manager, "_extract_sidecar_v3_edit", lambda *args, **kwargs: ({"changes": []}, "LOW", [], {}))
+
+    result = manager.plan_v3_operation("extractClass", {"relative_path": "src/main/java/Source.java"})
+
+    assert isinstance(result, dict), result
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "project_revision_unavailable", result
+
 
 
 # ── B05: external formatter runs in the V3 transactional apply (post-commit, pre-javac), and rolls back ───────────

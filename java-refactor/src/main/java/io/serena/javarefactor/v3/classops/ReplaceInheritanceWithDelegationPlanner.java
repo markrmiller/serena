@@ -92,6 +92,7 @@ public final class ReplaceInheritanceWithDelegationPlanner {
                 + "\"fileOperations\":[]"
                 + "},"
                 + "\"warnings\":" + PlannerSupport.warningsJson(List.of()) + ","
+                + "\"riskFacts\":" + publicApiRiskFacts(plan.superclassFqn()) + ","
                 + "\"stats\":{\"forwardedMethods\":" + plan.forwardedMethods() + "}"
                 + "}";
     }
@@ -106,7 +107,8 @@ public final class ReplaceInheritanceWithDelegationPlanner {
         return new TransformationStep(
                 "replaceInheritanceWithDelegation", plan.edits(), List.of(), List.of(),
                 "{\"operation\":\"replaceInheritanceWithDelegation\",\"superclass\":"
-                        + JsonUtil.quote(plan.superclassFqn()) + "}");
+                        + JsonUtil.quote(plan.superclassFqn()) + "}",
+                publicApiRiskFacts(plan.superclassFqn()));
     }
 
     private ReplaceInheritancePlan compute(Map<String, Object> fields)
@@ -330,7 +332,13 @@ public final class ReplaceInheritanceWithDelegationPlanner {
                     continue;
                 }
                 if (!method.getTypeParameters().isEmpty()) {
-                    continue; // generic methods would carry unbound type variables into the subclass
+                    throw new ClassOpsRefusal(
+                            "replace_inheritance_generic_method",
+                            "Inherited generic method "
+                                    + method.getSimpleName()
+                                    + " from "
+                                    + method.getEnclosingElement()
+                                    + " cannot be forwarded safely.");
                 }
                 String name = method.getSimpleName().toString();
                 if (OBJECT_METHODS.contains(name)) {
@@ -425,6 +433,13 @@ public final class ReplaceInheritanceWithDelegationPlanner {
     private static String readSource(Path sourceFile) throws IOException {
         return java.nio.file.Files.readString(sourceFile);
     }
+
+    private static String publicApiRiskFacts(String superclassFqn) {
+        return "{\"publicApiChanges\":["
+                + JsonUtil.quote("Dropping supertype '" + superclassFqn + "' from the subclass public API.")
+                + "]}";
+    }
+
 
     /** Whether the caller explicitly confirmed the public-API change of dropping the supertype (§10.3). */
     private static boolean confirmPublicApiChange(Map<String, Object> fields) {

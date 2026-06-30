@@ -41,6 +41,7 @@ class InlineRefactorClient:
         column: int | None = None,
         method_name: str | None = None,
         delete_method: bool = False,
+        delete_inlined_method: bool | None = None,
         max_call_sites: int | None = None,
         validate: bool = True,
     ) -> dict[str, Any]:

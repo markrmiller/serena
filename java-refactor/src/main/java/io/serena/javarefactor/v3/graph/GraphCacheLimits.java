@@ -25,8 +25,8 @@ public record GraphCacheLimits(int maxGraphCacheEntries, long maxResourceFileByt
     /** The default entry budget: one revision retained (the legacy single-graph behavior). */
     public static final int DEFAULT_MAX_GRAPH_CACHE_ENTRIES = 1;
 
-    /** The default resource-file cap: 8 MiB. Files above this are surfaced via the over-cap signal, never silently cut. */
-    public static final long DEFAULT_MAX_RESOURCE_FILE_BYTES = 8L * 1024 * 1024;
+    /** The default resource-file cap: 1 MiB. Files above this are surfaced via the over-cap signal, never silently cut. */
+    public static final long DEFAULT_MAX_RESOURCE_FILE_BYTES = 1024L * 1024;
 
     public GraphCacheLimits {
         if (maxGraphCacheEntries < 0) {
@@ -37,7 +37,7 @@ public record GraphCacheLimits(int maxGraphCacheEntries, long maxResourceFileByt
         }
     }
 
-    /** The default limits (single-revision cache, 8 MiB resource cap). */
+    /** The default limits (single-revision cache, 1 MiB resource cap). */
     public static GraphCacheLimits defaults() {
         return new GraphCacheLimits(DEFAULT_MAX_GRAPH_CACHE_ENTRIES, DEFAULT_MAX_RESOURCE_FILE_BYTES);
     }

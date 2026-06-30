@@ -351,4 +351,28 @@ class MovePackagePlannerTest {
         return new JavaProjectModel(
                 root, "test", List.of(sourceSet), List.of(), List.of(), List.of(), false, false, List.of());
     }
+    @Test
+    void nestedDestinationTypeDoesNotBlockTopLevelMove(@TempDir Path root) throws Exception {
+        Map<String, String> files = new LinkedHashMap<>();
+        files.put("src/com/acme/source/Foo.java", """
+                package com.acme.source;
+                public class Foo {}
+                """);
+        files.put("src/com/acme/target/Holder.java", """
+                package com.acme.target;
+                public class Holder {
+                    static class Foo {}
+                }
+                """);
+        JavaProjectModel model = model(root, files);
+        Map<String, Object> fields = new HashMap<>();
+        fields.put("sourcePackage", "com.acme.source");
+        fields.put("targetPackage", "com.acme.target");
+
+        String json = new MovePackagePlanner(root, model).plan(fields, false);
+
+        assertTrue(json.contains("\"accepted\":true"), json);
+        assertFalse(json.contains("package_collision"), json);
+    }
+
 }

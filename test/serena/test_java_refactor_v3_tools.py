@@ -36,6 +36,7 @@ from serena.tools.java_refactor_v3_tools import (
     JavaExtractSuperclassTool,
     JavaFindDeadCodeTool,
     JavaFrameworkDetectTool,
+    JavaFrameworkParticipateTool,
     JavaImpactReportTool,
     JavaListTransformationWorkspacesTool,
     JavaPlanResourceEditsTool,
@@ -44,6 +45,7 @@ from serena.tools.java_refactor_v3_tools import (
     JavaResourceReferencesTool,
     JavaScanMigrationOpportunitiesTool,
     JavaTransformationGraphTool,
+    JavaTransformationWorkspaceReportTool,
 )
 
 
@@ -255,6 +257,7 @@ def test_replace_inheritance_with_delegation_empty_members_become_none() -> None
     )
     assert args == ("src/main/java/com/acme/app/Dog.java",)
     assert kwargs == {
+        "subclass_name_path": None,
         "members": None,
         "delegate_field_name": None,
         "superclass_fqn": None,
@@ -278,6 +281,7 @@ def test_replace_inheritance_with_delegation_forwards_member_selector() -> None:
     )
     assert args == ("src/main/java/com/acme/app/Dog.java",)
     assert kwargs == {
+        "subclass_name_path": None,
         "members": ["bark", "sit"],
         "delegate_field_name": "animal",
         "superclass_fqn": None,
@@ -300,6 +304,8 @@ def test_replace_inheritance_with_delegation_forwards_superclass_fqn() -> None:
     )
     assert args == ("src/main/java/com/acme/app/Dog.java",)
     assert kwargs == {
+        "subclass_name_path": None,
+        "subclass_name_path": None,
         "members": None,
         "delegate_field_name": None,
         "superclass_fqn": "com.acme.app.Animal",
@@ -550,14 +556,32 @@ def test_framework_detect_tool_forwards_to_manager() -> None:
     assert kwargs == {}
 
 
+def test_framework_participate_tool_forwards_to_manager() -> None:
+    # frameworks.participate is an advertised V3 sidecar capability and must be reachable through the public tool layer.
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaFrameworkParticipateTool,
+        stub,
+        "framework_participate",
+        change_kind="renameType",
+        target="com.acme.OldName",
+        new_name="com.acme.NewName",
+        max_answer_chars=512,
+    )
+    assert args == ("renameType", "com.acme.OldName", "com.acme.NewName")
+    assert kwargs == {}
+
+
 def test_new_v3_tools_are_registered() -> None:
     # The graph/resource/framework tools are not sidecar-internal: they are first-class registered V3 tools, so the
     # G002/G005 acceptance rows bind to something actually exposed at the Serena tool layer.
     for cls in (
         JavaTransformationGraphTool,
+    JavaTransformationWorkspaceReportTool,
         JavaResourceReferencesTool,
         JavaPlanResourceEditsTool,
         JavaFrameworkDetectTool,
+    JavaFrameworkParticipateTool,
     ):
         assert cls in JAVA_REFACTOR_V3_TOOL_CLASSES
 
@@ -582,6 +606,7 @@ def test_graph_and_resource_and_framework_rows_bind_to_the_new_tools() -> None:
     assert V3_MATRIX_TOOL_BINDINGS["resourceProviders"] == (JavaResourceReferencesTool, JavaPlanResourceEditsTool)
     assert V3_MATRIX_TOOL_BINDINGS["frameworkDetect"] == (JavaFrameworkDetectTool,)
     assert V3_MATRIX_TOOL_BINDINGS["impactReport"] == (JavaImpactReportTool,)
+    assert V3_MATRIX_TOOL_BINDINGS["transformationReport"] == (JavaTransformationWorkspaceReportTool,)
 
 
 # --- R02: transformation-workspace lifecycle tools forward to the local manager bridges --------------------------------
@@ -689,6 +714,22 @@ def test_list_transformation_workspaces_tool_forwards_to_manager() -> None:
     assert kwargs == {}
 
 
+def test_transformation_workspace_report_tool_forwards_to_manager() -> None:
+    # transformation.report is distinct from whole-repo impact.facts and must route through the workspace report bridge.
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaTransformationWorkspaceReportTool,
+        stub,
+        "transformation_workspace_report",
+        workspace_id="ws-1",
+        include_tests=False,
+        include_resources=True,
+        max_answer_chars=512,
+    )
+    assert args == ("ws-1",)
+    assert kwargs == {"include_tests": False, "include_resources": True}
+
+
 def test_workspace_lifecycle_tools_are_registered_and_bound() -> None:
     # R02: the G001 transformationWorkspace row binds to the full create/add/preview/apply/cancel/list lifecycle, and
     # every one of those tools is actually registered (not a dangling reference).
@@ -717,6 +758,7 @@ def test_v3_planned_public_python_facade_imports() -> None:
         V3OperationPlan,
     )
     from serena.java_refactor_v3 import impact_report, recipe_models, resource_preview, transformation_models
+    from serena.java_refactor_v3.reports.sidecar_facts import SidecarFactsGraph, facts_to_graph_input
 
     assert transformation_models.V3OperationPlan is V3OperationPlan
     assert recipe_models.RecipeDocument is RecipeDocument
@@ -725,6 +767,7 @@ def test_v3_planned_public_python_facade_imports() -> None:
     assert recipe_models.MigrationOpportunity is MigrationOpportunity
     assert impact_report.ImpactReportBuilder is ImpactReportBuilder
     assert resource_preview.ResourcePreviewClient is ResourcePreviewClient
+    assert SidecarFactsGraph(facts_to_graph_input({})).build.main_java_roots() == []
 
 
 def test_impact_report_public_model_uses_v3_plan_sections() -> None:
@@ -734,42 +777,43 @@ def test_impact_report_public_model_uses_v3_plan_sections() -> None:
     payload = report.to_dict()
 
     assert list(payload) == ["summary", "semanticImpact", "resourceImpact", "tests", "warnings"]
-    assert payload["summary"]["filesChanged"] == ["src/A.java"]
+    assert payload["summary"]["filesChanged"] == 1
     assert isinstance(payload["semanticImpact"], dict)
     assert isinstance(payload["resourceImpact"], dict)
     assert isinstance(payload["tests"], dict)
     assert isinstance(payload["warnings"], list)
 
 
+def test_impact_report_public_model_requires_explicit_risk() -> None:
+    from serena.java_refactor_v3.models import ImpactReport
+
+    try:
+        ImpactReport(java={"filesChanged": ["src/A.java"]}, resources={}, api={}, tests={}, risk={}).to_dict()
+    except ValueError as exc:
+        assert "risk" in str(exc)
+    else:
+        raise AssertionError("ImpactReport must not fabricate SAFE when risk is missing")
+
 def test_v3_analysis_invariant_envelope_for_read_only_tools() -> None:
-    from serena.java_refactor.manager import JavaRefactorManager
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
 
-    manager = object.__new__(JavaRefactorManager)
-    payload = manager._with_v3_analysis_invariants({"accepted": True, "warnings": ["review resources"]}, "frameworkReferences")
+    payload = manager._with_v3_analysis_invariants({"accepted": True}, "resources.findReferences")
 
-    assert payload["previewFirst"] is True
-    assert payload["transactional"] is True
-    assert payload["projectRevision"] == "current"
-    assert payload["factGraphRevision"] == "current"
-    assert payload["javacFactsValidated"] is True
-    assert payload["validation"] == {"kind": "javacFacts", "javacFactsValidated": True}
-    assert payload["provenance"]["operation"] == "frameworkReferences"
-    assert payload["riskClassification"] == "INFO"
-    assert list(payload["impact"]) == ["summary", "semanticImpact", "resourceImpact", "tests", "warnings"]
+    assert payload["accepted"] is False
+    assert payload["riskClassification"] == "REFUSED"
+    assert payload["refusal"]["code"] == "V3_ANALYSIS_INVARIANT_MISSING"
+    assert payload["refusal"]["missing"] == ["projectRevision", "impact", "riskClassification", "validation"]
 
 
 def test_v3_disabled_scan_refusal_carries_analysis_invariants() -> None:
-    from serena.java_refactor.manager import JavaRefactorManager
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
 
-    manager = object.__new__(JavaRefactorManager)
     payload = manager._v3_scan_disabled_refusal("transformationGraph")
 
     assert payload["accepted"] is False
     assert payload["refusal"]["code"] == "java_refactor_v3_disabled"
     assert payload["riskClassification"] == "REFUSED"
-    assert payload["previewFirst"] is True
-    assert payload["javacFactsValidated"] is True
-    assert payload["impact"]["warnings"] == []
+    assert payload["operation"] == "transformationGraph"
 
 
 def test_extract_class_public_api_review_knobs_are_forwarded() -> None:
@@ -857,3 +901,83 @@ def test_deep_inline_accepts_name_path_alias_for_method_name() -> None:
     )
     assert args == ("src/main/java/com/acme/Worker.java", 12)
     assert kwargs["method_name"] == "helper"
+
+
+def test_v3_plan_safe_delete_aliases_forward_to_manager():
+    stub = _StubTool()
+    JavaPropagateSafeDeleteTool.apply(
+        stub,
+        roots_json='["com.acme.A"]',
+        max_cascade_depth=7,
+    )
+    call = stub.manager.propagate_safe_delete.call_args
+
+    assert call.args[0] == ["com.acme.A"]
+    assert call.kwargs["cascade_depth"] == 7
+
+
+def test_v3_plan_extract_and_delegation_aliases_forward_to_manager():
+    stub = _StubTool()
+    JavaExtractClassTool.apply(
+        stub,
+        relative_path="src/main/java/com/acme/Order.java",
+        new_class_name="OrderParts",
+        members_json='["field:total", "method:tax()"]',
+    )
+    assert stub.manager.extract_class.call_args.args[2] == ["field:total", "method:tax()"]
+
+    stub = _StubTool()
+    JavaReplaceInheritanceWithDelegationTool.apply(
+        stub,
+        subclass_name_path="src/main/java/com/acme/Dog.java",
+        methods_json='["bark", "sit"]',
+    )
+    call = stub.manager.replace_inheritance_with_delegation.call_args
+    assert call.args[0] == ""
+    assert call.kwargs["subclass_name_path"] == "src/main/java/com/acme/Dog.java"
+    assert call.kwargs["members"] == ["bark", "sit"]
+
+
+def test_v3_plan_conversion_coordinate_aliases_forward_to_manager():
+    stub = _StubTool()
+    JavaConvertLambdaToMethodReferenceTool.apply(
+        stub,
+        relative_path="src/main/java/com/acme/App.java",
+        start_line=12,
+        start_col=9,
+    )
+    call = stub.manager.convert_lambda_to_method_reference.call_args
+
+    assert call.args[1] == 12
+    assert call.kwargs["column"] == 9
+
+def test_replace_inheritance_refuses_conflicting_relative_and_semantic_targets(monkeypatch) -> None:
+    from serena.java_refactor_v3 import graph_client
+
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    manager._v3_disabled_refusal = lambda *args, **kwargs: None
+    manager._validate_supported_project = lambda: None
+    manager._get_or_start_client = lambda refresh=False: object()
+
+    class _Symbols:
+        type_to_file = {"com.acme.Cat": "src/main/java/com/acme/Cat.java"}
+
+    class _Graph:
+        symbols = _Symbols()
+
+    class _GraphClient:
+        def __init__(self, client) -> None:
+            pass
+
+        def project_graph(self):
+            return _Graph()
+
+    monkeypatch.setattr(graph_client, "GraphClient", _GraphClient)
+
+    result = manager.replace_inheritance_with_delegation(
+        "src/main/java/com/acme/Dog.java",
+        subclass_name_path="com.acme.Cat",
+    )
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "class_identifier_mismatch"

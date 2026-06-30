@@ -476,6 +476,13 @@ class TransformationWorkspace:
 
         # enforce the single-revision pin across member sessions
         revision = _project_revision_of(envelope)
+        if revision is None:
+            self._safe_cancel(session_id)
+            return self._refuse(
+                WORKSPACE_REVISION_MISMATCH,
+                f"The {operation!r} session returned no project revision; the V3 workspace revision guard cannot be enforced.",
+                mode="add_session",
+            )
         if self._project_revision is None and not self._sessions:
             self._project_revision = revision
         elif revision is not None and self._project_revision is not None and revision != self._project_revision:
@@ -543,6 +550,12 @@ class TransformationWorkspace:
 
         # enforce the single-revision pin across members
         revision = plan.project_revision
+        if revision is None:
+            return self._refuse(
+                WORKSPACE_REVISION_MISMATCH,
+                f"The {operation!r} op did not return a project revision; V3 workspaces cannot safely compose it.",
+                mode="add_operation",
+            )
         if self._project_revision is None and not self._sessions:
             self._project_revision = revision
         elif revision is not None and self._project_revision is not None and revision != self._project_revision:
@@ -712,11 +725,13 @@ class TransformationWorkspace:
             return self._terminal_refusal("apply")
 
         # optimistic-concurrency guard against the pinned revision
-        if (
-            expected_project_revision is not None
-            and self._project_revision is not None
-            and expected_project_revision != self._project_revision
-        ):
+        if self._project_revision is None:
+            return self._refuse(
+                WORKSPACE_REVISION_MISMATCH,
+                "Apply refused because the workspace has no pinned project revision.",
+                mode="apply",
+            )
+        if expected_project_revision is not None and expected_project_revision != self._project_revision:
             return self._refuse(
                 WORKSPACE_REVISION_MISMATCH,
                 f"Apply expected project revision {expected_project_revision!r} but the workspace pins {self._project_revision!r}.",
@@ -748,32 +763,18 @@ class TransformationWorkspace:
             validate=validate,
             allow_review_required=allow_review_required,
         )
-        if validation is not None:
-            if not validation.get("accepted", False):
-                self._status = WorkspaceStatus.FAILED if validation.get("applied") else self._status
-                self._touch()
-                return self._refuse(
-                    validation.get("refusal", {}).get("code") or WORKSPACE_UNSAFE_EDIT,
-                    validation.get("refusal", {}).get("message") or "The composed workspace edit failed V3 validation.",
-                    mode="apply",
-                    validation=validation,
-                    impactReport=_build_impact_report(
-                        composition.stats,
-                        composition.risk,
-                        composition.merged_edit.warnings,
-                    ).to_dict(),
-                    warnings=list(composition.merged_edit.warnings),
-                )
-            for ref in self._sessions:
-                ref.applied = True
-                self._release(ref)
-            self._status = WorkspaceStatus.APPLIED
+        if validation is not None and not validation.get("accepted", False):
+            self._status = WorkspaceStatus.FAILED if validation.get("applied") else self._status
             self._touch()
-            result = self._success_envelope(composition, mode="apply", applied=True, validation=validation)
-            result["touchedFiles"] = composition.merged_edit.touched_files()
-            return result
+            return self._refuse(
+                validation.get("refusal", {}).get("code") or WORKSPACE_UNSAFE_EDIT,
+                validation.get("refusal", {}).get("message")
+                or "The composed workspace edit failed javac validation.",
+                mode="apply",
+                risk=composition.risk,
+                validation=validation,
+            )
 
-        # stage in memory (validates), then commit transactionally with automatic rollback on failure
         applier = self._driver.new_workspace_edit_applier()
         try:
             staged = applier.stage(composition.merged_edit)
@@ -800,7 +801,7 @@ class TransformationWorkspace:
             self._release(ref)
         self._status = WorkspaceStatus.APPLIED
         self._touch()
-        result = self._success_envelope(composition, mode="apply", applied=True)
+        result = self._success_envelope(composition, mode="apply", applied=True, validation=validation)
         result["touchedFiles"] = composition.merged_edit.touched_files()
         return result
 
@@ -853,7 +854,11 @@ class TransformationWorkspace:
         assert composition.stats is not None and composition.merged_edit is not None
         validator = getattr(self._driver, "validate_v3_workspace_edit", None)
         if not callable(validator):
-            return None
+            return self._refuse(
+                WORKSPACE_UNSAFE_EDIT,
+                "The composed workspace edit cannot be accepted because no V3 javac validation bridge is available.",
+                mode=mode,
+            )
         return cast(
             dict[str, Any] | None,
             validator(
@@ -891,13 +896,13 @@ class TransformationWorkspace:
             "impactReport": impact.to_dict(),
             "warnings": list(composition.merged_edit.warnings),
         }
-        result["validation"] = validation or {
-            "accepted": True,
-            "applied": False,
-            "validated": False,
-            "validationMode": "not_available",
-            "message": "No V3 javac validation bridge was available for this workspace driver.",
-        }
+        if validation is None:
+            return self._refuse(
+                WORKSPACE_UNSAFE_EDIT,
+                "The composed workspace edit cannot be accepted without a real V3 javac validation result.",
+                mode=mode,
+            )
+        result["validation"] = validation
         return result
 
     def _composition_refusal(self, composition: _Composition, *, mode: str) -> dict[str, Any]:

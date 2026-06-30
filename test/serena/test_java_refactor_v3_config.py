@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from serena.java_refactor.manager import JavaRefactorManager
 from serena.config.serena_config import (
     JavaRefactorConfig,
     JavaRefactorV3Config,
@@ -243,3 +244,33 @@ def test_parent_config_rejects_unknown_nested_v3_key() -> None:
 def test_parent_config_rejects_non_mapping_v3() -> None:
     with pytest.raises(ValueError, match="Invalid v3 value|expected a mapping"):
         JavaRefactorConfig.from_dict({"v3": 5})
+
+
+def _manager_with_config(config: JavaRefactorConfig) -> JavaRefactorManager:
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    manager._config = config
+    return manager
+
+
+def test_python_package_operations_honor_v3_config_gates() -> None:
+    globally_disabled = _manager_with_config(JavaRefactorConfig.from_dict({"enabled": True, "v3": {"enabled": False}}))
+    assert globally_disabled.rename_package("com.acme.old", "com.acme.new")["refusal"]["configPath"] == "java_refactor.v3"
+    assert globally_disabled.move_package("com.acme.old", "com.acme.new")["refusal"]["configPath"] == "java_refactor.v3"
+    assert globally_disabled.move_source_root("src/main/java", "src/other/java")["refusal"]["configPath"] == "java_refactor.v3"
+
+    rename_disabled = _manager_with_config(
+        JavaRefactorConfig.from_dict({"enabled": True, "v3": {"packages": {"rename_enabled": False}}})
+    )
+    assert rename_disabled.rename_package("com.acme.old", "com.acme.new")["refusal"]["configPath"] == (
+        "java_refactor.v3.packages.rename_enabled"
+    )
+
+    move_disabled = _manager_with_config(
+        JavaRefactorConfig.from_dict({"enabled": True, "v3": {"packages": {"move_enabled": False}}})
+    )
+    assert move_disabled.move_package("com.acme.old", "com.acme.new")["refusal"]["configPath"] == (
+        "java_refactor.v3.packages.move_enabled"
+    )
+    assert move_disabled.move_source_root("src/main/java", "src/other/java")["refusal"]["configPath"] == (
+        "java_refactor.v3.packages.move_enabled"
+    )

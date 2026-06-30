@@ -77,7 +77,7 @@ public final class GraphInvalidation {
      * @throws IOException if the project cannot be opened or its resources cannot be walked
      */
     public synchronized TransformationGraph get(JavaProjectModel model, GraphCacheLimits limits) throws IOException {
-        String key = ReachabilityGraphCache.projectKey(model);
+        String key = graphKey(model, limits);
         Entry hit = cache.get(key);
         if (hit != null) {
             return hit.graph();
@@ -103,6 +103,12 @@ public final class GraphInvalidation {
 
         store(new Entry(key, layoutDigest, fileHashes, artifacts.facts(), artifacts.graph()), limits);
         return artifacts.graph();
+    }
+
+    private static String graphKey(JavaProjectModel model, GraphCacheLimits limits) throws IOException {
+        return ReachabilityGraphCache.projectKey(model)
+                + "|maxResourceFileBytes=" + limits.maxResourceFileBytes()
+                + "|resourceProviders=builtin-v1";
     }
 
     /** The most-recently-used cached entry whose layout matches {@code layoutDigest}, or {@code null}. */

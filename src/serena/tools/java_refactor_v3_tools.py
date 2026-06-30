@@ -1,6 +1,6 @@
 from typing import Any
 
-from serena.tools.java_refactor_tools import _JavaRefactorToolBase
+from serena.tools.java_refactor_tools import _JavaRefactorReadOnlyToolBase, _JavaRefactorToolBase
 
 
 class JavaRenamePackageTool(_JavaRefactorToolBase):
@@ -160,6 +160,7 @@ class JavaMoveSourceRootTool(_JavaRefactorToolBase):
         preserve_package_names: bool = True,
         preview: bool | None = None,
         validate: bool = True,
+        allow_review_required: bool = False,
     ) -> str:
         """
         Relocate Java source files from one configured source root to another, keeping package declarations unchanged.
@@ -215,6 +216,7 @@ class JavaMoveSourceRootTool(_JavaRefactorToolBase):
             preserve_package_names=preserve_package_names,
             apply=not self._resolve_preview(preview),
             validate=validate,
+            allow_review_required=allow_review_required,
         )
         return self._finalize_result(result)
 
@@ -246,7 +248,9 @@ class JavaPropagateSafeDeleteTool(_JavaRefactorToolBase):
         self,
         seeds: str = "",
         roots: str | None = None,
+        roots_json: str | None = None,
         cascade_depth: int | None = None,
+        max_cascade_depth: int | None = None,
         delete_private_only: bool = True,
         include_tests: bool = False,
         include_resources: bool = True,
@@ -292,10 +296,10 @@ class JavaPropagateSafeDeleteTool(_JavaRefactorToolBase):
             human should confirm) is blocked on apply and writes nothing; set ``True`` to apply it after review. SAFE
             edits always apply and REFUSED results never apply, regardless of this flag.
         """
-        seed_list = JavaPropagateSafeDeleteTool._parse_seeds(roots if roots is not None else seeds)
+        seed_list = JavaPropagateSafeDeleteTool._parse_seeds(roots_json if roots_json is not None else (roots if roots is not None else seeds))
         result = self._get_manager().propagate_safe_delete(
             seed_list,
-            cascade_depth=cascade_depth,
+            cascade_depth=max_cascade_depth if max_cascade_depth is not None else cascade_depth,
             delete_private_only=delete_private_only,
             include_tests=include_tests,
             include_resources=include_resources,
@@ -350,7 +354,7 @@ class JavaPropagateSafeDeleteTool(_JavaRefactorToolBase):
         return [item for item in coerced if isinstance(item, dict) or item]
 
 
-class JavaFindDeadCodeTool(_JavaRefactorToolBase):
+class JavaFindDeadCodeTool(_JavaRefactorReadOnlyToolBase):
     """Reports Java types unreachable from the public-API boundary, confidence-ranked (V3 ``findDeadCode``, READ-ONLY)."""
 
     def apply(
@@ -422,6 +426,7 @@ class JavaExtractClassTool(_JavaRefactorToolBase):
         relative_path: str = "",
         new_class_name: str = "",
         members: str = "",
+        members_json: str | None = None,
         target_package: str | None = None,
         leave_delegate_methods: bool = True,
         update_usages: bool = False,
@@ -477,6 +482,7 @@ class JavaExtractClassTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        members = members_json if members_json is not None else members
         if relative_path and name_path:
             # Verify the named symbol resolves within relative_path (raises ValueError on a miss/ambiguity); the sidecar
             # resolves the file's primary type, so this resolution is used only as an identity guard.
@@ -505,6 +511,7 @@ class JavaExtractSuperclassTool(_JavaRefactorToolBase):
         relative_path: str = "",
         superclass_name: str = "",
         members: str = "",
+        members_json: str | None = None,
         classes: str = "",
         target_package: str | None = None,
         make_abstract: bool = True,
@@ -547,7 +554,7 @@ class JavaExtractSuperclassTool(_JavaRefactorToolBase):
             (shared) package of the listed types.
         :param make_abstract: When true, each hoisted METHOD becomes an ``abstract`` declaration in the generated
             superclass while every subclass keeps its concrete override (annotated ``@Override``); fields are always
-            pulled up wholesale regardless. When false (default) methods are moved wholesale into the superclass.
+            pulled up wholesale regardless. When false, methods are moved wholesale into the superclass.
         :param preview: When true only the planned (javac-validated) edit is returned; when false it is applied. When
             omitted, the project's ``java_refactor.preview_default`` decides (preview mode if that config is absent).
         :param validate: Preview-time reporting only. When true (default) a preview also runs and reports staged in-memory
@@ -555,6 +562,7 @@ class JavaExtractSuperclassTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        members = members_json if members_json is not None else members
         class_paths: list[str] = []
         if relative_path:
             class_paths.append(relative_path)
@@ -582,7 +590,9 @@ class JavaReplaceInheritanceWithDelegationTool(_JavaRefactorToolBase):
     def apply(
         self,
         relative_path: str = "",
+        subclass_name_path: str | None = None,
         members: str = "",
+        methods_json: str | None = None,
         delegate_field_name: str | None = None,
         superclass_fqn: str | None = None,
         confirm_public_api_change: bool = False,
@@ -625,9 +635,11 @@ class JavaReplaceInheritanceWithDelegationTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        members = methods_json if methods_json is not None else members
         member_names = _parse_member_names(members)
         result = self._get_manager().replace_inheritance_with_delegation(
             relative_path,
+            subclass_name_path=subclass_name_path,
             members=member_names or None,
             delegate_field_name=delegate_field_name,
             superclass_fqn=superclass_fqn,
@@ -650,6 +662,7 @@ class JavaDeepInlineMethodTool(_JavaRefactorToolBase):
         method_name: str | None = None,
         name_path: str | None = None,
         delete_method: bool = False,
+        delete_inlined_method: bool | None = None,
         max_call_sites: int | None = None,
         preview: bool | None = None,
         validate: bool = True,
@@ -680,6 +693,8 @@ class JavaDeepInlineMethodTool(_JavaRefactorToolBase):
             ``line``/``column`` locator. It must be unambiguous (an overloaded name is refused with ``inline_overloaded``).
         :param delete_method: By default (false) the inlined method is retained; pass ``delete_method=True`` to remove the
             now-unused declaration after inlining.
+        :param delete_inlined_method: V3-plan spelling for ``delete_method``. When supplied, it overrides
+            ``delete_method`` so callers using the documented contract get the same behavior.
         :param max_call_sites: Optional cap on how many call sites may be inlined in a single operation. When the found
             call-site count exceeds the effective limit the operation is REFUSED with ``deep_inline_too_many_call_sites``
             rather than rewriting a large blast radius. When omitted, the project's configured
@@ -694,6 +709,8 @@ class JavaDeepInlineMethodTool(_JavaRefactorToolBase):
         """
         if method_name is None and name_path:
             method_name = str(name_path).split("/")[-1].split("[")[0] or None
+        if delete_inlined_method is not None:
+            delete_method = delete_inlined_method
 
         result = self._get_manager().deep_inline_method(
             relative_path,
@@ -717,6 +734,9 @@ class JavaConvertAnonymousToLambdaTool(_JavaRefactorToolBase):
         relative_path: str = "",
         line: int = 0,
         column: int | None = None,
+        start_line: int | None = None,
+        start_col: int | None = None,
+        start_column: int | None = None,
         preview: bool | None = None,
         validate: bool = True,
         allow_review_required: bool = False,
@@ -745,6 +765,8 @@ class JavaConvertAnonymousToLambdaTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        line = start_line if start_line is not None else line
+        column = start_col if start_col is not None else (start_column if start_column is not None else column)
         result = self._get_manager().convert_anonymous_to_lambda(
             relative_path,
             line,
@@ -764,6 +786,9 @@ class JavaConvertLambdaToMethodReferenceTool(_JavaRefactorToolBase):
         relative_path: str = "",
         line: int = 0,
         column: int | None = None,
+        start_line: int | None = None,
+        start_col: int | None = None,
+        start_column: int | None = None,
         preview: bool | None = None,
         validate: bool = True,
         allow_review_required: bool = False,
@@ -792,6 +817,8 @@ class JavaConvertLambdaToMethodReferenceTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        line = start_line if start_line is not None else line
+        column = start_col if start_col is not None else (start_column if start_column is not None else column)
         result = self._get_manager().convert_lambda_to_method_reference(
             relative_path,
             line,
@@ -803,14 +830,16 @@ class JavaConvertLambdaToMethodReferenceTool(_JavaRefactorToolBase):
         return self._finalize_result(result)
 
 
-class JavaScanMigrationOpportunitiesTool(_JavaRefactorToolBase):
+class JavaScanMigrationOpportunitiesTool(_JavaRefactorReadOnlyToolBase):
     """Reports the grouped migration opportunities a recipe matches across the project (V3 ``scanMigrationOpportunities``, READ-ONLY)."""
 
     def apply(
         self,
+        recipe_id: str = "",
         recipe_name: str = "",
         recipe_document: str = "",
         scope: str = "project",
+        scope_package: str = "",
         max_answer_chars: int = -1,
     ) -> str:
         """
@@ -819,7 +848,7 @@ class JavaScanMigrationOpportunitiesTool(_JavaRefactorToolBase):
         Selects a recipe from EITHER a built-in ``recipe_name`` OR an inline ``recipe_document`` (a JSON or YAML recipe
         document), matches every rule across the project's Java sources, and classifies each occurrence (SAFE for
         unambiguous/qualified rewrites, REVIEW_REQUIRED for receiver- or semantics-dependent ones). This is a pure
-        preview: it produces NO edit, writes nothing, and runs no javac (there is nothing to validate). Feed the same
+        preview: it produces NO edit, writes nothing, and runs no before/after javac diagnostic delta because there is no edit to validate; analysis is backed by javac-resolved facts. Feed the same
         recipe selection into ``apply_refactor_recipe`` to compose and javac-validate the transactional migration edit. A
         parse error, an unknown built-in name, or an ambiguous selection (neither or both of the two parameters) is
         returned as a structured refusal.
@@ -844,10 +873,12 @@ class JavaScanMigrationOpportunitiesTool(_JavaRefactorToolBase):
         :param max_answer_chars: If the rendered report exceeds this length the call errors instead of returning it
             (``-1`` uses the configured default); narrow the recipe or ``scope`` to fit.
         """
+        recipe_selector = recipe_id or recipe_name
+        effective_scope = scope_package or scope
         result = self._get_manager().scan_migration_opportunities(
-            recipe_name=recipe_name or None,
+            recipe_name=recipe_selector or None,
             recipe_document=recipe_document or None,
-            scope=scope,
+            scope=effective_scope,
         )
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
@@ -857,6 +888,7 @@ class JavaApplyRefactorRecipeTool(_JavaRefactorToolBase):
 
     def apply(
         self,
+        recipe_id: str = "",
         recipe_name: str = "",
         recipe_document: str = "",
         recipe_json: str = "",
@@ -864,6 +896,7 @@ class JavaApplyRefactorRecipeTool(_JavaRefactorToolBase):
         preview: bool | None = None,
         validate: bool = True,
         scope: str = "project",
+        scope_package: str = "",
     ) -> str:
         """
         Apply an API-migration recipe across the project as a single transactional edit, validated by a real javac delta.
@@ -908,18 +941,20 @@ class JavaApplyRefactorRecipeTool(_JavaRefactorToolBase):
             across the whole project. Applied semantically inside the sidecar by each matched file's package.
         """
         inline_document = recipe_document or recipe_json
+        recipe_selector = recipe_id or recipe_name
+        effective_scope = scope_package or scope
         result = self._get_manager().apply_refactor_recipe(
-            recipe_name=recipe_name or None,
+            recipe_name=recipe_selector or None,
             recipe_document=inline_document or None,
             allow_review_required=allow_review_required,
             apply=not self._resolve_preview(preview),
             validate=validate,
-            scope=scope,
+            scope=effective_scope,
         )
         return self._finalize_result(result)
 
 
-class JavaImpactReportTool(_JavaRefactorToolBase):
+class JavaImpactReportTool(_JavaRefactorReadOnlyToolBase):
     """Whole-repo V3 impact report (summary/semanticImpact/resourceImpact/tests/warnings) for a composed transformation workspace (V3 ``impactReport``, READ-ONLY)."""
 
     def apply(
@@ -956,7 +991,11 @@ class JavaImpactReportTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
-class JavaTransformationGraphTool(_JavaRefactorToolBase):
+class JavaRefactorImpactReportTool(JavaImpactReportTool):
+    """V3-plan public alias for :class:`JavaImpactReportTool`."""
+
+
+class JavaTransformationGraphTool(_JavaRefactorReadOnlyToolBase):
     """Builds the whole-project V3 transformation graph (project/build/symbols/hierarchy/calls/resources/tests) (V3 ``transformationGraph``, READ-ONLY)."""
 
     def apply(self, max_answer_chars: int = -1) -> str:
@@ -977,7 +1016,7 @@ class JavaTransformationGraphTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
-class JavaResourceReferencesTool(_JavaRefactorToolBase):
+class JavaResourceReferencesTool(_JavaRefactorReadOnlyToolBase):
     """Finds references to a type or package across scanned resources (XML/properties/YAML/JSON/META-INF/services) (V3 ``resourceProviders``, READ-ONLY)."""
 
     def apply(
@@ -1049,7 +1088,7 @@ class JavaPlanResourceEditsTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
-class JavaFrameworkDetectTool(_JavaRefactorToolBase):
+class JavaFrameworkDetectTool(_JavaRefactorReadOnlyToolBase):
     """Detects which known frameworks are present in the project, by applied annotations (V3 ``frameworkDetect``, READ-ONLY)."""
 
     def apply(self, max_answer_chars: int = -1) -> str:
@@ -1068,7 +1107,7 @@ class JavaFrameworkDetectTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
-class JavaFrameworkReferencesTool(_JavaRefactorToolBase):
+class JavaFrameworkReferencesTool(_JavaRefactorReadOnlyToolBase):
     """Finds framework-significant references to a Java type using framework SPI facts (V3 ``frameworkReferences``, READ-ONLY)."""
 
     def apply(self, target: str, max_answer_chars: int = -1) -> str:
@@ -1087,10 +1126,45 @@ class JavaFrameworkReferencesTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
+class JavaFrameworkParticipateTool(_JavaRefactorReadOnlyToolBase):
+    """Ask framework SPI providers to participate in a pending V3 transformation (``frameworks.participate``, READ-ONLY)."""
+
+    def apply(
+        self,
+        change_kind: str,
+        target: str = "",
+        new_name: str = "",
+        max_answer_chars: int = -1,
+    ) -> str:
+        """
+        Return provider participation facts for a pending framework-sensitive change. READ-ONLY.
+
+        Parameters
+        ----------
+        change_kind:
+            Change category understood by framework providers (for example ``renameType`` or ``movePackage``).
+        target:
+            Fully-qualified target type/package/member when applicable.
+        new_name:
+            Replacement name/FQN/package when applicable.
+        max_answer_chars:
+            Maximum length of the returned JSON string after standard tool finalization (``-1`` uses default).
+        """
+        result = self._get_manager().framework_participate(change_kind, target, new_name)
+        return self._limit_length(self._finalize_result(result), max_answer_chars)
+
+
 class JavaCreateTransformationWorkspaceTool(_JavaRefactorToolBase):
     """Opens a new V3 transformation workspace that groups multiple operations under one revision-guarded unit (V3 ``transformationWorkspace``)."""
 
-    def apply(self, max_answer_chars: int = -1) -> str:
+    def apply(
+        self,
+        goal: str = "",
+        operation: str = "",
+        arguments_json: str = "",
+        operations_json: str = "",
+        max_answer_chars: int = -1,
+    ) -> str:
         """
         Open a new transformation workspace and return its id and status summary.
 
@@ -1104,7 +1178,15 @@ class JavaCreateTransformationWorkspaceTool(_JavaRefactorToolBase):
         :param max_answer_chars: If the rendered status exceeds this length the call errors instead of returning it
             (``-1`` uses the configured default).
         """
-        result = self._get_manager().transformation_workspace_create()
+        if goal or operation or arguments_json or operations_json:
+            result = self._get_manager().transformation_workspace_create_from_request(
+                goal=goal or None,
+                operation=operation or None,
+                arguments_json=arguments_json or None,
+                operations_json=operations_json or None,
+            )
+        else:
+            result = self._get_manager().transformation_workspace_create()
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
@@ -1261,7 +1343,7 @@ class JavaCancelTransformationWorkspaceTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
-class JavaListTransformationWorkspacesTool(_JavaRefactorToolBase):
+class JavaListTransformationWorkspacesTool(_JavaRefactorReadOnlyToolBase):
     """Lists the live transformation workspaces with their status summaries (V3 ``transformationWorkspace``, READ-ONLY)."""
 
     def apply(self, max_answer_chars: int = -1) -> str:
@@ -1276,6 +1358,38 @@ class JavaListTransformationWorkspacesTool(_JavaRefactorToolBase):
             (``-1`` uses the configured default).
         """
         result = self._get_manager().transformation_workspace_list()
+        return self._limit_length(self._finalize_result(result), max_answer_chars)
+
+
+class JavaTransformationWorkspaceReportTool(_JavaRefactorReadOnlyToolBase):
+    """Build the V3 transformation workspace impact report (``transformation.report``, READ-ONLY)."""
+
+    def apply(
+        self,
+        workspace_id: str,
+        include_tests: bool = True,
+        include_resources: bool = True,
+        max_answer_chars: int = -1,
+    ) -> str:
+        """
+        Report file/resource/test impact for an existing transformation workspace. READ-ONLY.
+
+        Parameters
+        ----------
+        workspace_id:
+            Workspace id returned by ``java_create_transformation_workspace``.
+        include_tests:
+            Include impacted-test roll-up where available.
+        include_resources:
+            Include resource-impact roll-up where available.
+        max_answer_chars:
+            Maximum length of the returned JSON string after standard tool finalization (``-1`` uses default).
+        """
+        result = self._get_manager().transformation_workspace_report(
+            workspace_id,
+            include_tests=include_tests,
+            include_resources=include_resources,
+        )
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
@@ -1302,6 +1416,7 @@ JAVA_REFACTOR_V3_TOOL_CLASSES = (
     JavaPlanResourceEditsTool,
     JavaFrameworkDetectTool,
     JavaFrameworkReferencesTool,
+    JavaFrameworkParticipateTool,
     JavaCreateTransformationWorkspaceTool,
     JavaAddWorkspaceSessionTool,
     JavaAddWorkspaceOperationTool,
@@ -1309,6 +1424,7 @@ JAVA_REFACTOR_V3_TOOL_CLASSES = (
     JavaApplyTransformationWorkspaceTool,
     JavaCancelTransformationWorkspaceTool,
     JavaListTransformationWorkspacesTool,
+    JavaTransformationWorkspaceReportTool,
 )
 
 
@@ -1334,6 +1450,7 @@ JAVA_REFACTOR_V3_CAPABILITY_TOOLS: dict[type, str] = {
     JavaResourceReferencesTool: "resources.findReferences",
     JavaFrameworkDetectTool: "frameworks.detect",
     JavaFrameworkReferencesTool: "frameworks.findReferences",
+    JavaFrameworkParticipateTool: "frameworks.participate",
     JavaCreateTransformationWorkspaceTool: "transformation.createWorkspace",
     JavaAddWorkspaceSessionTool: "transformation.addSession",
     JavaAddWorkspaceOperationTool: "transformation.addOperation",
@@ -1341,6 +1458,7 @@ JAVA_REFACTOR_V3_CAPABILITY_TOOLS: dict[type, str] = {
     JavaApplyTransformationWorkspaceTool: "transformation.apply",
     JavaCancelTransformationWorkspaceTool: "transformation.cancel",
     JavaListTransformationWorkspacesTool: "transformation.list",
+    JavaTransformationWorkspaceReportTool: "transformation.report",
     JavaTransformationGraphTool: "graph.build",
 }
 
@@ -1365,6 +1483,7 @@ V3_MATRIX_TOOL_BINDINGS: dict[str, tuple[type, ...]] = {
         JavaCancelTransformationWorkspaceTool,
         JavaListTransformationWorkspacesTool,
     ),
+    "transformationReport": (JavaTransformationWorkspaceReportTool,),
     "transformationGraph": (JavaTransformationGraphTool,),
     "renamePackage": (JavaRenamePackageTool,),
     "movePackage": (JavaMovePackageTool,),
@@ -1374,6 +1493,7 @@ V3_MATRIX_TOOL_BINDINGS: dict[str, tuple[type, ...]] = {
     "resourceProviders": (JavaResourceReferencesTool, JavaPlanResourceEditsTool),
     "frameworkDetect": (JavaFrameworkDetectTool,),
     "frameworkReferences": (JavaFrameworkReferencesTool,),
+    "frameworkParticipate": (JavaFrameworkParticipateTool,),
     "extractClass": (JavaExtractClassTool,),
     "extractSuperclass": (JavaExtractSuperclassTool,),
     "replaceInheritanceWithDelegation": (JavaReplaceInheritanceWithDelegationTool,),
@@ -1415,6 +1535,7 @@ __all__ = [
     "JavaFrameworkDetectTool",
     "JavaFrameworkReferencesTool",
     "JavaImpactReportTool",
+    "JavaRefactorImpactReportTool",
     "JavaListTransformationWorkspacesTool",
     "JavaMovePackageTool",
     "JavaMoveSourceRootTool",

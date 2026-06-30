@@ -69,6 +69,8 @@ public final class RecipeEngine {
             RecipeMatchIndex matcher = new RecipeMatchIndex(index);
             List<String> warnings = new ArrayList<>(unresolvedWarnings(recipe, matcher));
             List<RecipeMatch> matches = scoped(matcher.scan(recipe.rules()), scopePackage);
+            String matchesJson = matchesJson(matcher, matches);
+            String groupsJson = groupedMatchesJson(matcher, matches);
 
             List<String> findingJsons = new ArrayList<>();
             int safe = 0, review = 0, refused = 0;
@@ -139,6 +141,8 @@ public final class RecipeEngine {
             RecipeMatchIndex matcher = new RecipeMatchIndex(index);
             List<String> unresolved = unresolvedTypes(recipe, matcher);
             List<RecipeMatch> matches = scoped(matcher.scan(recipe.rules()), scopePackage);
+            String matchesJson = matchesJson(matcher, matches);
+            String groupsJson = groupedMatchesJson(matcher, matches);
 
             List<String> warnings = new ArrayList<>(unresolvedTypesAsWarnings(unresolved));
             // changeMethodSignature rules are structural signature changes driven through the compiler-backed
@@ -152,7 +156,7 @@ public final class RecipeEngine {
 
             // A template-only recipe that matched nothing is still a no_matches/unresolved refusal; but a recipe whose
             // signature rules produced edits has matched something, so only refuse when there are no signature rules.
-            if (matches.isEmpty() && recipe.signatureRules().isEmpty()) {
+            if (matches.isEmpty() && signatureEdits.isEmpty()) {
                 if (!unresolved.isEmpty() && unresolved.size() == referencedTypes(recipe).size()) {
                     throw new RecipeRefusal("recipe_unresolved_symbol",
                             "None of the recipe's referenced types resolve on the project classpath: "
@@ -166,33 +170,36 @@ public final class RecipeEngine {
             int skipped = 0;
             for (RecipeMatch match : matches) {
                 boolean hasEdit = match.newText() != null;
-                boolean riskOk = RecipeMatchIndex.RISK_SAFE.equals(match.risk())
-                        || (applyNeedsReview && RecipeMatchIndex.RISK_NEEDS_REVIEW.equals(match.risk()));
-                if (hasEdit && riskOk) {
-                    editable.add(match);
-                } else {
+                if (!hasEdit) {
                     skipped++;
+                    continue;
                 }
+                if (RecipeMatchIndex.RISK_REFUSED.equals(match.risk())) {
+                    throw new RecipeRefusal("recipe_refused_match",
+                            "Recipe apply matched a refused finding; no partial edit was produced.");
+                }
+                if (RecipeMatchIndex.RISK_NEEDS_REVIEW.equals(match.risk()) && !applyNeedsReview) {
+                    throw new RecipeRefusal("recipe_review_required",
+                            "Recipe apply matched review-required findings; pass apply_needs_review:true to produce edits.");
+                }
+                editable.add(match);
             }
             if (skipped > 0) {
-                warnings.add(skipped + " finding(s) were not applied (report-only, needs_review without "
-                        + "apply_needs_review, or refused).");
+                warnings.add(skipped + " finding(s) were report-only and produced no apply edit.");
             }
-
             List<TextEdit> edits = buildEdits(matcher, editable, warnings);
             edits.addAll(signatureEdits);
-            // A recipe that MATCHED something but had every match withheld by the apply gate (report-only / needs_review
-            // without apply_needs_review / outside scope) is accepted as a no-op: applied:0 with the withheld count in
-            // skipped, leaving the target files untouched — it is NOT a recipe_no_matches refusal. A recipe that matched
-            // nothing at all is already refused above (recipe_no_matches / recipe_unresolved_symbol), and the
-            // change-signature operation refuses its own cases (e.g. PUBLIC_API_CONFIRMATION_REQUIRED) verbatim before
-            // reaching here.
+            if (edits.isEmpty()) {
+                throw new RecipeRefusal("recipe_no_matches", "Recipe apply produced no in-scope edits.");
+            }
             String changes = PlannerSupport.changesJson(projectRoot, edits);
-            int totalMatches = matches.size() + recipe.signatureRules().size();
+            int totalMatches = matches.size() + signatureEdits.size();
             String stats = "{" + "\"applied\":" + edits.size() + "," + "\"skipped\":" + skipped + ","
                     + "\"matches\":" + totalMatches + "}";
             return "{" + "\"accepted\":true," + "\"operation\":\"applyRecipe\"," + "\"recipeId\":"
-                    + JsonUtil.quote(recipe.id() == null ? "" : recipe.id()) + "," + "\"workspaceEdit\":{"
+                    + JsonUtil.quote(recipe.id() == null ? "" : recipe.id()) + ","
+                    + "\"matches\":" + matchesJson + ","
+                    + "\"groups\":" + groupsJson + "," + "\"workspaceEdit\":{"
                     + "\"changes\":" + changes + "," + "\"fileOperations\":[]" + "}," + "\"warnings\":"
                     + PlannerSupport.warningsJson(warnings) + "," + "\"stats\":" + stats + "}";
         }
@@ -438,6 +445,39 @@ public final class RecipeEngine {
             }
         }
         throw new RecipeRefusal("recipe_no_matches", "Project has no Java sources to scan.");
+    }
+
+    private String matchesJson(RecipeMatchIndex matcher, List<RecipeMatch> matches) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < matches.size(); i++) {
+            if (i > 0) out.append(',');
+            out.append(findingJson(matcher, matches.get(i)));
+        }
+        return out.append(']').toString();
+    }
+
+    private String groupedMatchesJson(RecipeMatchIndex matcher, List<RecipeMatch> matches) {
+        return "{"
+                + "\"byRule\":" + groupedMatchesJson(matcher, matches, match -> match.ruleId()) + ","
+                + "\"byFile\":" + groupedMatchesJson(matcher, matches, match -> PlannerSupport.relative(projectRoot, match.file())) + ","
+                + "\"byRisk\":" + groupedMatchesJson(matcher, matches, RecipeMatch::risk)
+                + "}";
+    }
+
+    private String groupedMatchesJson(RecipeMatchIndex matcher, List<RecipeMatch> matches,
+            java.util.function.Function<RecipeMatch, String> classifier) {
+        java.util.Map<String, java.util.List<RecipeMatch>> grouped = new java.util.LinkedHashMap<>();
+        for (RecipeMatch match : matches) {
+            grouped.computeIfAbsent(classifier.apply(match), key -> new java.util.ArrayList<>()).add(match);
+        }
+        StringBuilder out = new StringBuilder("[");
+        int index = 0;
+        for (java.util.Map.Entry<String, java.util.List<RecipeMatch>> entry : grouped.entrySet()) {
+            if (index++ > 0) out.append(',');
+            out.append("{\"key\":").append(JsonUtil.quote(entry.getKey())).append(",\"matches\":")
+                    .append(matchesJson(matcher, entry.getValue())).append('}');
+        }
+        return out.append(']').toString();
     }
 
     private String findingJson(RecipeMatchIndex matcher, RecipeMatch match) {

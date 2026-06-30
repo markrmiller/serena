@@ -8,6 +8,7 @@ import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.edits.PlannerSupport.TextEdit;
 import io.serena.javarefactor.edits.ResponseBuilder.FileOperation;
 import io.serena.javarefactor.project.JavaProjectModel;
+import io.serena.javarefactor.project.SourceSet;
 import io.serena.javarefactor.protocol.JsonUtil;
 import io.serena.javarefactor.shared.ProjectPathResolver;
 import io.serena.javarefactor.v3.transformation.TransformationStep;
@@ -16,6 +17,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -109,25 +111,27 @@ public final class ExtractSuperclassPlanner {
                 "extractSuperclass", plan.edits(),
                 List.of(FileOperation.create(plan.superclassRelative(), plan.superclassSource())),
                 plan.warnings(),
-                "{\"operation\":\"extractSuperclass\",\"superclass\":" + JsonUtil.quote(plan.superclassFqn()) + "}");
+                "{\"operation\":\"extractSuperclass\",\"superclass\":" + JsonUtil.quote(plan.superclassFqn()) + "}",
+                "{\"publicApiChanges\":" + PlannerSupport.warningsJson(plan.warnings()) + "}");
     }
 
     private ExtractSuperclassPlan compute(Map<String, Object> fields)
             throws IOException, ProjectPathResolver.Violation {
         String superclassName = requireString(fields, "superclassName");
         List<String> classPaths = stringList(fields.get("classes"));
-        if (classPaths.size() < 2) {
+        if (classPaths.isEmpty()) {
             throw new ClassOpsRefusal("insufficient_classes",
-                    "Extract superclass requires at least two source classes.");
+                    "Extract superclass requires at least one source class.");
         }
         List<String> memberSelectors = stringList(fields.get("members"));
+        refuseDivergentSelectedMemberText(classPaths, memberSelectors);
         if (memberSelectors.isEmpty()) {
             throw new ClassOpsRefusal("no_members", "Extract superclass requires at least one member selector.");
         }
 
         List<Path> sourceFiles = new ArrayList<>();
         for (String classPath : classPaths) {
-            sourceFiles.add(ProjectPathResolver.resolveProjectRelative(projectRoot, classPath, "classes"));
+            sourceFiles.add(resolveClassInput(classPath));
         }
         String representative = PlannerSupport.relative(projectRoot, sourceFiles.get(0));
 
@@ -540,6 +544,190 @@ public final class ExtractSuperclassPlanner {
             dir = targetPackage.isEmpty() ? root : root.resolve(targetPackage.replace('.', '/'));
         }
         return dir.resolve(superclassName + ".java");
+    }
+
+    private void refuseDivergentSelectedMemberText(List<String> classNames, List<String> selectors) {
+        Map<String, String> firstBySelector = new HashMap<>();
+        for (String className : classNames) {
+            String source = readClassSource(className);
+            if (source == null) {
+                continue;
+            }
+            for (String selector : selectors) {
+                String memberText = selectedMemberText(source, selector);
+                if (memberText == null) {
+                    continue;
+                }
+                String normalized = memberText.replaceAll("\\s+", " ").trim();
+                String first = firstBySelector.putIfAbsent(selector, normalized);
+                if (first != null && !first.equals(normalized)) {
+                    throw new ClassOpsRefusal("extract_superclass_member_not_equivalent",
+                            "Selected member '" + selector + "' has different implementations across source classes.");
+                }
+            }
+        }
+    }
+
+    private String readClassSource(String className) {
+        String suffix = className.replace('.', '/') + ".java";
+        try (var stream = Files.walk(projectRoot)) {
+            return stream.filter(Files::isRegularFile)
+                    .filter(path -> path.toString().replace('\\', '/').endsWith(suffix))
+                    .findFirst()
+                    .map(path -> {
+                        try {
+                            return Files.readString(path);
+                        } catch (IOException e) {
+                            return null;
+                        }
+                    })
+                    .orElse(null);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static String selectedMemberText(String source, String selector) {
+        SelectorParts parts = selectorParts(selector);
+        if (!"field".equals(parts.kind())) {
+            MethodMatch match = selectedMethodText(source, parts);
+            if (match.ambiguous()) {
+                throw new ClassOpsRefusal("extract_superclass_member_ambiguous",
+                        "Selected member '" + selector + "' is overloaded; use an exact signature.");
+            }
+            if (match.text() != null) {
+                return match.text();
+            }
+        }
+        if ("method".equals(parts.kind())) {
+            return null;
+        }
+        Matcher field = Pattern.compile("(?m)^.*\\b" + Pattern.quote(parts.name()) + "\\b[^;]*;").matcher(source);
+        return field.find() ? field.group() : null;
+    }
+
+    private static MethodMatch selectedMethodText(String source, SelectorParts selector) {
+        Matcher matcher = Pattern.compile("(?m)^\\s*(?:@\\w+(?:\\([^)]*\\))?\\s+)*(?:public|protected|private)?\\s*(?:static\\s+|final\\s+|abstract\\s+|synchronized\\s+|native\\s+)*[\\w<>\\[\\]., ?]+\\s+"
+                + Pattern.quote(selector.name()) + "\\s*\\(([^)]*)\\)\\s*(?:throws\\s+[^\\{]+)?\\{").matcher(source);
+        String only = null;
+        int count = 0;
+        while (matcher.find()) {
+            if (selector.params() != null && !paramsMatch(selector.params(), matcher.group(1))) {
+                continue;
+            }
+            count++;
+            int brace = source.indexOf('{', matcher.end() - 1);
+            if (brace < 0) {
+                continue;
+            }
+            int start = source.lastIndexOf('\n', matcher.start());
+            start = start < 0 ? 0 : start + 1;
+            int depth = 0;
+            for (int i = brace; i < source.length(); i++) {
+                char ch = source.charAt(i);
+                if (ch == '{') {
+                    depth++;
+                } else if (ch == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        only = source.substring(start, i + 1);
+                        break;
+                    }
+                }
+            }
+        }
+        return new MethodMatch(only, selector.params() == null && count > 1);
+    }
+
+    private static boolean paramsMatch(List<String> selectorParams, String declarationParams) {
+        List<String> declared = new ArrayList<>();
+        String trimmed = declarationParams.trim();
+        if (!trimmed.isEmpty()) {
+            for (String param : trimmed.split(",")) {
+                declared.add(normalizeParamType(param));
+            }
+        }
+        if (declared.size() != selectorParams.size()) {
+            return false;
+        }
+        for (int i = 0; i < declared.size(); i++) {
+            String expected = normalizeSelectorType(selectorParams.get(i));
+            String actual = declared.get(i);
+            if (!actual.equals(expected) && !actual.endsWith("." + expected)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String normalizeParamType(String param) {
+        String normalized = param.replace("...", "[]")
+                .replaceAll("@\\w+(?:\\([^)]*\\))?\\s*", "")
+                .replaceAll("\\bfinal\\s+", "")
+                .trim();
+        int lastSpace = normalized.lastIndexOf(' ');
+        if (lastSpace >= 0) {
+            normalized = normalized.substring(0, lastSpace).trim();
+        }
+        return normalizeSelectorType(normalized);
+    }
+
+    private static String normalizeSelectorType(String type) {
+        return type.replace("...", "[]").replaceAll("\\s+", "").trim();
+    }
+
+    private static SelectorParts selectorParts(String selector) {
+        String kind = null;
+        int colon = selector.indexOf(':');
+        if (colon >= 0) {
+            kind = selector.substring(0, colon);
+            selector = selector.substring(colon + 1);
+        }
+        int paren = selector.indexOf('(');
+        List<String> params = null;
+        if (paren >= 0) {
+            int end = selector.indexOf(')', paren);
+            String rawParams = end >= 0 ? selector.substring(paren + 1, end) : selector.substring(paren + 1);
+            params = new ArrayList<>();
+            if (!rawParams.isBlank()) {
+                for (String param : rawParams.split(",")) {
+                    params.add(param.trim());
+                }
+            }
+            selector = selector.substring(0, paren);
+        }
+        int dot = selector.lastIndexOf('.');
+        String name = dot >= 0 ? selector.substring(dot + 1) : selector;
+        return new SelectorParts(kind, name, params);
+    }
+
+    private record SelectorParts(String kind, String name, List<String> params) {}
+
+    private record MethodMatch(String text, boolean ambiguous) {}
+
+
+    private Path resolveClassInput(String input) throws ProjectPathResolver.Violation {
+        String value = input == null ? "" : input.trim();
+        if (value.startsWith("fqn:")) {
+            value = value.substring("fqn:".length());
+        } else if (value.startsWith("symbol:")) {
+            value = value.substring("symbol:".length());
+        }
+        if (value.endsWith(".java") || value.contains("/") || value.contains("\\")) {
+            return ProjectPathResolver.resolveProjectRelative(projectRoot, value, "classes");
+        }
+
+        String relativeClassFile = value.replace('.', '/') + ".java";
+        for (SourceSet sourceSet : model.sourceSets()) {
+            for (Path root : sourceSet.sourceRoots()) {
+                Path candidate = root.resolve(relativeClassFile).toAbsolutePath().normalize();
+                if (Files.exists(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+        throw new ClassOpsRefusal("source_type_not_found",
+                "Class identifier '" + input + "' did not resolve to a source file.");
     }
 
     private static String requireString(Map<String, Object> fields, String key) {

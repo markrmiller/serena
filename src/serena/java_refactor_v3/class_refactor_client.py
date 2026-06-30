@@ -74,9 +74,10 @@ class ClassRefactorClient:
     ) -> dict[str, Any]:
         """Plans an extract-superclass (§9): hoist ``members`` common to ``classes`` into ``superclass_name``.
 
-        ``classes`` are project-relative paths to the sibling classes (at least one). ``members`` are selectors of the
-        form ``"field:<name>"`` or ``"method:<name>(<types>)"`` that must exist on every selected class. Per §9.4, the
-        operation is refused if any selected class already extends a non-Object superclass.
+        ``classes`` are project-relative paths, FQNs, or ``fqn:``/``symbol:`` keys for the sibling classes (at least
+        one). ``members`` are selectors of the form ``"field:<name>"`` or ``"method:<name>(<types>)"`` that must exist
+        on every selected class. Per §9.4, the operation is refused if any selected class already extends a non-Object
+        superclass.
 
         When ``make_abstract`` is true, each hoisted METHOD becomes an ``abstract`` declaration in the generated
         superclass while every subclass keeps its concrete override (annotated ``@Override``); fields ignore the flag and

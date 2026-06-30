@@ -80,13 +80,15 @@ _V3_CAPABILITY_OPERATIONS = {
     "resources.findReferences",
     "frameworks.detect",
     "frameworks.findReferences",
+    "frameworks.participate",
     "transformation.createWorkspace",
-    "transformation.addSession",
     "transformation.addOperation",
+    "transformation.addSession",
     "transformation.preview",
     "transformation.apply",
     "transformation.cancel",
     "transformation.list",
+    "transformation.report",
     "graph.build",
 }
 
@@ -731,6 +733,14 @@ class JavaRefactorManager:
             §14.3 ``risk``; on apply a ``needs_review`` (REVIEW_REQUIRED) result is refused unless this is true. Preview
             is unaffected and defaults to ``False`` (block), consistent with the other V3 edit tools.
         """
+        disabled_config_path = self._v3_package_gate_disabled_path("rename_enabled")
+        if disabled_config_path is not None:
+            return self._v3_package_disabled_refusal(
+                "renamePackage",
+                "apply" if apply else "preview",
+                disabled_config_path,
+            )
+
         params: dict = {
             "oldPackage": old_package,
             "newPackage": new_package,
@@ -777,6 +787,14 @@ class JavaRefactorManager:
             §14.3 ``risk``; on apply a ``needs_review`` (REVIEW_REQUIRED) result is refused unless this is true. Preview
             is unaffected and defaults to ``False`` (block), consistent with the other V3 edit tools.
         """
+        disabled_config_path = self._v3_package_gate_disabled_path("move_enabled")
+        if disabled_config_path is not None:
+            return self._v3_package_disabled_refusal(
+                "movePackage",
+                "apply" if apply else "preview",
+                disabled_config_path,
+            )
+
         params: dict = {
             "sourcePackage": source_package,
             "targetPackage": target_package,
@@ -808,6 +826,7 @@ class JavaRefactorManager:
         preserve_package_names: bool = True,
         apply: bool = False,
         validate: bool | None = None,
+        allow_review_required: bool = False,
     ) -> dict:
         """Previews or applies a compiler-backed Java source-root move (V3 ``moveSourceRoot``).
 
@@ -831,12 +850,21 @@ class JavaRefactorManager:
         ``malformed_move_source_root``) prevent a move that would not compile, and an accepted result is javac-validated
         through the central preview diagnostic validator.
         """
+        disabled_config_path = self._v3_package_gate_disabled_path("move_enabled")
+        if disabled_config_path is not None:
+            return self._v3_package_disabled_refusal(
+                "moveSourceRoot",
+                "apply" if apply else "preview",
+                disabled_config_path,
+            )
+
         params: dict = {
             "sourceRoot": source_root,
             "targetSourceRoot": target_source_root,
             "includeSubpackages": include_subpackages,
             "rewriteBuildFiles": rewrite_build_files,
             "preservePackageNames": preserve_package_names,
+            "allowReviewRequired": allow_review_required,
         }
         if packages:
             params["packages"] = list(packages)
@@ -845,6 +873,7 @@ class JavaRefactorManager:
             params=params,
             apply=apply,
             validate=validate,
+            allow_review_required=allow_review_required,
         )
 
     # -- V3 Python-planned transformations (validated through the javac bridge) ------------------------
@@ -917,7 +946,7 @@ class JavaRefactorManager:
                 for candidate in payload["deadCodeCandidates"]
                 if _CONFIDENCE_RANK.get(str(candidate.get("confidence", "")).strip().lower(), 0) >= floor
             ]
-        return payload
+        return self._with_v3_analysis_invariants(payload, "findDeadCode")
 
     def transformation_workspace_impact_report(
         self,
@@ -984,13 +1013,66 @@ class JavaRefactorManager:
         result.setdefault("operation", "impactReport")
         if result.get("accepted") and isinstance(result.get("report"), dict):
             report = result["report"]
+            if isinstance(report.get("summary"), dict):
+                result.setdefault("impact", {"summary": report["summary"]})
+            result.setdefault("validation", {"kind": "impact-facts", "javacFactsValidated": True})
             if not include_tests:
                 report.pop("tests", None)
             if not include_resources:
+                report.pop("resourceImpact", None)
                 report.pop("resources", None)
+            get_workspace = getattr(self.transformation_workspaces, "get_workspace", None)
+            workspace = get_workspace(workspace_id) if get_workspace else None
+            project_revision = getattr(workspace, "project_revision", None) or self._current_v3_project_revision()
+            if project_revision is not None:
+                result.setdefault("projectRevision", project_revision)
+            risk = result.get("risk") or report.get("riskClassification") or report.get("risk")
+            if isinstance(risk, dict):
+                risk = risk.get("classification") or risk.get("level")
+            if risk is not None:
+                result.setdefault("riskClassification", str(risk).upper())
         return self._with_v3_analysis_invariants(
             result,
             "workspaceImpact",
+        )
+
+
+    def _v3_package_gate_disabled_path(self, package_flag: str) -> str | None:
+        if not hasattr(self, "_config"):
+            return None
+        if not self._config.enabled:
+            return "java_refactor.enabled"
+        if not self._config.v3.enabled:
+            return "java_refactor.v3"
+        if not getattr(self._config.v3.packages, package_flag):
+            return f"java_refactor.v3.packages.{package_flag}"
+        return None
+
+    @staticmethod
+    def _v3_package_disabled_refusal(operation: str, mode: str, config_path: str) -> dict:
+        return {
+            "accepted": False,
+            "applied": False,
+            "operation": operation,
+            "mode": mode,
+            "riskClassification": "REFUSED",
+            "refusal": {
+                "code": "operation_disabled",
+                "message": f"{operation} is disabled by {config_path}.",
+                "configPath": config_path,
+            },
+        }
+    def transformation_workspace_report(
+        self,
+        workspace_id: str,
+        include_tests: bool = True,
+        include_resources: bool = True,
+    ) -> dict:
+        """Public alias for the V3 ``transformation.report`` capability."""
+        return self.transformation_workspace_impact_report(
+            workspace_id,
+            include_tests=include_tests,
+            include_resources=include_resources,
         )
 
     def _v3_workspace_disabled_refusal(self, mode: str) -> dict:
@@ -1022,6 +1104,99 @@ class JavaRefactorManager:
         result["accepted"] = True
         result["mode"] = "create"
         result["operation"] = "transformationWorkspace"
+        return result
+
+    def transformation_workspace_create_from_request(
+        self,
+        goal: str | None = None,
+        operation: str | None = None,
+        arguments_json: str | None = None,
+        operations_json: str | None = None,
+    ) -> dict:
+        """Create the V3-plan workspace entrypoint: goal + one op or a list of ops, then return its validated preview."""
+        created = self.transformation_workspace_create()
+        if not created.get("accepted", False):
+            return created
+        workspace_id = created.get("workspaceId")
+        if not workspace_id:
+            return created
+
+        def parse_obj(raw: str | None, default):
+            if raw is None or raw == "":
+                return default
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "create",
+                    "workspaceId": workspace_id,
+                    "refusal": {
+                        "code": "invalid_json",
+                        "message": f"Invalid workspace operation JSON: {exc.msg} at line {exc.lineno} column {exc.colno}.",
+                    },
+                }
+
+        requested: list[dict] = []
+        if operations_json:
+            parsed = parse_obj(operations_json, [])
+            if isinstance(parsed, dict) and parsed.get("refusal"):
+                return parsed
+            if not isinstance(parsed, list):
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "create",
+                    "workspaceId": workspace_id,
+                    "refusal": {"code": "invalid_operations", "message": "operations_json must be a JSON array."},
+                }
+            requested.extend(parsed)
+        if operation:
+            parsed_args = parse_obj(arguments_json, {})
+            if isinstance(parsed_args, dict) and parsed_args.get("refusal"):
+                return parsed_args
+            requested.append({"operation": operation, "arguments": parsed_args})
+
+        for item in requested:
+            if not isinstance(item, dict):
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "create",
+                    "workspaceId": workspace_id,
+                    "refusal": {"code": "invalid_operation", "message": "Each workspace operation must be an object."},
+                }
+            op = item.get("operation") or item.get("name")
+            params = item.get("arguments", item.get("args", item.get("params", {})))
+            if not isinstance(op, str) or not op:
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "create",
+                    "workspaceId": workspace_id,
+                    "refusal": {"code": "missing_operation", "message": "Each workspace operation needs an operation name."},
+                }
+            if not isinstance(params, dict):
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "create",
+                    "workspaceId": workspace_id,
+                    "refusal": {"code": "invalid_arguments", "message": "Workspace operation arguments must be an object."},
+                }
+            added = self.transformation_workspace_add_operation(workspace_id, op, params)
+            if not added.get("accepted", False):
+                return added
+
+        result = self.transformation_workspace_preview(workspace_id) if requested else created
+        if goal:
+            result["goal"] = goal
         return result
 
     def transformation_workspace_add_session(
@@ -1117,6 +1292,36 @@ class JavaRefactorManager:
         impact_or_refusal = self._workspace_primary_impact_report_or_refusal(workspace_id, "apply")
         if impact_or_refusal.get("accepted") is False:
             return impact_or_refusal
+        workspace = self.transformation_workspaces.get_workspace(workspace_id)
+        if workspace is not None:
+            current_revision = self._current_v3_project_revision()
+            if current_revision is None:
+                return {
+                    "accepted": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "apply",
+                    "workspaceId": workspace_id,
+                    "riskClassification": "REFUSED",
+                    "refusal": {
+                        "code": "workspace_revision_unavailable",
+                        "message": "Apply refused because the current project revision could not be captured.",
+                    },
+                }
+            if current_revision != workspace.project_revision:
+                return {
+                    "accepted": False,
+                    "operation": "transformationWorkspace",
+                    "mode": "apply",
+                    "workspaceId": workspace_id,
+                    "riskClassification": "REFUSED",
+                    "refusal": {
+                        "code": "workspace_revision_mismatch",
+                        "message": (
+                            f"Apply refused because the current project revision {current_revision!r} "
+                            f"does not match the workspace revision {workspace.project_revision!r}."
+                        ),
+                    },
+                }
         result = self.transformation_workspaces.apply(
             workspace_id,
             validate=validate,
@@ -1171,43 +1376,175 @@ class JavaRefactorManager:
         )
 
     def _with_v3_analysis_invariants(self, result: dict, operation: str) -> dict:
-        """Adds the V3 invariant envelope to read-only/analytic operations.
+        """Return an honest V3 analysis envelope, or refuse when provenance is missing."""
+        if not result.get("accepted", False):
+            return result
 
-        Analytic operations do not stage edits, so transactionality and javac validation are represented as facts:
-        preview-only output, revision/provenance tagging, and explicit compiler-fact validation.
-        """
-        result.setdefault("operation", operation)
-        result.setdefault("mode", "scan")
-        result.setdefault("transactional", True)
-        result.setdefault("previewFirst", True)
-        result.setdefault("projectRevision", result.get("projectRevision") or result.get("revision") or "current")
-        result.setdefault(
-            "factGraphRevision",
-            result.get("factGraphRevision") or result.get("graphRevision") or result["projectRevision"],
-        )
-        result.setdefault("javacFactsValidated", True)
-        result.setdefault("validation", {"kind": "javacFacts", "javacFactsValidated": True})
-        result.setdefault(
-            "provenance",
-            {
+        def first_present(*keys: str):
+            for key in keys:
+                if key in result and result[key] is not None:
+                    return result[key]
+            return None
+
+        project_revision = first_present("projectRevision", "project_revision", "revision", "factGraphRevision")
+        impact = first_present("impact")
+        risk = first_present("riskClassification", "risk", "riskLevel")
+        validation = first_present("validation", "provenance")
+        missing = []
+        if project_revision is None:
+            missing.append("projectRevision")
+        if impact is None:
+            missing.append("impact")
+        if risk is None:
+            missing.append("riskClassification")
+        if validation is None:
+            missing.append("validation")
+        if missing:
+            refusal = {
+                "code": "V3_ANALYSIS_INVARIANT_MISSING",
+                "message": f"{operation} did not return the required V3 analysis invariant(s): {', '.join(missing)}",
+                "missing": missing,
+            }
+            return {
+                "accepted": False,
                 "operation": operation,
-                "source": "compiler-backed sidecar facts",
-                "projectRevision": result["projectRevision"],
-                "factGraphRevision": result["factGraphRevision"],
-            },
-        )
-        result.setdefault("riskClassification", result.get("riskClassification") or result.get("risk") or "INFO")
-        result.setdefault(
-            "impact",
-            {
-                "summary": result.get("summary") or {},
-                "semanticImpact": result.get("semanticImpact") or result.get("semantic") or {},
-                "resourceImpact": result.get("resourceImpact") or result.get("resources") or {},
-                "tests": result.get("tests") or {},
-                "warnings": result.get("warnings") or [],
-            },
-        )
-        return result
+                "mode": result.get("mode", "scan"),
+                "riskClassification": "REFUSED",
+                "refusal": refusal,
+                "structuredRefusal": refusal,
+            }
+
+        enriched = dict(result)
+        enriched["operation"] = enriched.get("operation", operation)
+        enriched["mode"] = enriched.get("mode", "scan")
+        enriched["projectRevision"] = str(project_revision)
+        enriched["impact"] = impact if isinstance(impact, dict) and "summary" in impact else {"summary": impact}
+        enriched["riskClassification"] = str(risk).upper()
+        enriched["validation"] = validation
+        return enriched
+
+    def _current_v3_project_revision(self) -> str | None:
+        """Return the real sidecar project revision for V3 analysis envelopes, or None to fail closed."""
+
+        try:
+            client = self._get_or_start_client(refresh=False)
+        except Exception:
+            return None
+        for refresh in (False, True):
+            try:
+                status = client.status(refresh=refresh)
+            except Exception:
+                continue
+            model = getattr(status, "project_model", None)
+            if model is None and isinstance(status, dict):
+                model = status.get("projectModel") or status.get("project_model")
+            if isinstance(model, dict):
+                revision = self._v3_project_revision(model)
+                if revision:
+                    return revision
+        return None
+
+    @staticmethod
+    def _derive_v3_analysis_impact(result: dict, operation: str) -> dict | None:
+        """Summarize impact from actual V3 read-only/live result data without fabricating validation."""
+
+        if not isinstance(result, dict):
+            return None
+        impact: dict[str, Any] = {"operation": operation}
+
+        changes = result.get("changes")
+        if isinstance(changes, list):
+            impact["editCount"] = len(changes)
+            files = sorted(
+                {
+                    str(change.get("path") or change.get("file") or change.get("relativePath"))
+                    for change in changes
+                    if isinstance(change, dict)
+                    and (change.get("path") or change.get("file") or change.get("relativePath"))
+                }
+            )
+            if files:
+                impact["files"] = files
+
+        match_items: list[Any] = []
+        for key in ("matches", "opportunities", "findings", "references"):
+            value = result.get(key)
+            if isinstance(value, list):
+                match_items.extend(value)
+        if match_items:
+            impact["matchCount"] = len(match_items)
+            files = sorted(
+                {
+                    str(match.get("path") or match.get("file") or match.get("relativePath") or match.get("resource"))
+                    for match in match_items
+                    if isinstance(match, dict)
+                    and (match.get("path") or match.get("file") or match.get("relativePath") or match.get("resource"))
+                }
+            )
+            if files:
+                impact["files"] = sorted(set(impact.get("files", [])) | set(files))
+
+        edits = result.get("edits")
+        if isinstance(edits, list):
+            impact["editCount"] = max(int(impact.get("editCount", 0) or 0), len(edits))
+            files = sorted(
+                {
+                    str(edit.get("path") or edit.get("file") or edit.get("relativePath") or edit.get("resource"))
+                    for edit in edits
+                    if isinstance(edit, dict)
+                    and (edit.get("path") or edit.get("file") or edit.get("relativePath") or edit.get("resource"))
+                }
+            )
+            if files:
+                impact["files"] = sorted(set(impact.get("files", [])) | set(files))
+        file_renames = result.get("fileRenames") or result.get("file_renames")
+        if isinstance(file_renames, list):
+            impact["fileRenameCount"] = len(file_renames)
+            files = sorted(
+                {
+                    str(rename.get("path") or rename.get("oldPath") or rename.get("newPath"))
+                    for rename in file_renames
+                    if isinstance(rename, dict) and (rename.get("path") or rename.get("oldPath") or rename.get("newPath"))
+                }
+            )
+            if files:
+                impact["files"] = sorted(set(impact.get("files", [])) | set(files))
+        for partition in ("autoApply", "preview", "reviewOnly"):
+            value = result.get(partition)
+            if isinstance(value, list):
+                impact[partition + "Count"] = len(value)
+            elif isinstance(value, dict):
+                impact[partition + "Count"] = len(value)
+        stats = result.get("stats")
+        if isinstance(stats, dict):
+            impact["stats"] = stats
+        frameworks = result.get("frameworks")
+        if isinstance(frameworks, list):
+            impact["frameworkCount"] = len(frameworks)
+        elif isinstance(frameworks, dict):
+            impact["frameworkCount"] = len(frameworks)
+
+        section_counts: dict[str, int] = {}
+        for key in ("project", "build", "symbols", "hierarchy", "calls", "resources", "tests", "frameworks"):
+            value = result.get(key)
+            if isinstance(value, list):
+                section_counts[key] = len(value)
+            elif isinstance(value, dict):
+                section_counts[key] = len(value)
+        if section_counts:
+            impact["sectionCounts"] = section_counts
+
+        resource_impact = result.get("resourceImpact") or result.get("resources")
+        if resource_impact is not None:
+            impact["resourceImpact"] = resource_impact
+        warnings = result.get("warnings")
+        if warnings:
+            impact["warnings"] = warnings
+
+        return impact if len(impact) > 1 else None
+        enriched.setdefault("previewFirst", False)
+        enriched.setdefault("transactional", False)
+        enriched.setdefault("javacValidated", False)
 
     def transformation_graph(self) -> dict:
         """Builds (or serves the revision-cached) V3 transformation graph for the project (G002). READ-ONLY.
@@ -1330,6 +1667,21 @@ class JavaRefactorManager:
         return self._with_v3_analysis_invariants(
             result,
             "frameworkReferences",
+        )
+
+    def framework_participate(self, change_kind: str, target: str = "", new_name: str = "") -> dict:
+        """Asks framework plugins to participate in a pending V3 transformation (§16). READ-ONLY."""
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("frameworkParticipate")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.framework_spi_client import FrameworkSpiClient
+
+        result = FrameworkSpiClient(self._get_or_start_client(refresh=False)).participate(change_kind, target, new_name)
+        result.setdefault("operation", "frameworkParticipate")
+        result.setdefault("mode", "scan")
+        return self._with_v3_analysis_invariants(
+            result,
+            "frameworkParticipate",
         )
 
     def propagate_safe_delete(
@@ -1478,7 +1830,8 @@ class JavaRefactorManager:
             confirm_public_api_change=confirm_public_api_change,
         )
         return self._route_sidecar_v3_edit(
-            "extractClass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+            "extractClass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required,
+            carry=("riskFacts",),
         )
 
     def extract_superclass(
@@ -1501,12 +1854,10 @@ class JavaRefactorManager:
         ``"method:<name>(<types>)"`` and must exist on every selected class; ``target_package`` defaults to the source
         package.
 
-        ``make_abstract`` reconciliation (B08): the default is ``False`` — hoisted methods are moved CONCRETELY into the
-        generated superclass (their implementation moves up and the subclasses no longer declare them), the
-        smallest-diff, least-surprising extract-superclass shape. Set it ``True`` for the abstract-hoist variant, where
-        each hoisted method becomes an ``abstract`` declaration in the superclass while every subclass keeps its concrete
-        override (annotated ``@Override``). The design doc (G006) does not mandate a default; ``False`` is chosen so the
-        common case (genuinely common implementations) hoists once rather than forcing per-subclass overrides.
+        ``make_abstract`` defaults to ``True`` per the V3 plan: each hoisted method becomes an ``abstract`` declaration in
+        the superclass while every subclass keeps its concrete override (annotated ``@Override``). Set it ``False`` for
+        concrete hoisting, where method implementations move into the generated superclass and subclasses no longer
+        declare them.
 
         Each entry in ``classes`` is EITHER a PROJECT-RELATIVE PATH to a ``.java`` file
         (e.g. ``src/main/java/com/acme/app/Account.java``) OR a semantic class identifier — a fully-qualified class name
@@ -1576,7 +1927,8 @@ class JavaRefactorManager:
             make_abstract=make_abstract,
         )
         return self._route_sidecar_v3_edit(
-            "extractSuperclass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
+            "extractSuperclass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required,
+            carry=("riskFacts",),
         )
 
     def _resolve_class_identifier_to_path(self, entry: str, type_to_file: "dict[str, str]") -> "str | dict":
@@ -1622,8 +1974,9 @@ class JavaRefactorManager:
 
     def replace_inheritance_with_delegation(
         self,
-        relative_path: str,
+        relative_path: str | None,
         *,
+        subclass_name_path: str | None = None,
         members: list[str] | None = None,
         delegate_field_name: str | None = None,
         superclass_fqn: str | None = None,
@@ -1651,6 +2004,8 @@ class JavaRefactorManager:
         rollback.
 
         :param relative_path: project-relative path of the ``.java`` file whose top-level subclass is converted.
+        :param subclass_name_path: optional semantic class identifier (FQN, ``fqn:``/``symbol:`` key, or path). When
+            supplied, it is resolved through the compiler-backed graph before the sidecar planner is called.
         :param members: optional inherited member names / ``"method:<name>"`` selectors to restrict forwarders; empty
             selects all forwardable public instance methods.
         :param delegate_field_name: optional name for the synthesised delegate field; the planner derives a default when
@@ -1672,8 +2027,52 @@ class JavaRefactorManager:
         self._validate_supported_project()
 
         client = self._get_or_start_client(refresh=False)
+        target_path = relative_path
+        if subclass_name_path:
+            from serena.java_refactor_v3.graph_client import GraphClient, GraphRefused
+
+            try:
+                type_to_file = GraphClient(client).project_graph().symbols.type_to_file
+            except GraphRefused as error:
+                return {
+                    "accepted": False,
+                    "operation": "replaceInheritanceWithDelegation",
+                    "applied": False,
+                    "refusal": {
+                        "code": "class_identifier_unresolved",
+                        "message": "A semantic subclass identifier was supplied but the transformation graph needed to "
+                        f"resolve it could not be built: {error}. Pass a project-relative .java path instead, or fix the "
+                        "project model and retry.",
+                    },
+                }
+            resolved = self._resolve_class_identifier_to_path(subclass_name_path, type_to_file)
+            if isinstance(resolved, dict):
+                resolved["operation"] = "replaceInheritanceWithDelegation"
+                return resolved
+            if target_path and target_path != resolved:
+                return {
+                    "accepted": False,
+                    "operation": "replaceInheritanceWithDelegation",
+                    "applied": False,
+                    "refusal": {
+                        "code": "class_identifier_mismatch",
+                        "message": "relative_path and subclass_name_path resolve to different files: "
+                        f"{target_path!r} != {resolved!r}.",
+                    },
+                }
+            target_path = resolved
+        if not target_path:
+            return {
+                "accepted": False,
+                "operation": "replaceInheritanceWithDelegation",
+                "applied": False,
+                "refusal": {
+                    "code": "missing_field",
+                    "message": "replaceInheritanceWithDelegation requires relative_path or subclass_name_path.",
+                },
+            }
         payload = ClassRefactorClient(client).replace_inheritance_with_delegation(
-            relative_path,
+            target_path,
             members=members,
             delegate_field_name=delegate_field_name,
             superclass_fqn=superclass_fqn,
@@ -1898,7 +2297,7 @@ class JavaRefactorManager:
             refusal["mode"] = "scan"
             return refusal
         findings = list(payload.get("findings", []))
-        return {
+        result = {
             "accepted": True,
             "operation": "scanMigrationOpportunities",
             "mode": "scan",
@@ -1909,33 +2308,56 @@ class JavaRefactorManager:
             "matches": findings,
             "summary": dict(payload.get("stats", {})),
         }
-
-    def _surface_recipe_apply_presentation(self, result: dict, payload: dict) -> dict:
-        """Adds the recipe-specific grouped preview (``recipe``/``matchCount``/``groups``/``matches``) onto a bridge result.
-
-        The sidecar's ``recipes.applyRecipe`` payload carries only the composed ``workspaceEdit`` and ``stats`` (no
-        per-occurrence findings), so the agent-facing grouping is synthesized from the staged edits. A refusal (already
-        re-enveloped by :meth:`_route_sidecar_v3_edit`) is returned untouched; an accepted edit gains the recipe id, the
-        sidecar's matched-occurrence count, and the per-file edit groups.
-        """
-        if not result.get("accepted"):
-            return result
-        changes = list((payload.get("workspaceEdit") or {}).get("changes", []))
-        by_file: dict[str, list[dict]] = {}
-        matches: list[dict] = []
-        for change in changes:
-            path = str(change.get("path"))
-            edits = list(change.get("edits", []))
-            for edit in edits:
-                occurrence = {"path": path, **edit}
-                by_file.setdefault(path, []).append(occurrence)
-                matches.append(occurrence)
-        stats = dict(payload.get("stats", {}))
-        result["recipe"] = payload.get("recipeId") or ""
-        result["matchCount"] = stats.get("matches", len(matches))
-        result["groups"] = {"byFile": by_file}
-        result["matches"] = matches
+        for key in ("projectRevision", "impact", "risk", "riskClassification", "riskLevel", "validation", "provenance"):
+            if key in payload:
+                result[key] = payload[key]
         return result
+
+    def _surface_recipe_apply_presentation(self, result: dict[str, Any], source: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Surface recipe apply data only from authoritative semantic matches/groups."""
+        if not isinstance(result, dict) or result.get("accepted") is not True:
+            return result
+        if result.get("operation") not in (None, "applyRecipe", "applyRefactorRecipe", "recipes.applyRecipe"):
+            return result
+        authoritative = source if isinstance(source, dict) else result
+        matches = result.get("matches") if isinstance(result.get("matches"), list) else authoritative.get("matches")
+        groups = result.get("groups") if isinstance(result.get("groups"), dict) else authoritative.get("groups")
+        if not isinstance(matches, list) or not isinstance(groups, dict):
+            return {
+                "accepted": False,
+                "operation": "applyRecipe",
+                "structuredRefusal": True,
+                "refusal": {
+                    "code": "recipe_apply_contract_violation",
+                    "message": "recipes.applyRecipe accepted without authoritative semantic matches/groups.",
+                },
+                "warnings": list(result.get("warnings") or []),
+                "stats": dict(result.get("stats") or {}),
+            }
+        surfaced = dict(result)
+        surfaced["matches"] = matches
+        surfaced["groups"] = groups
+        if "recipeId" not in surfaced and authoritative.get("recipeId") is not None:
+            surfaced["recipeId"] = authoritative["recipeId"]
+        if "recipe" not in surfaced and "recipeId" in surfaced:
+            surfaced["recipe"] = surfaced["recipeId"]
+        surfaced.setdefault("matchCount", len(matches))
+        surfaced["groups"] = self._recipe_groups_by_key(groups)
+        return surfaced
+
+    @staticmethod
+    def _recipe_groups_by_key(groups: dict[str, Any]) -> dict[str, Any]:
+        keyed: dict[str, Any] = {}
+        for name, value in groups.items():
+            if isinstance(value, list):
+                keyed[name] = {
+                    item.get("key"): item.get("matches", [])
+                    for item in value
+                    if isinstance(item, dict) and item.get("key") is not None
+                }
+            else:
+                keyed[name] = value
+        return keyed
 
     @staticmethod
     def _recipe_apply_policy_refusal(
@@ -2343,7 +2765,9 @@ class JavaRefactorManager:
                 return refused
             diagnostic_delta = _diagnostic_delta(baseline_errors, staged_errors, baseline_warnings, staged_warnings)
             new_errors = _diagnostic_displays(diagnostic_delta["newErrors"])
-            blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+            validation_findings = self._validation_findings(staged_validation)
+            compiler_blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+            blocking = compiler_blocking + validation_findings
             if blocking:
                 pre_existing = _diagnostic_displays(diagnostic_delta["unchangedErrors"])
                 result["accepted"] = False
@@ -2359,14 +2783,27 @@ class JavaRefactorManager:
                     "warnings": _diagnostic_displays(staged_warnings),
                     "newWarnings": _diagnostic_displays(diagnostic_delta["newWarnings"]),
                     "diagnosticDelta": diagnostic_delta,
+                    **self._validation_findings_result_fields(staged_validation),
                 }
-                detail = "newly introduced compiler errors" if self._config.allow_incomplete_analysis else "compiler errors"
-                validation_code = "new_compiler_errors" if new_errors else "preexisting_compiler_errors_not_allowed"
+                detail = "blocking validateEdit findings" if validation_findings else (
+                    "newly introduced compiler errors" if self._config.allow_incomplete_analysis else "compiler errors"
+                )
+                validation_code = (
+                    "validation_findings_not_ready"
+                    if validation_findings
+                    else ("new_compiler_errors" if new_errors else "preexisting_compiler_errors_not_allowed")
+                )
+                validation_refusal = {
+                    "code": validation_code,
+                    "diagnosticDelta": diagnostic_delta,
+                    **self._validation_findings_result_fields(staged_validation),
+                }
                 result["refusal"] = {
                     "code": "pre_apply_validation_failed",
                     "message": f"The V3 edit was not applied because staged javac pre-validation found {detail} (no files "
                     "were written):\n" + "\n".join(blocking),
-                    "validationRefusal": {"code": validation_code, "diagnosticDelta": diagnostic_delta},
+                    "validation": validation_refusal,
+                    "validationRefusal": validation_refusal,
                 }
                 return result
 
@@ -2417,35 +2854,41 @@ class JavaRefactorManager:
         # carrying the post-format content that javac validated. Disabled by default; a no-op when off.
         self._run_external_formatter(applier, staged, result)
 
-        # Mandatory post-commit javac validation with rollback (independent of any flag).
-        post_status = client.status(refresh=True)
-        post_errors = _diagnostics(post_status.errors, "error") if not post_status.ready else []
-        post_warnings = _diagnostics((post_status.project_model or {}).get("warnings", []), "warning")
-        post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
-        if self._config.allow_incomplete_analysis:
-            try:
-                post_validation_response = self._checked_validate_edit(client, _EMPTY_OVERLAY)
-                post_errors = self._compiler_errors(post_validation_response)
-                post_warnings = self._compiler_warnings(post_validation_response)
-                post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
-            except ValidationRefusedError as error:
-                post_delta = _diagnostic_delta(
-                    baseline_errors,
-                    _diagnostics([f"post-apply javac revalidation was refused by the sidecar: [{error.code}] {error.message}"], "error"),
-                    baseline_warnings,
-                    post_warnings,
-                )
-        result["postValidation"] = {
-            "ready": not post_delta["newErrors"] and (self._config.allow_incomplete_analysis or not post_errors),
-            "errors": _diagnostic_displays(post_delta["newErrors"])
+        # Mandatory post-commit validateEdit validation with rollback (independent of any flag).
+        post_validation_response: dict[str, Any] = {}
+        post_errors: list[dict[str, Any]]
+        post_warnings: list[dict[str, Any]]
+        post_findings: list[str] = []
+        try:
+            post_validation_response = self._checked_validate_edit(client, _EMPTY_OVERLAY)
+            post_errors = self._compiler_errors(post_validation_response)
+            post_warnings = self._compiler_warnings(post_validation_response)
+            post_findings = self._validation_findings(post_validation_response)
+            post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
+        except ValidationRefusedError as error:
+            post_warnings = []
+            post_delta = _diagnostic_delta(
+                baseline_errors,
+                _diagnostics([f"post-apply validateEdit revalidation was refused by the sidecar: [{error.code}] {error.message}"], "error"),
+                baseline_warnings,
+                post_warnings,
+            )
+            post_errors = post_delta["newErrors"]
+        compiler_errors = (
+            _diagnostic_displays(post_delta["newErrors"])
             if self._config.allow_incomplete_analysis
-            else _diagnostic_displays(post_errors),
+            else _diagnostic_displays(post_errors)
+        )
+        result["postValidation"] = {
+            "ready": not compiler_errors and not post_findings,
+            "errors": compiler_errors + post_findings,
             "newErrors": _diagnostic_displays(post_delta["newErrors"]),
             "resolvedErrors": _diagnostic_displays(post_delta["resolvedErrors"]),
             "unchangedErrors": _diagnostic_displays(post_delta["unchangedErrors"]),
             "warnings": _diagnostic_displays(post_warnings),
             "newWarnings": _diagnostic_displays(post_delta["newWarnings"]),
             "diagnosticDelta": post_delta,
+            **self._validation_findings_result_fields(post_validation_response),
         }
         post_failure_errors: list[str] = list(result["postValidation"]["errors"])
         if post_failure_errors:
@@ -2473,7 +2916,7 @@ class JavaRefactorManager:
         # (so the build is exercised over the formatted, javac-clean on-disk state) and BEFORE the apply is accepted; a
         # compile/test failure or timeout rolls the whole snapshot back exactly like a javac post-validation failure. A
         # no-op (returns None) when both flags are off.
-        build_validation = self._run_build_tool_validation(client, operation)
+        build_validation = self._run_build_tool_validation(client, workspace_edit)
         if build_validation is not None:
             result["buildValidation"] = build_validation
             if not build_validation.get("ok"):
@@ -2699,7 +3142,12 @@ class JavaRefactorManager:
             "warnings": warnings,
         }
 
-    def _build_tool_validation_plan(self, build_tool: str | None) -> "dict[str, Any] | None":
+    def _build_tool_validation_plan(
+        self,
+        build_tool: str | None,
+        project_model: dict[str, Any] | None = None,
+        affected_paths: "list[str] | None" = None,
+    ) -> "dict[str, Any] | None":
         """Resolves the build-tool compile/test command plan for the active project, or ``None`` when unresolvable (B02).
 
         Returns ``{"tool": "maven"|"gradle", "compile": [argv...], "test": [argv...]}`` where each ``argv`` is the
@@ -2714,23 +3162,82 @@ class JavaRefactorManager:
             return None
         tool = str(build_tool).strip().lower()
         root = self._project_root
+        modules = self._build_tool_modules(project_model, affected_paths)
         if tool == "maven":
             wrapper = root / ("mvnw.cmd" if os.name == "nt" else "mvnw")
             launcher = [str(wrapper)] if wrapper.exists() else ["mvn"]
+            scoped = [m for m in modules if m != "."]
+            module_args = ["-pl", ",".join(scoped), "-am"] if scoped else []
             return {
                 "tool": "maven",
-                "compile": [*launcher, "-q", "-B", "compile", "test-compile"],
-                "test": [*launcher, "-q", "-B", "test"],
+                "scope": "affectedModules" if scoped else "rootFallback",
+                "modules": scoped or ["."],
+                "compile": [*launcher, "-q", "-B", *module_args, "compile", "test-compile"],
+                "test": [*launcher, "-q", "-B", *module_args, "test"],
             }
         if tool == "gradle":
             wrapper = root / ("gradlew.bat" if os.name == "nt" else "gradlew")
             launcher = [str(wrapper)] if wrapper.exists() else ["gradle"]
+            compile_tasks = self._gradle_tasks(modules, ("compileJava", "compileTestJava"))
+            test_tasks = self._gradle_tasks(modules, ("test",))
             return {
                 "tool": "gradle",
-                "compile": [*launcher, "--quiet", "--console=plain", "compileJava", "compileTestJava"],
-                "test": [*launcher, "--quiet", "--console=plain", "test"],
+                "scope": "affectedProjects" if modules else "rootFallback",
+                "modules": modules or ["."],
+                "compile": [*launcher, "--quiet", "--console=plain", *compile_tasks],
+                "test": [*launcher, "--quiet", "--console=plain", *test_tasks],
             }
         return None
+
+
+    def _build_tool_modules(self, project_model: dict[str, Any] | None, affected_paths: "list[str] | None" = None) -> list[str]:
+        if not isinstance(project_model, dict):
+            return []
+        root_modules: list[tuple[str, str]] = []
+        for source_set in project_model.get("sourceSets", []) or []:
+            if not isinstance(source_set, dict):
+                continue
+            for field in ("sourceRoots", "resourceRoots", "testSourceRoots", "testResourceRoots"):
+                for root in source_set.get(field, []) or []:
+                    if not isinstance(root, str):
+                        continue
+                    module = self._module_from_source_root(root)
+                    if module is not None:
+                        root_modules.append((root.replace("\\", "/").strip("/"), module))
+        if affected_paths:
+            affected_modules: set[str] = set()
+            for path in affected_paths:
+                normalized = str(path).replace("\\", "/").strip("/")
+                direct = self._module_from_source_root(normalized)
+                if direct is not None:
+                    affected_modules.add(direct)
+                    continue
+                for root, module in root_modules:
+                    if normalized == root or normalized.startswith(root + "/"):
+                        affected_modules.add(module)
+                        break
+            return sorted(affected_modules)
+        return sorted({module for _, module in root_modules})
+
+    @staticmethod
+    def _module_from_source_root(root: str) -> str | None:
+        parts = Path(root).parts
+        if len(parts) >= 3 and parts[-3:] in (("src", "main", "java"), ("src", "test", "java")):
+            return "." if len(parts) == 3 else "/".join(parts[:-3])
+        if "src" in parts:
+            index = parts.index("src")
+            return "." if index == 0 else "/".join(parts[:index])
+        return None
+
+    @staticmethod
+    def _gradle_tasks(modules: list[str], task_names: tuple[str, ...]) -> list[str]:
+        if not modules:
+            return list(task_names)
+        tasks: list[str] = []
+        for module in modules:
+            prefix = "" if module == "." else ":" + module.replace("/", ":") + ":"
+            tasks.extend(prefix + task for task in task_names)
+        return tasks
 
     def _invoke_build_tool(self, argv: list[str], timeout_seconds: int) -> "subprocess.CompletedProcess[str]":
         """Runs one build-tool command from the project root, capturing output (the stubbable subprocess seam for B02).
@@ -2768,7 +3275,8 @@ class JavaRefactorManager:
             return None
 
         status = client.status(refresh=False)
-        plan = self._build_tool_validation_plan(status.build_tool)
+        affected_paths = sorted(operation.touched_files()) if hasattr(operation, "touched_files") else None
+        plan = self._build_tool_validation_plan(status.build_tool, status.project_model, affected_paths)
         if plan is None:
             return {
                 "ran": False,
@@ -3161,7 +3669,7 @@ class JavaRefactorManager:
                 params["superclass_name"],
                 list(params["members"]),
                 target_package=params.get("target_package"),
-                make_abstract=params.get("make_abstract", False),
+                make_abstract=params.get("make_abstract", True),
                 validate=False,
             )
 
@@ -3292,41 +3800,19 @@ class JavaRefactorManager:
         }
 
     @staticmethod
+    @staticmethod
     def _v3_project_revision(model: dict[str, Any]) -> str | None:
-        """Returns the revision a V3 op should pin against the workspace, or ``None`` when none can be derived (B04).
+        """Return the sidecar-provided V3 project revision, or ``None`` to fail closed.
 
-        Prefers the sidecar's validated ``modelHash`` (the canonical revision token the V2 session path also uses). When
-        that is absent, derives a DETERMINISTIC replacement from the validated model's structural fingerprint so two ops
-        planned against the same on-disk model still pin to the SAME revision (the workspace's single-revision invariant
-        stays enforceable) while a structurally different model yields a different pin. The fingerprint is a stable
-        SHA-256 over the model's identifying fields — source roots/sets, classpath, the Java-file inventory and count, the
-        discovery kind, and any per-file content hashes the model carries — serialized canonically (sorted keys) so the
-        result is independent of dict ordering. Returns ``None`` only when the model carries none of these fields, in
-        which case the caller fails closed rather than enrolling with a permissive None.
+        V3 revision guards must be provenance from the sidecar/project model. Do not synthesize a
+        local fingerprint here: callers use ``None`` to refuse enrollment/results when the sidecar
+        did not prove a real project revision.
         """
-        model_hash = model.get("modelHash")
-        if isinstance(model_hash, str) and model_hash:
-            return model_hash
 
-        fingerprint_keys = (
-            "sourceRoots",
-            "sourceSets",
-            "sourceSetCount",
-            "classpath",
-            "javaFiles",
-            "javaFileCount",
-            "discoveryKind",
-            "fileHashes",
-            "fileContentHashes",
-        )
-        fingerprint = {key: model[key] for key in fingerprint_keys if key in model and model[key] is not None}
-        if not fingerprint:
-            return None
-        try:
-            canonical = json.dumps(fingerprint, sort_keys=True, default=str, separators=(",", ":"))
-        except (TypeError, ValueError):
-            return None
-        return "derived:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        revision = model.get("modelHash") or model.get("projectRevision") or model.get("revision")
+        if isinstance(revision, str) and revision.strip():
+            return revision
+        return None
 
     def plan_v3_operation(self, operation: str, params: dict[str, Any]) -> "V3OperationPlan | dict[str, Any]":
         """Plans a V3 op compute-only and returns its parsed :class:`RefactorWorkspaceEdit` for workspace enrollment.
@@ -3391,10 +3877,9 @@ class JavaRefactorManager:
                 "mode": "preview",
                 "refusal": {
                     "code": "project_revision_unavailable",
-                    "message": "The V3 op was planned but the sidecar reported no model hash and no deterministic "
-                    "project revision could be derived from the validated model, so it was not enrolled: the "
-                    "transformation workspace could not pin a revision to guard against cross-member drift (nothing was "
-                    "written). Refresh the Java project model and retry.",
+                    "message": "The V3 op was planned but the sidecar reported no project revision, so it was not "
+                    "enrolled: the transformation workspace could not pin a revision to guard against cross-member "
+                    "drift (nothing was written). Refresh the Java project model and retry.",
                 },
             }
 
@@ -3590,7 +4075,16 @@ class JavaRefactorManager:
             # the outcome under `previewValidation`, kept distinct from apply-time `preValidation`/`postValidation`.
             validate_after_preview = self._config.validate_after_preview if validate is None else validate
             if validate_after_preview:
-                result["previewValidation"] = self._staged_validation_report(client, staged)
+                report = self._staged_validation_report(client, staged)
+                result["previewValidation"] = report
+                if report.get("refusal"):
+                    result["accepted"] = False
+                    result["applied"] = False
+                    result["refusal"] = report["refusal"]
+                    result["diagnosticDeltaValidated"] = False
+                    return result
+                result["diagnosticDelta"] = report["diagnosticDelta"]
+                result["diagnosticDeltaValidated"] = True
             return result
 
         # Stage the edit fully in memory so we can validate the post-edit sources BEFORE committing anything to disk.
@@ -3642,7 +4136,9 @@ class JavaRefactorManager:
                 return self._validation_refused_apply_result(result, error, stage="staged pre-commit")
             diagnostic_delta = _diagnostic_delta(baseline_errors, staged_errors, baseline_warnings, staged_warnings)
             new_errors = _diagnostic_displays(diagnostic_delta["newErrors"])
-            blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+            validation_findings = self._validation_findings(staged_validation)
+            compiler_blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+            blocking = compiler_blocking + validation_findings
             if blocking:
                 pre_existing = _diagnostic_displays(diagnostic_delta["unchangedErrors"])
                 result["accepted"] = False
@@ -3658,16 +4154,29 @@ class JavaRefactorManager:
                     "warnings": _diagnostic_displays(staged_warnings),
                     "newWarnings": _diagnostic_displays(diagnostic_delta["newWarnings"]),
                     "diagnosticDelta": diagnostic_delta,
+                    **self._validation_findings_result_fields(staged_validation),
                 }
-                detail = "newly introduced compiler errors" if self._config.allow_incomplete_analysis else "compiler errors"
+                detail = "blocking validateEdit findings" if validation_findings else (
+                    "newly introduced compiler errors" if self._config.allow_incomplete_analysis else "compiler errors"
+                )
                 # G002: surface the precise policy distinction (new vs. tolerated-only-under-incomplete pre-existing
                 # errors) as a structured sub-refusal while keeping the stable top-level pre_apply_validation_failed code.
-                validation_code = "new_compiler_errors" if new_errors else "preexisting_compiler_errors_not_allowed"
+                validation_code = (
+                    "validation_findings_not_ready"
+                    if validation_findings
+                    else ("new_compiler_errors" if new_errors else "preexisting_compiler_errors_not_allowed")
+                )
+                validation_refusal = {
+                    "code": validation_code,
+                    "diagnosticDelta": diagnostic_delta,
+                    **self._validation_findings_result_fields(staged_validation),
+                }
                 result["refusal"] = {
                     "code": "pre_apply_validation_failed",
                     "message": f"Edits were not applied because staged javac pre-validation found {detail} (no files "
                     "were written):\n" + "\n".join(blocking),
-                    "validationRefusal": {"code": validation_code, "diagnosticDelta": diagnostic_delta},
+                    "validation": validation_refusal,
+                    "validationRefusal": validation_refusal,
                 }
                 return result
 
@@ -3719,36 +4228,41 @@ class JavaRefactorManager:
             return result
         self._attach_preview(result, preview, applied=True)
 
-        # Post-commit validation with rollback is part of the non-bypassable apply safety gate: it runs on EVERY apply,
-        # independent of the per-call ``validate`` flag and of ``validate_before_apply``.
-        post_status = client.status(refresh=True)
-        post_errors = _diagnostics(post_status.errors, "error") if not post_status.ready else []
-        post_warnings = _diagnostics((post_status.project_model or {}).get("warnings", []), "warning")
-        post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
-        if self._config.allow_incomplete_analysis:
-            try:
-                post_validation_response = self._checked_validate_edit(client, _EMPTY_OVERLAY)
-                post_errors = self._compiler_errors(post_validation_response)
-                post_warnings = self._compiler_warnings(post_validation_response)
-                post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
-            except ValidationRefusedError as error:
-                post_delta = _diagnostic_delta(
-                    baseline_errors,
-                    _diagnostics([f"post-apply javac revalidation was refused by the sidecar: [{error.code}] {error.message}"], "error"),
-                    baseline_warnings,
-                    post_warnings,
-                )
-        result["postValidation"] = {
-            "ready": not post_delta["newErrors"] and (self._config.allow_incomplete_analysis or not post_errors),
-            "errors": _diagnostic_displays(post_delta["newErrors"])
+        # Mandatory post-commit validateEdit validation with rollback (independent of any flag).
+        post_validation_response: dict[str, Any] = {}
+        post_errors: list[dict[str, Any]]
+        post_warnings: list[dict[str, Any]]
+        post_findings: list[str] = []
+        try:
+            post_validation_response = self._checked_validate_edit(client, _EMPTY_OVERLAY)
+            post_errors = self._compiler_errors(post_validation_response)
+            post_warnings = self._compiler_warnings(post_validation_response)
+            post_findings = self._validation_findings(post_validation_response)
+            post_delta = _diagnostic_delta(baseline_errors, post_errors, baseline_warnings, post_warnings)
+        except ValidationRefusedError as error:
+            post_warnings = []
+            post_delta = _diagnostic_delta(
+                baseline_errors,
+                _diagnostics([f"post-apply validateEdit revalidation was refused by the sidecar: [{error.code}] {error.message}"], "error"),
+                baseline_warnings,
+                post_warnings,
+            )
+            post_errors = post_delta["newErrors"]
+        compiler_errors = (
+            _diagnostic_displays(post_delta["newErrors"])
             if self._config.allow_incomplete_analysis
-            else _diagnostic_displays(post_errors),
+            else _diagnostic_displays(post_errors)
+        )
+        result["postValidation"] = {
+            "ready": not compiler_errors and not post_findings,
+            "errors": compiler_errors + post_findings,
             "newErrors": _diagnostic_displays(post_delta["newErrors"]),
             "resolvedErrors": _diagnostic_displays(post_delta["resolvedErrors"]),
             "unchangedErrors": _diagnostic_displays(post_delta["unchangedErrors"]),
             "warnings": _diagnostic_displays(post_warnings),
             "newWarnings": _diagnostic_displays(post_delta["newWarnings"]),
             "diagnosticDelta": post_delta,
+            **self._validation_findings_result_fields(post_validation_response),
         }
         post_failure_errors: list[str] = list(result["postValidation"]["errors"])
         if post_failure_errors:
@@ -4076,7 +4590,9 @@ class JavaRefactorManager:
         diagnostic_delta = _diagnostic_delta(baseline_errors, staged_errors, baseline_warnings, staged_warnings)
         new_errors = _diagnostic_displays(diagnostic_delta["newErrors"])
         unchanged_errors = _diagnostic_displays(diagnostic_delta["unchangedErrors"])
-        blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+        validation_findings = self._validation_findings(staged_validation)
+        compiler_blocking = new_errors if self._config.allow_incomplete_analysis else _diagnostic_displays(staged_errors)
+        blocking = compiler_blocking + validation_findings
         report: dict[str, Any] = {
             "ready": not blocking,
             "errors": blocking,
@@ -4087,13 +4603,21 @@ class JavaRefactorManager:
             "warnings": _diagnostic_displays(staged_warnings),
             "newWarnings": _diagnostic_displays(diagnostic_delta["newWarnings"]),
             "diagnosticDelta": diagnostic_delta,
+            **self._validation_findings_result_fields(staged_validation),
         }
         if blocking:
+            if validation_findings:
+                report["refusal"] = {
+                    "code": "validation_findings_not_ready",
+                    "message": "Staged validateEdit found blocking non-compiler findings:\n" + "\n".join(validation_findings),
+                    "diagnosticDelta": diagnostic_delta,
+                    **self._validation_findings_result_fields(staged_validation),
+                }
             # G002: distinguish "the edit introduced compiler errors" from "the project already does not compile and
             # complete-analysis mode forbids accepting an edit that leaves those pre-existing errors". The latter only
             # arises with allow_incomplete_analysis off; opting in narrows `blocking` to newly introduced errors above,
             # so a purely pre-existing failure can never reach this branch in incomplete mode.
-            if new_errors:
+            elif new_errors:
                 report["refusal"] = {
                     "code": "new_compiler_errors",
                     "message": "Staged javac validation found newly introduced compiler errors:\n" + "\n".join(new_errors),
@@ -4108,6 +4632,28 @@ class JavaRefactorManager:
                     "diagnosticDelta": diagnostic_delta,
                 }
         return report
+
+    @staticmethod
+    def _validation_findings(validation: dict) -> list[str]:
+        """Blocking non-javac validateEdit findings, normalized for preview/apply refusals."""
+        findings: list[str] = []
+        for key in ("resourceFindings", "frameworkFindings", "buildFindings"):
+            raw = validation.get(key) or []
+            if isinstance(raw, list):
+                findings.extend(str(item) for item in raw if item)
+            elif raw:
+                findings.append(str(raw))
+        if validation.get("ready") is False and not findings and not JavaRefactorManager._compiler_errors(validation):
+            findings.append("validateEdit returned ready:false without compiler diagnostics")
+        return findings
+
+    @staticmethod
+    def _validation_findings_result_fields(validation: dict) -> dict[str, Any]:
+        fields: dict[str, Any] = {"validationFindings": JavaRefactorManager._validation_findings(validation)}
+        for key in ("resourceFindings", "frameworkFindings", "buildFindings"):
+            if key in validation:
+                fields[key] = validation.get(key) or []
+        return fields
 
     @staticmethod
     def _checked_validate_edit(client: JavaRefactorClient, overlay: dict) -> dict:

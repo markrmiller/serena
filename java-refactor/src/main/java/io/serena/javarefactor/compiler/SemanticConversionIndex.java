@@ -475,6 +475,9 @@ public final class SemanticConversionIndex {
             if (argCheck != null) {
                 return argCheck;
             }
+            if (!isStableBoundReceiver(member.getExpression(), invPath)) {
+                return null;
+            }
             String receiverText = text(file, member.getExpression());
             return receiverText == null ? null : receiverText + "::" + name;
         }
@@ -512,6 +515,24 @@ public final class SemanticConversionIndex {
         return null;
     }
 
+    private boolean isStableBoundReceiver(ExpressionTree expression, TreePath invocationPath) {
+        if (expression instanceof ParenthesizedTree parenthesized) {
+            return isStableBoundReceiver(parenthesized.getExpression(), invocationPath);
+        }
+        if (!(expression instanceof IdentifierTree)) {
+            return false;
+        }
+        Element element = trees.getElement(new TreePath(invocationPath, expression));
+        if (element == null) {
+            return false;
+        }
+        ElementKind kind = element.getKind();
+        return kind == ElementKind.LOCAL_VARIABLE
+                || kind == ElementKind.PARAMETER
+                || kind == ElementKind.EXCEPTION_PARAMETER
+                || kind == ElementKind.RESOURCE_VARIABLE;
+    }
+
     private boolean referencesAnyParam(ExpressionTree expression, List<String> paramNames, TreePath invocationPath) {
         boolean[] found = {false};
         new TreeScanner<Void, Void>() {
@@ -533,11 +554,10 @@ public final class SemanticConversionIndex {
     }
 
     private String erasedTypeName(TypeMirror type) {
-        if (type == null || type.getKind() != TypeKind.DECLARED) {
-            return null;
+        if (type == null) {
+            return "";
         }
-        Element element = ((DeclaredType) type).asElement();
-        return element instanceof TypeElement typeElement ? typeElement.getSimpleName().toString() : null;
+        return types.erasure(type).toString();
     }
 
     private static ExpressionTree unwrap(ExpressionTree expression) {

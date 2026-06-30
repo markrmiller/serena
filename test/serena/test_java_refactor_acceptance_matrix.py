@@ -1003,7 +1003,7 @@ V3_ACCEPTANCE_CRITERIA: dict[str, list[tuple[str, str]]] = {
         (V3_DELETION_PROTO, "test_cascade_pulls_in_private_helper"),
         (V3_DELETION_PROTO, "test_blocked_when_live_referrer_remains"),
         (V3_DELETION_PROTO, "test_service_loader_provider_line_removed"),
-        (V3_DELETION_PROTO, "test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous"),
+        (V3_DELETION_PROTO, "test_propagate_refuses_when_spring_ref_still_points_at_deleted_bean"),
         (V3_DELETION_PROTO, "test_propagate_refuses_when_no_roots"),
     ],
     "Find dead code": [
@@ -1210,7 +1210,7 @@ V3_REVIEW_BLOCKERS: dict[str, list[tuple[str, str]]] = {
         (V3_DELETION_PROTO, "test_cascade_pulls_in_private_helper"),
         (V3_DELETION_PROTO, "test_blocked_when_live_referrer_remains"),
         (V3_DELETION_PROTO, "test_service_loader_provider_line_removed"),
-        (V3_DELETION_PROTO, "test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous"),
+        (V3_DELETION_PROTO, "test_propagate_refuses_when_spring_ref_still_points_at_deleted_bean"),
         (V3_DELETION_PROTO, "test_find_dead_code_reports_unused_constructor_and_overload"),
         (V3_SAFE_DELETE_IMPORT_CLEANUP, "test_safe_delete_strips_dangling_import_and_compiles"),
         (V3_SAFE_DELETE_IMPORT_CLEANUP, "test_safe_delete_does_not_mask_real_usage_and_refuses"),

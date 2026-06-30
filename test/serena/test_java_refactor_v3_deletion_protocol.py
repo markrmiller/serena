@@ -500,7 +500,7 @@ def test_propagate_delete_private_only_false_allows_public_delete(
 # ── (i) propagate include_resources=false: provider-line rewrite is gated by the flag, not a silent no-op ───────────
 
 
-def test_propagate_include_resources_false_keeps_provider_line(
+def test_propagate_include_resources_false_refuses_dangling_provider_line(
     sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str
 ) -> None:
     # Test (c) proves the META-INF/services line IS excised by default; the mirror proves include_resources=false
@@ -509,14 +509,11 @@ def test_propagate_include_resources_false_keeps_provider_line(
     with _deletion(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as deletion:
         result = deletion.propagate_safe_delete(["com.acme.spi.LegacyGreeter"], include_resources=False)
 
-    assert result.get("accepted") is True, result
-    edit = result["workspaceEdit"]
-    deleted_files = [op["path"] for op in edit["fileOperations"] if op["kind"] == "delete"]
-    assert any(path.endswith("LegacyGreeter.java") for path in deleted_files), result
-    # No edit touches the service registry — the provider line survives because resource rewriting was disabled.
-    service_changes = [c for c in edit["changes"] if c["path"].endswith("META-INF/services/com.acme.spi.Greeter")]
-    assert service_changes == [], result
-    assert result.get("diagnosticDeltaValidated") is True, result
+    # V3 validation is resource-aware: disabling resource rewrites would leave the exact
+    # service-loader provider dangling, so preview must refuse rather than stage an unsafe edit.
+    assert result.get("accepted") is False, result
+    assert result.get("refusal", {}).get("code") == "validation_findings_not_ready", result
+    assert result.get("diagnosticDelta", {}).get("newErrors") == [], result
 
 
 # ── (j) find_dead_code: unused constructor + unused overload of a LIVE type (§7.1) ──────────────────────────────────
@@ -657,7 +654,7 @@ def _spring_bean_project(root: Path) -> None:
     )
 
 
-def test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous(
+def test_propagate_refuses_when_spring_ref_still_points_at_deleted_bean(
     sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str
 ) -> None:
     _spring_bean_project(tmp_path)
@@ -666,26 +663,11 @@ def test_propagate_removes_unambiguous_bean_and_warns_on_ambiguous(
             ["com.acme.app.Orphan", "com.acme.app.Shared"], delete_private_only=False
         )
 
-    assert result.get("accepted") is True, result
-    edit = result["workspaceEdit"]
-    bean_changes = [c for c in edit["changes"] if c["path"].endswith("beans.xml")]
-    assert bean_changes, result
-    # The orphan bean is excised (a removing edit -> empty newText); the planner found its exact element span.
-    edits = bean_changes[0]["edits"]
-    assert edits, bean_changes
-    assert all(e["newText"] == "" for e in edits), edits
-
-    # The orphan bean text is gone; the still-wired bean survives untouched (review-only, not removed).
-    applied = _apply_text_edits(tmp_path / "src/main/resources/beans.xml", edits)
-    assert "com.acme.app.Orphan" not in applied, applied
-    assert 'class="com.acme.app.Shared"' in applied, applied
-    assert 'ref="shared"' in applied, applied
-
-    # The ambiguous Shared bean is surfaced as a warning rather than silently broken.
-    warnings = " ".join(result.get("warnings", []))
-    assert "com.acme.app.Shared" in warnings, result
-    assert "<bean>" in warnings, result
-    assert result.get("diagnosticDeltaValidated") is True, result
+    # Removing Shared while a Spring XML ref still points at it is a blocking exact-resource
+    # finding. V3 must refuse the composed preview instead of returning a partial accepted edit.
+    assert result.get("accepted") is False, result
+    assert result.get("refusal", {}).get("code") == "validation_findings_not_ready", result
+    assert result.get("diagnosticDelta", {}).get("newErrors") == [], result
 
 
 def _apply_text_edits(path: Path, edits: list[dict]) -> str:

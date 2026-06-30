@@ -55,19 +55,38 @@ class TransformationClient:
             params["arguments"] = arguments or {}
         return self._client._request("transformation.createWorkspace", {"params": params})
 
+    def add_operation(
+        self, workspace_id: str, operation: str, arguments: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Adds a V3 operation to an existing preview-ready transformation workspace."""
+        return self._client._request(
+            "transformation.addOperation",
+            {"params": {"workspaceId": workspace_id, "operation": operation, "arguments": arguments or {}}},
+        )
+
+    def add_session(self, workspace_id: str, session_id: str) -> dict[str, Any]:
+        """Adds an existing V2 preview session edit to an existing transformation workspace."""
+        return self._client._request(
+            "transformation.addSession", {"params": {"workspaceId": workspace_id, "sessionId": session_id}}
+        )
+
     def preview(self, workspace_id: str) -> dict[str, Any]:
         return self._client._request("transformation.preview", {"params": {"workspaceId": workspace_id}})
 
     def apply(self, workspace_id: str, expected_project_revision: Any = None) -> dict[str, Any]:
-        """Returns the authoritative validated edit for the Python applier after the clean-revision guard passes.
+        """Prepares the authoritative validated edit for a transactional Python applier.
 
-        The sidecar never writes files; the caller's transactional applier commits the returned edit. A drifted
-        project or a mismatched ``expected_project_revision`` is refused before any edit is surfaced.
+        The sidecar never writes files and does not mark the workspace applied; callers that need disk mutation must
+        commit the returned ``workspaceEdit`` through Serena's transactional applier.
         """
         params: dict[str, Any] = {"workspaceId": workspace_id}
         if expected_project_revision is not None:
             params["expectedProjectRevision"] = expected_project_revision
         return self._client._request("transformation.apply", {"params": params})
+
+    def ack_apply(self, workspace_id: str) -> dict[str, Any]:
+        """Marks a prepared workspace applied after the caller has committed the returned edit transactionally."""
+        return self._client._request("transformation.ackApply", {"params": {"workspaceId": workspace_id}})
 
     def cancel(self, workspace_id: str) -> dict[str, Any]:
         """Evicts a workspace. Idempotent: cancelling a gone workspace yields a terminal refusal, not an error."""

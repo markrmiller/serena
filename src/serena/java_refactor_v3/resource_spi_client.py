@@ -87,7 +87,8 @@ class ResourceSpiClient:
         ``reviewOnly`` array. The result also carries the full ``edits`` array (each with
         ``path``/offsets/``newText``/``kind``/``confidence``/``disposition``/``provider``), a ``fileRenames`` array
         (``from``/``to``/``provider``/``reason``), plus ``stats`` and ``warnings``. Refused with
-        ``resource_rename_empty`` when both maps are empty.
+        ``resource_rename_empty`` when both maps are empty, or ``malformed_resource_edit_map`` for non-string/blank
+        map entries.
         """
         params: dict[str, Any] = {
             "typeFqnMap": dict(type_fqn_map or {}),

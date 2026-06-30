@@ -176,3 +176,27 @@ def test_lambda_to_method_reference_refuses_compound(sidecar_jar: Path, tmp_path
 
     assert result.get("accepted") is False, result
     assert result["refusal"]["code"] in {"lambda_not_single_call", "lambda_unsupported_shape"}, result
+
+
+def test_lambda_to_method_reference_refuses_bound_call_receiver(tmp_path, sidecar_jar, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Main.java",
+        """package com.acme;
+import java.util.function.Function;
+class Main {
+  Helper current() { return new Helper(); }
+  void run() {
+    Function<String, String> f = s -> current().clean(s);
+  }
+  static class Helper {
+    String clean(String value) { return value.trim(); }
+  }
+}
+""",
+    )
+    with _conversions(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.lambda_to_method_reference("src/main/java/com/acme/Main.java", 6)
+
+    assert result["accepted"] is False, result
+    assert result["refusal"]["code"] == "lambda_unsupported_shape", result

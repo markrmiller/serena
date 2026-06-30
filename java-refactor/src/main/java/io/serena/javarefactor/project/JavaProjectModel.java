@@ -235,7 +235,9 @@ public record JavaProjectModel(
     }
 
     public String toJson() {
-        return JsonUtil.object(toJsonFields());
+        Map<String, String> fields = new LinkedHashMap<>(toJsonFields());
+        fields.put("modelHash", JsonUtil.quote(revisionDigest()));
+        return JsonUtil.object(fields);
     }
 
     private Map<String, String> toJsonFields() {

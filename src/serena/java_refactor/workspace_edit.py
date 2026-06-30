@@ -27,7 +27,7 @@ class RefactorTextEdit:
 class RefactorFileOperation:
     """Single file operation planned by the Java refactoring sidecar."""
 
-    kind: Literal["create", "delete", "rename"]
+    kind: Literal["create", "delete", "rename", "deleteDirectory"]
     relative_path: str
     new_relative_path: str | None = None
     content: str | None = None
@@ -263,6 +263,8 @@ class TransactionalWorkspaceEditApplier:
         return path.relative_to(self._project_root).as_posix()
 
     def _validate_workspace_edit(self, workspace_edit: RefactorWorkspaceEdit) -> None:
+        self._reject_cross_kind_delete_directory_conflicts(workspace_edit.file_operations)
+
         """Validates paths, hashes, operation shape, and edit overlap."""
         for relative_path, old_hash in workspace_edit.old_hashes.items():
             self._verify_hash(self._resolve_relative_path(relative_path), old_hash)
@@ -301,6 +303,19 @@ class TransactionalWorkspaceEditApplier:
 
         self._reject_overlapping_text_edits(workspace_edit.text_edits)
 
+
+    def _reject_cross_kind_delete_directory_conflicts(self, file_operations: list[RefactorFileOperation]) -> None:
+        file_deletes: set[str] = set()
+        directory_deletes: set[str] = set()
+        for operation in file_operations:
+            if operation.kind == "delete":
+                file_deletes.add(operation.relative_path)
+            elif operation.kind == "deleteDirectory":
+                directory_deletes.add(operation.relative_path)
+        conflicts = sorted(file_deletes & directory_deletes)
+        if conflicts:
+            raise WorkspaceEditError(f"Path cannot be deleted both as a file and as a directory: {conflicts[0]}")
+
     def _validate_text_edit(self, edit: RefactorTextEdit) -> None:
         """Validates one text edit."""
         self._resolve_relative_path(edit.relative_path)
@@ -312,12 +327,14 @@ class TransactionalWorkspaceEditApplier:
     def _validate_file_operation(self, operation: RefactorFileOperation) -> None:
         """Validates one file operation."""
         self._resolve_relative_path(operation.relative_path)
-        if operation.kind not in {"create", "delete", "rename"}:
+        if operation.kind not in {"create", "delete", "rename", "deleteDirectory"}:
             raise WorkspaceEditError(f"Malformed file operation kind: {operation.kind}")
         if operation.kind == "create" and operation.content is None:
             raise WorkspaceEditError(f"Create operation requires content: {operation.relative_path}")
         if operation.kind == "rename" and operation.new_relative_path is None:
             raise WorkspaceEditError(f"Rename operation requires new_relative_path: {operation.relative_path}")
+        if operation.kind == "deleteDirectory" and (operation.content is not None or operation.new_relative_path is not None):
+            raise WorkspaceEditError(f"Delete-directory operation cannot carry content or a rename target: {operation.relative_path}")
         if operation.new_relative_path is not None:
             self._resolve_relative_path(operation.new_relative_path)
 
@@ -340,7 +357,7 @@ class TransactionalWorkspaceEditApplier:
         originals: dict[Path, bytes | None] = {}
         for relative_path in workspace_edit.touched_files():
             path = self._resolve_relative_path(relative_path)
-            originals[path] = path.read_bytes() if path.exists() else None
+            originals[path] = path.read_bytes() if path.is_file() else None
         return originals
 
     def _stage_file_operations(
@@ -367,6 +384,10 @@ class TransactionalWorkspaceEditApplier:
                 if staged_bytes.get(path) is None and not path.exists():
                     raise WorkspaceEditError(f"Delete operation target does not exist: {operation.relative_path}")
                 staged_bytes[path] = None
+                deleted_paths.add(path)
+            elif operation.kind == "deleteDirectory":
+                if path.exists() and not path.is_dir():
+                    raise WorkspaceEditError(f"Delete-directory operation target is not a directory: {operation.relative_path}")
                 deleted_paths.add(path)
             elif operation.kind == "rename":
                 assert operation.new_relative_path is not None
@@ -564,8 +585,11 @@ class TransactionalWorkspaceEditApplier:
                 temp_files.remove(temp)
                 journal.append(("replace", (path, backup)))
 
-            for path in pure_deletes:
-                if path.exists():
+            for path in sorted(pure_deletes, key=lambda item: len(item.parts), reverse=True):
+                if path.is_dir():
+                    path.rmdir()
+                    journal.append(("delete_dir", (path,)))
+                elif path.exists():
                     backup = backups.get(path)
                     if backup is None:
                         backup = path.read_bytes()
@@ -608,6 +632,10 @@ class TransactionalWorkspaceEditApplier:
         for path in pure_deletes:
             if not path.exists():
                 raise WorkspaceEditError(f"Delete target does not exist at commit time: {self._relative_str(path)}")
+            if path.is_dir() and any(path.iterdir()):
+                staged_deleted = {candidate for candidate in pure_deletes if candidate != path}
+                if any(child not in staged_deleted for child in path.iterdir()):
+                    raise WorkspaceEditError(f"Directory delete target is not empty at commit time: {self._relative_str(path)}")
             self._preflight_writable_parent(path)
 
     def _preflight_writable_destination(self, path: Path) -> None:
@@ -674,6 +702,9 @@ class TransactionalWorkspaceEditApplier:
                 path, backup = payload
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(backup)
+            elif kind == "delete_dir":
+                (path,) = payload
+                path.mkdir(parents=True, exist_ok=True)
 
     def _restore_backups(self, backups: dict[Path, bytes | None]) -> None:
         """Restores original file bytes after a failed commit."""

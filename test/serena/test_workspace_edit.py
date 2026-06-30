@@ -594,3 +594,72 @@ def test_workspace_edit_commit_failure_rolls_back_rename_and_delete(tmp_path: Pa
     assert (tmp_path / "Old.java").read_text(encoding="utf-8") == "class Old {}\n"
     assert (tmp_path / "Gone.java").read_text(encoding="utf-8") == "class Gone {}\n"
     assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_applier_commits_empty_directory_delete_after_file_delete(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    package_dir = root / "src/main/java/com/acme/dead"
+    package_dir.mkdir(parents=True)
+    target = package_dir / "Unused.java"
+    target.write_text("class Unused {}\n", encoding="utf-8")
+    edit = RefactorWorkspaceEdit.from_protocol_dict(
+        {
+            "fileOperations": [
+                {"kind": "delete", "path": "src/main/java/com/acme/dead/Unused.java", "oldSha256": sha256_bytes(target.read_bytes())},
+                {"kind": "deleteDirectory", "path": "src/main/java/com/acme/dead"},
+            ]
+        }
+    )
+
+    TransactionalWorkspaceEditApplier(root).apply(edit)
+
+    assert not target.exists()
+    assert not package_dir.exists()
+
+
+def test_applier_refuses_non_empty_directory_delete(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    package_dir = root / "src/main/java/com/acme/live"
+    package_dir.mkdir(parents=True)
+    (package_dir / "Live.java").write_text("class Live {}\n", encoding="utf-8")
+    edit = RefactorWorkspaceEdit.from_protocol_dict(
+        {"fileOperations": [{"kind": "deleteDirectory", "path": "src/main/java/com/acme/live"}]}
+    )
+
+    with pytest.raises(WorkspaceEditError, match="not empty"):
+        TransactionalWorkspaceEditApplier(root).apply(edit)
+
+    assert package_dir.exists()
+
+def test_applier_refuses_file_delete_then_directory_delete_same_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    target_dir = root / "src/main/java/com/acme/dead"
+    target_dir.mkdir(parents=True)
+    edit = RefactorWorkspaceEdit(
+        file_operations=[
+            RefactorFileOperation(kind="delete", relative_path="src/main/java/com/acme/dead"),
+            RefactorFileOperation(kind="deleteDirectory", relative_path="src/main/java/com/acme/dead"),
+        ]
+    )
+
+    with pytest.raises(WorkspaceEditError, match="both as a file and as a directory"):
+        TransactionalWorkspaceEditApplier(root).apply(edit)
+
+    assert target_dir.exists()
+
+
+def test_applier_refuses_directory_delete_then_file_delete_same_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    target_dir = root / "src/main/java/com/acme/dead"
+    target_dir.mkdir(parents=True)
+    edit = RefactorWorkspaceEdit(
+        file_operations=[
+            RefactorFileOperation(kind="deleteDirectory", relative_path="src/main/java/com/acme/dead"),
+            RefactorFileOperation(kind="delete", relative_path="src/main/java/com/acme/dead"),
+        ]
+    )
+
+    with pytest.raises(WorkspaceEditError, match="both as a file and as a directory"):
+        TransactionalWorkspaceEditApplier(root).apply(edit)
+
+    assert target_dir.exists()

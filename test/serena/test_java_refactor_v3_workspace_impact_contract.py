@@ -7,6 +7,8 @@ from serena.config.serena_config import JavaRefactorConfig
 from serena.java_refactor.manager import JavaRefactorManager
 
 
+_DEFAULT_REVISION = object()
+
 V3_IMPACT_REPORT = {
     "summary": {"filesChanged": ["src/main/java/app/A.java"], "risk": "SAFE"},
     "semanticImpact": {"javaMoves": [], "publicApiChanges": []},
@@ -20,6 +22,10 @@ class _WorkspaceStub:
     def __init__(self) -> None:
         self.apply_calls: list[dict[str, object]] = []
         self.preview_calls: list[str] = []
+        self.workspace = SimpleNamespace(project_revision={"projectRevision": "rev-1"})
+
+    def get_workspace(self, workspace_id: str) -> SimpleNamespace:
+        return self.workspace
 
     def preview(self, workspace_id: str) -> dict[str, object]:
         self.preview_calls.append(workspace_id)
@@ -50,10 +56,16 @@ class _FailingApplyWorkspace(_WorkspaceStub):
 
 
 class _TestManager(JavaRefactorManager):
-    def __init__(self, workspace: _WorkspaceStub, impact_result: dict[str, object]) -> None:
+    def __init__(
+        self,
+        workspace: _WorkspaceStub,
+        impact_result: dict[str, object],
+        current_revision: object | None = _DEFAULT_REVISION,
+    ) -> None:
         self._config = cast(JavaRefactorConfig, SimpleNamespace(enabled=True))
         self._workspace_stub = workspace
         self._impact_result = impact_result
+        self._current_revision = {"projectRevision": "rev-1"} if current_revision is _DEFAULT_REVISION else current_revision
 
     @property
     def transformation_workspaces(self) -> _WorkspaceStub:  # type: ignore[override]
@@ -70,9 +82,16 @@ class _TestManager(JavaRefactorManager):
     ) -> dict[str, object]:
         return self._impact_result
 
+    def _current_v3_project_revision(self) -> object:  # type: ignore[override]
+        return self._current_revision
 
-def _manager_with_workspace(workspace: _WorkspaceStub, impact_result: dict[str, object]) -> JavaRefactorManager:
-    return _TestManager(workspace, impact_result)
+
+def _manager_with_workspace(
+    workspace: _WorkspaceStub,
+    impact_result: dict[str, object],
+    current_revision: object | None = _DEFAULT_REVISION,
+) -> JavaRefactorManager:
+    return _TestManager(workspace, impact_result, current_revision=current_revision)
 
 
 def test_workspace_preview_attaches_graph_backed_v3_impact_report() -> None:
@@ -128,3 +147,33 @@ def test_workspace_apply_refuses_before_write_when_primary_impact_report_refuses
     assert result["refusal"] == refusal["refusal"]
     assert result["workspaceId"] == "workspace-3"
     assert result["mode"] == "apply"
+
+
+def test_workspace_apply_refuses_live_revision_drift_before_local_write() -> None:
+    workspace = _WorkspaceStub()
+    manager = _manager_with_workspace(
+        workspace,
+        {"accepted": True, "report": V3_IMPACT_REPORT},
+    )
+    manager._current_revision = {"projectRevision": "rev-2"}  # type: ignore[attr-defined]
+
+    result = manager.transformation_workspace_apply("workspace-4")
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "workspace_revision_mismatch"
+    assert workspace.apply_calls == []
+
+
+def test_workspace_apply_refuses_when_live_revision_is_unavailable() -> None:
+    workspace = _WorkspaceStub()
+    manager = _manager_with_workspace(
+        workspace,
+        {"accepted": True, "report": V3_IMPACT_REPORT},
+        current_revision=None,
+    )
+
+    result = manager.transformation_workspace_apply("workspace-5")
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "workspace_revision_unavailable"
+    assert workspace.apply_calls == []

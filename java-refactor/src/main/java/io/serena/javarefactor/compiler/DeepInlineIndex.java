@@ -16,6 +16,8 @@ import com.sun.source.tree.NewClassTree;
 import com.sun.source.tree.ParenthesizedTree;
 import com.sun.source.tree.ReturnTree;
 import com.sun.source.tree.StatementTree;
+import com.sun.source.tree.SynchronizedTree;
+import com.sun.source.tree.YieldTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TryTree;
 import com.sun.source.tree.VariableTree;
@@ -91,8 +93,17 @@ public final class DeepInlineIndex {
         if (unit == null) {
             return DeepInlineResult.refuse("method_not_found", "File is not in the Java project model: " + file);
         }
-        TreePath methodPath = locateMethod(unit, line, column);
+        TreePath methodPath;
+        try {
+            methodPath = line > 0 ? locateMethod(unit, line, column) : locateUniqueMethodByName(unit, methodName);
+        } catch (AmbiguousInlineMethod ambiguous) {
+            return DeepInlineResult.refuse("inline_overloaded", ambiguous.getMessage());
+        }
         if (methodPath == null) {
+            if (line <= 0 && methodName != null && !methodName.isBlank()) {
+                return DeepInlineResult.refuse("method_not_found",
+                        "No method declaration named '" + methodName.trim() + "' was found.");
+            }
             return DeepInlineResult.refuse("method_not_found",
                     "No method declaration was found at " + line + ":" + column + ".");
         }
@@ -111,6 +122,10 @@ public final class DeepInlineIndex {
                     "V3 inline method supports private methods only (a private method has no overriding/cross-file "
                             + "call sites); '" + method.getName() + "' is not private.");
         }
+        if (target.getModifiers().contains(Modifier.SYNCHRONIZED)) {
+            return DeepInlineResult.refuse("synchronized_method_unsupported",
+                    "V3 inline method refuses synchronized methods because monitor ownership cannot be preserved by textual inlining.");
+        }
         if (!target.getTypeParameters().isEmpty()) {
             return DeepInlineResult.refuse("generic_method_unsupported",
                     "V3 inline method refuses generic methods: call-site type-argument substitution cannot be proven "
@@ -119,6 +134,11 @@ public final class DeepInlineIndex {
         BlockTree body = method.getBody();
         if (body == null) {
             return DeepInlineResult.refuse("abstract_method", "The selected method has no body to inline.");
+        }
+
+        String unsupportedInlineConstruct = firstUnsupportedInlineConstruct(body);
+        if (unsupportedInlineConstruct != null) {
+            return DeepInlineResult.refuse(unsupportedInlineConstruct, escapeMessage(unsupportedInlineConstruct));
         }
 
         boolean returnsValue = target.getReturnType() != null && target.getReturnType().getKind() != TypeKind.VOID;
@@ -482,6 +502,34 @@ public final class DeepInlineIndex {
 
     // ── classification helpers ───────────────────────────────────────────────────────────────────────────────────
 
+
+    private String firstUnsupportedInlineConstruct(Tree tree) {
+        final String[] code = new String[1];
+        new TreeScanner<Void, Void>() {
+            @Override
+            public Void visitSynchronized(SynchronizedTree node, Void unused) {
+                if (code[0] == null) {
+                    code[0] = "synchronized_block_unsupported";
+                }
+                return null;
+            }
+
+            @Override
+            public Void visitYield(YieldTree node, Void unused) {
+                if (code[0] == null) {
+                    code[0] = "yield_unsupported";
+                }
+                return null;
+            }
+
+            @Override
+            public Void scan(Tree node, Void unused) {
+                return code[0] == null ? super.scan(node, unused) : null;
+            }
+        }.scan(tree, null);
+        return code[0];
+    }
+
     private String firstEscape(TreePath methodPath, ExecutableElement target, ReturnTree finalReturn) {
         String[] found = {null};
         new TreePathScanner<Void, Void>() {
@@ -729,6 +777,34 @@ public final class DeepInlineIndex {
         char before = at > 0 ? source.charAt(at - 1) : ' ';
         char after = at + word.length() < source.length() ? source.charAt(at + word.length()) : ' ';
         return !Character.isJavaIdentifierPart(before) && !Character.isJavaIdentifierPart(after);
+    }
+
+    private TreePath locateUniqueMethodByName(CompilationUnitTree unit, String methodName) {
+        if (methodName == null || methodName.isBlank()) {
+            return null;
+        }
+        String targetName = methodName.trim();
+        List<TreePath> matches = new ArrayList<>();
+        new TreePathScanner<Void, Void>() {
+            @Override
+            public Void visitMethod(MethodTree node, Void unused) {
+                if (node.getName().contentEquals(targetName)) {
+                    matches.add(getCurrentPath());
+                }
+                return super.visitMethod(node, unused);
+            }
+        }.scan(unit, null);
+        if (matches.size() > 1) {
+            throw new AmbiguousInlineMethod(
+                    "Method name '" + targetName + "' is ambiguous; pass line/column to select one overload.");
+        }
+        return matches.isEmpty() ? null : matches.get(0);
+    }
+
+    private static final class AmbiguousInlineMethod extends RuntimeException {
+        AmbiguousInlineMethod(String message) {
+            super(message);
+        }
     }
 
     private TreePath locateMethod(CompilationUnitTree unit, int line, int column) {

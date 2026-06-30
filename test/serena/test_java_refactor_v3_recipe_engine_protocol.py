@@ -187,19 +187,15 @@ def _needs_review_recipe_fixture(tmp_path: Path) -> dict:
 
 
 def test_recipe_apply_blocks_needs_review_by_default(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
-    # The sole match is REVIEW_REQUIRED with a replacement. Without apply_needs_review (the default) the gate SKIPS it:
-    # the recipe is accepted (it matched) but emits ZERO edits — the needs_review match is counted as skipped and the
-    # target file is left untouched. This proves the gate withholds the edit by default (the same match IS applied once
-    # apply_needs_review=True, see the companion test) rather than the param being silently accepted.
+    # Applying a recipe is atomic at recipe scope: REVIEW_REQUIRED findings may be previewed,
+    # but apply must refuse unless the caller explicitly approves review-required edits.
     recipe = _needs_review_recipe_fixture(tmp_path)
     with _recipes(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
         result = client.apply_recipe(recipe=recipe)
 
-    assert result.get("accepted") is True, result
-    changes = result["workspaceEdit"]["changes"]
-    assert not any(c["path"].endswith("Caller.java") for c in changes), result
-    assert result["stats"]["applied"] == 0, result
-    assert result["stats"]["skipped"] >= 1, result
+    assert result.get("accepted") is False, result
+    assert result.get("refusal", {}).get("code") == "recipe_review_required", result
+    assert result.get("workspaceEdit", {}).get("changes") in ({}, []), result
 
 
 def test_recipe_apply_applies_needs_review_when_allowed(
@@ -369,3 +365,103 @@ def test_recipe_scan_scope_restricts_to_package_subtree(sidecar_jar: Path, tmp_p
     # The scope is honoured in the sidecar: only the in-subtree file's findings remain.
     assert any(p.endswith("WebClock.java") for p in scoped_paths), scoped
     assert not any(p.endswith("DataClock.java") for p in scoped_paths), scoped
+
+
+
+def test_recipe_apply_refuses_signature_rule_skipped_by_scope(
+    sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str
+) -> None:
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Api.java",
+        "package com.acme;\npublic class Api {\n  void handle(int left, int right) {}\n}\n",
+    )
+    recipe = {
+        "id": "skip-signature",
+        "description": "Signature rule is real but outside the requested apply scope.",
+        "rules": [
+            {
+                "kind": "changeMethodSignature",
+                "owner": "com.acme.Api",
+                "name": "handle",
+                "paramTypes": ["int", "int"],
+                "newName": "process",
+            }
+        ],
+    }
+
+    with _recipes(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.apply_recipe(recipe=recipe, scope="com.other")
+
+    assert result.get("accepted") is False, result
+    assert result.get("refusal", {}).get("code") == "recipe_no_matches", result
+    assert result.get("workspaceEdit", {}).get("changes") in ({}, []), result
+
+
+def test_replace_import_does_not_rewrite_type_references(tmp_path, sidecar_jar, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/OldType.java",
+        "package com.acme; public class OldType {}",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/NewType.java",
+        "package com.acme; public class NewType {}",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Main.java",
+        """package com.acme;
+import com.acme.OldType;
+class Main {
+  OldType value;
+}
+""",
+    )
+    recipe = {
+        "id": "import-only",
+        "rules": [{"kind": "replaceImport", "oldType": "com.acme.OldType", "newType": "com.acme.NewType"}],
+    }
+    with _recipes(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.apply_recipe(recipe=recipe)
+
+    assert result["accepted"] is True, result
+    edits = str(result.get("workspaceEdit", {}))
+    assert "com.acme.NewType" in edits
+    assert "OldType value" not in edits
+
+
+def test_replace_annotation_only_rewrites_annotation_type(tmp_path, sidecar_jar, sidecar_java_cmd):
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/OldAnno.java",
+        "package com.acme; public @interface OldAnno { String value() default \"\"; }",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/NewAnno.java",
+        "package com.acme; public @interface NewAnno { String value() default \"\"; }",
+    )
+    _write(
+        tmp_path,
+        "src/main/java/com/acme/Main.java",
+        """package com.acme;
+@OldAnno("kept")
+class Main {
+  OldAnno field;
+}
+""",
+    )
+    recipe = {
+        "id": "annotation-only",
+        "rules": [{"kind": "replaceAnnotation", "oldType": "com.acme.OldAnno", "newType": "com.acme.NewAnno"}],
+    }
+    with _recipes(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as client:
+        result = client.apply_recipe(recipe=recipe)
+
+    assert result["accepted"] is True, result
+    edits = str(result.get("workspaceEdit", {}))
+    assert "NewAnno" in edits
+    assert "OldAnno field" not in edits
+    assert "kept" not in edits

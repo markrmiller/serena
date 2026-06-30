@@ -2,6 +2,8 @@ package io.serena.javarefactor.v3.transformation;
 
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.edits.ResponseBuilder.FileOperation;
+import io.serena.javarefactor.protocol.Json;
+import io.serena.javarefactor.protocol.JsonUtil;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -37,12 +39,17 @@ import java.util.Set;
  */
 public final class EditComposer {
 
+    private static final List<String> RISK_FACT_KEYS = List.of(
+            "publicApiChanges", "frameworkBoundaryChanges", "heuristicEdits", "analysisIncomplete");
+
+
     /** The merged, conflict-checked contribution of every step in a workspace. */
     public record ComposedEdit(
             List<PlannerSupport.TextEdit> edits,
             List<FileOperation> fileOperations,
             List<String> warnings,
-            String semanticTargetJson) {
+            String semanticTargetJson,
+            String riskFactsJson) {
     }
 
     /** Raised when two steps genuinely conflict; carries the canonical {@code workspace_edit_conflict} refusal code. */
@@ -68,11 +75,13 @@ public final class EditComposer {
         List<FileOperation> allFileOps = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         List<String> semanticTargets = new ArrayList<>();
+        Map<String, LinkedHashSet<String>> riskFacts = new LinkedHashMap<>();
         for (TransformationStep step : steps) {
             allEdits.addAll(step.edits());
             allFileOps.addAll(step.fileOperations());
             warnings.addAll(step.warnings());
-            semanticTargets.add("{\"operation\":" + io.serena.javarefactor.protocol.JsonUtil.quote(step.operation())
+            mergeRiskFacts(riskFacts, step.riskFactsJson());
+            semanticTargets.add("{\"operation\":" + JsonUtil.quote(step.operation())
                     + ",\"target\":" + step.semanticTargetJson() + "}");
         }
 
@@ -83,11 +92,50 @@ public final class EditComposer {
                 .thenComparingLong(PlannerSupport.TextEdit::endOffset));
         detectTrueOverlap(allEdits);
         detectFileOperationConflicts(allFileOps);
+        detectRenameThenEditOldPathByStep(steps);
         detectRenameThenEditOldPath(allEdits, allFileOps);
 
         String semanticTargetJson = "{\"kind\":\"transformation\",\"steps\":["
                 + String.join(",", semanticTargets) + "]}";
-        return new ComposedEdit(allEdits, allFileOps, warnings, semanticTargetJson);
+        return new ComposedEdit(allEdits, allFileOps, warnings, semanticTargetJson, riskFactsJson(riskFacts));
+    }
+
+    private static void mergeRiskFacts(Map<String, LinkedHashSet<String>> merged, String riskFactsJson) {
+        if (riskFactsJson == null || riskFactsJson.isBlank() || "{}".equals(riskFactsJson.strip())) {
+            return;
+        }
+        Map<String, Object> parsed;
+        try {
+            parsed = Json.parseObject(riskFactsJson);
+        } catch (RuntimeException ignored) {
+            return;
+        }
+        for (String key : RISK_FACT_KEYS) {
+            Object value = parsed.get(key);
+            if (!(value instanceof List<?> values)) {
+                continue;
+            }
+            LinkedHashSet<String> bucket = merged.computeIfAbsent(key, ignored -> new LinkedHashSet<>());
+            for (Object item : values) {
+                if (item != null) {
+                    String text = String.valueOf(item);
+                    if (!text.isBlank()) {
+                        bucket.add(text);
+                    }
+                }
+            }
+        }
+    }
+
+    private static String riskFactsJson(Map<String, LinkedHashSet<String>> riskFacts) {
+        List<String> fields = new ArrayList<>();
+        for (String key : RISK_FACT_KEYS) {
+            LinkedHashSet<String> values = riskFacts.get(key);
+            if (values != null && !values.isEmpty()) {
+                fields.add(JsonUtil.quote(key) + ":" + JsonUtil.array(new ArrayList<>(values)));
+            }
+        }
+        return "{" + String.join(",", fields) + "}";
     }
 
     /** Refuses ONLY when two edits to the same file have overlapping half-open {@code [start, end)} ranges. */
@@ -115,6 +163,8 @@ public final class EditComposer {
     private void detectFileOperationConflicts(List<FileOperation> fileOps) {
         Set<String> renamedSources = new LinkedHashSet<>();
         Set<String> producedPaths = new LinkedHashSet<>();
+        Set<String> deletedPaths = new LinkedHashSet<>();
+        Set<String> deletedDirectories = new LinkedHashSet<>();
         for (FileOperation op : fileOps) {
             switch (op.kind()) {
                 case "rename" -> {
@@ -122,22 +172,69 @@ public final class EditComposer {
                         throw new ComposeConflict("workspace edit conflict: '" + op.oldPath()
                                 + "' is renamed by more than one operation.");
                     }
+                    if (deletedPaths.contains(op.oldPath())) {
+                        throw new ComposeConflict("workspace edit conflict: '" + op.oldPath()
+                                + "' is both renamed and deleted.");
+                    }
+                    if (deletedPaths.contains(op.newPath())) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.newPath()
+                                + "' is both produced and deleted.");
+                    }
+                    if (isUnderDeletedDirectory(op.newPath(), deletedDirectories)) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.newPath()
+                                + "' is produced under a deleted directory.");
+                    }
                     if (!producedPaths.add(op.newPath())) {
                         throw new ComposeConflict("workspace edit conflict: two operations produce the file '"
                                 + op.newPath() + "'.");
                     }
                 }
                 case "create" -> {
+                    if (deletedPaths.contains(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.path()
+                                + "' is both created and deleted.");
+                    }
+                    if (isUnderDeletedDirectory(op.path(), deletedDirectories)) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.path()
+                                + "' is created under a deleted directory.");
+                    }
                     if (!producedPaths.add(op.path())) {
                         throw new ComposeConflict("workspace edit conflict: two operations produce the file '"
                                 + op.path() + "'.");
                     }
                 }
                 case "delete" -> {
-                    // A delete that races a rename of the same source is caught by renamedSources below.
+                    if (deletedDirectories.contains(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: path '" + op.path()
+                                + "' is both deleted as a file and as a directory.");
+                    }
+                    if (!deletedPaths.add(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.path()
+                                + "' is deleted by more than one operation.");
+                    }
                     if (renamedSources.contains(op.path())) {
                         throw new ComposeConflict("workspace edit conflict: '" + op.path()
                                 + "' is both renamed and deleted.");
+                    }
+                    if (producedPaths.contains(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: file '" + op.path()
+                                + "' is both produced and deleted.");
+                    }
+                }
+                case "deleteDirectory" -> {
+                    if (deletedPaths.contains(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: path '" + op.path()
+                                + "' is both deleted as a file and as a directory.");
+                    }
+                    if (!deletedDirectories.add(op.path())) {
+                        throw new ComposeConflict("workspace edit conflict: directory '" + op.path()
+                                + "' is deleted by more than one operation.");
+                    }
+                    for (String producedPath : producedPaths) {
+                        if (isUnderDirectory(producedPath, op.path())) {
+                            throw new ComposeConflict("workspace edit conflict: file '" + producedPath
+                                    + "' is produced under deleted directory '" + op.path() + "'.");
+                        }
                     }
                 }
                 default -> {
@@ -147,6 +244,19 @@ public final class EditComposer {
         }
     }
 
+    private boolean isUnderDeletedDirectory(String path, Set<String> deletedDirectories) {
+        for (String directory : deletedDirectories) {
+            if (isUnderDirectory(path, directory)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isUnderDirectory(String path, String directory) {
+        return path.equals(directory) || path.startsWith(directory + "/");
+    }
+
     /**
      * Detects the rename-then-edit-old-path hazard: a file is renamed by one operation while another operation's text
      * edits are keyed to that file's OLD path under a *different* logical owner. Text edits keyed to a renamed file's old
@@ -154,6 +264,29 @@ public final class EditComposer {
      * the SAME old path is BOTH a rename source AND a create target — i.e. the path is being recreated under it, which the
      * applier cannot order.
      */
+
+    private void detectRenameThenEditOldPathByStep(List<TransformationStep> steps) {
+        Set<String> renamedSources = new LinkedHashSet<>();
+        for (TransformationStep step : steps) {
+            for (PlannerSupport.TextEdit edit : step.edits()) {
+                String editPath = edit.file().toString();
+                if (edit.file().isAbsolute() && edit.file().startsWith(projectRoot)) {
+                    editPath = projectRoot.relativize(edit.file()).toString();
+                }
+                if (renamedSources.contains(editPath)) {
+                    throw new ComposeConflict(
+                            "rename_then_edit_old_path: File '" + editPath
+                                    + "' is renamed by an earlier operation and edited at its old path later in the workspace.");
+                }
+            }
+            for (FileOperation op : step.fileOperations()) {
+                if ("rename".equals(op.kind()) && op.oldPath() != null && !op.oldPath().isBlank()) {
+                    renamedSources.add(op.oldPath());
+                }
+            }
+        }
+    }
+
     private void detectRenameThenEditOldPath(List<PlannerSupport.TextEdit> edits, List<FileOperation> fileOps) {
         Set<String> renameSources = new LinkedHashSet<>();
         Set<String> createTargets = new LinkedHashSet<>();

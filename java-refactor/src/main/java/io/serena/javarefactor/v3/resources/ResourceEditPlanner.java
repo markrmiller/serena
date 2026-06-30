@@ -54,8 +54,8 @@ public final class ResourceEditPlanner {
     }
 
     private String planEditsChecked(Map<String, Object> fields) throws IOException {
-        Map<String, String> typeFqnMap = stringMap(fields.get("typeFqnMap"));
-        Map<String, String> packageMap = stringMap(fields.get("packageMap"));
+        Map<String, String> typeFqnMap = stringMap(fields.get("typeFqnMap"), "typeFqnMap");
+        Map<String, String> packageMap = stringMap(fields.get("packageMap"), "packageMap");
         if (typeFqnMap.isEmpty() && packageMap.isEmpty()) {
             throw new ResourceRefusal("resource_rename_empty",
                     "At least one of 'typeFqnMap' or 'packageMap' must be a non-empty {oldName:newName} object.");
@@ -102,7 +102,7 @@ public final class ResourceEditPlanner {
     }
 
     private String envelope(ResourcePlanner.ResourcePlan plan, List<ResourceReference> reviewOnly,
-            boolean applyMediumConfidence) {
+            boolean applyMediumConfidence) throws IOException {
         // Story R06 gate: when the resource scan that informed this plan was incomplete (an in-scope file was unreadable
         // or exceeded the size cap, so we could not determine whether it references a moved symbol) NO edit may be
         // auto-applied — every edit drops to PREVIEW and the envelope is marked resourceScanIncomplete so the canonical
@@ -121,6 +121,7 @@ public final class ResourceEditPlanner {
         String editsJson = editsArray(plan.edits(), applyMediumConfidence, scanIncomplete);
         String autoApplyJson = editsArray(autoApply, applyMediumConfidence, scanIncomplete);
         String previewJson = editsArray(preview, applyMediumConfidence, scanIncomplete);
+        String workspaceEditJson = workspaceEditJson(autoApply, scanIncomplete ? List.of() : plan.fileRenames());
 
         StringBuilder renames = new StringBuilder("[");
         for (int i = 0; i < plan.fileRenames().size(); i++) {
@@ -151,6 +152,7 @@ public final class ResourceEditPlanner {
                 + "\"preview\":" + previewJson + ","
                 + "\"reviewOnly\":" + review + ","
                 + "\"fileRenames\":" + renames + ","
+                + "\"workspaceEdit\":" + workspaceEditJson + ","
                 + "\"stats\":{\"edits\":" + plan.edits().size()
                 + ",\"autoApply\":" + autoApply.size()
                 + ",\"preview\":" + preview.size()
@@ -169,6 +171,29 @@ public final class ResourceEditPlanner {
             out.append(editJson(edits.get(i), applyMediumConfidence, scanIncomplete));
         }
         return out.append("]").toString();
+    }
+
+    private String workspaceEditJson(List<ResourceEdit> edits, List<ResourceFileRename> renames) throws IOException {
+        List<PlannerSupport.TextEdit> textEdits = new ArrayList<>();
+        for (ResourceEdit edit : edits) {
+            textEdits.add(new PlannerSupport.TextEdit(
+                    edit.file(), edit.startOffset(), edit.endOffset(), edit.newText(), edit.kind().name()));
+        }
+        StringBuilder fileOps = new StringBuilder("[");
+        for (int i = 0; i < renames.size(); i++) {
+            if (i > 0) {
+                fileOps.append(",");
+            }
+            ResourceFileRename rename = renames.get(i);
+            fileOps.append(PlannerSupport.renameFileOp(
+                    projectRoot,
+                    PlannerSupport.relative(projectRoot, rename.from()),
+                    PlannerSupport.relative(projectRoot, rename.to())));
+        }
+        fileOps.append("]");
+        return "{\"changes\":" + PlannerSupport.changesJson(projectRoot, textEdits)
+                + ",\"fileOperations\":" + fileOps
+                + ",\"warnings\":" + PlannerSupport.warningsJson(List.of()) + "}";
     }
 
     private String editJson(ResourceEdit edit, boolean applyMediumConfidence, boolean scanIncomplete) {
@@ -213,15 +238,23 @@ public final class ResourceEditPlanner {
                 + "}";
     }
 
-    /** Coerce a JSON object field into a {@code <String,String>} map, ignoring non-string entries. */
-    private static Map<String, String> stringMap(Object raw) {
+    /** Coerce a JSON object field into a {@code <String,String>} map, refusing malformed entries. */
+    private static Map<String, String> stringMap(Object raw, String field) {
         Map<String, String> map = new LinkedHashMap<>();
-        if (raw instanceof Map<?, ?> object) {
-            for (Map.Entry<?, ?> entry : object.entrySet()) {
-                if (entry.getKey() instanceof String key && entry.getValue() instanceof String value) {
-                    map.put(key, value);
-                }
+        if (raw == null) {
+            return map;
+        }
+        if (!(raw instanceof Map<?, ?> object)) {
+            throw new ResourceRefusal("malformed_resource_edit_map",
+                    field + " must be a JSON object whose keys and values are non-empty strings.");
+        }
+        for (Map.Entry<?, ?> entry : object.entrySet()) {
+            if (!(entry.getKey() instanceof String key) || key.isBlank()
+                    || !(entry.getValue() instanceof String value) || value.isBlank()) {
+                throw new ResourceRefusal("malformed_resource_edit_map",
+                        field + " entries must have non-empty string keys and values.");
             }
+            map.put(key, value);
         }
         return map;
     }

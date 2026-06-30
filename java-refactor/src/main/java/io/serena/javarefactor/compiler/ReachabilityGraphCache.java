@@ -2,11 +2,13 @@ package io.serena.javarefactor.compiler;
 
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.project.JavaProjectModel;
+import io.serena.javarefactor.project.ResourceRootModel;
 import io.serena.javarefactor.project.SourceSet;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -14,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 /**
  * Process-wide memoization of {@link ReachabilityGraph} instances keyed by a WHOLE-PROJECT revision (G-CACHE,
@@ -30,7 +33,8 @@ import java.util.function.Supplier;
  * DOES change the graph, which would silently serve a stale graph and corrupt impact facts. Instead the key combines
  * {@link JavaProjectModel#revisionDigest()} (source-set layout, compiler options, classpath, ... — every
  * inventory-independent model field) with a content digest over EVERY {@code .java} source file across EVERY source
- * root (path + SHA-256 of bytes, in sorted order). Any edit to any source file — touched or not — yields a new key, a
+ * root plus every configured resource file (path + SHA-256 of bytes, in sorted order). Any edit to any graph-affecting
+ * file — touched or not — yields a new key, a
  * cache miss, and a rebuild. Caching is therefore content-addressed: invalidation is automatic on key change.
  *
  * <p>Memory is bounded: only the most-recently-seen key is retained, with at most one entry per {@code includeTests}
@@ -84,20 +88,45 @@ public final class ReachabilityGraphCache {
         TreeMap<String, String> inventory = new TreeMap<>();
         for (SourceSet sourceSet : model.sourceSets()) {
             for (Path javaFile : sourceSet.javaFiles()) {
-                Path normalized = javaFile.toAbsolutePath().normalize();
-                if (Files.isRegularFile(normalized)) {
-                    inventory.put(normalized.toString(), PlannerSupport.sha256(normalized));
-                } else {
-                    inventory.put(normalized.toString(), "<missing>");
+                putFileHash(inventory, "src", javaFile.toAbsolutePath().normalize());
+            }
+        }
+        for (Path resourceRoot : ResourceRootModel.resourceRoots(model)) {
+            Path normalizedRoot = resourceRoot.toAbsolutePath().normalize();
+            if (!Files.isDirectory(normalizedRoot)) {
+                inventory.put("res " + normalizedRoot, "<missing-root>");
+                continue;
+            }
+            try (Stream<Path> walk = Files.walk(normalizedRoot)) {
+                for (Path resourceFile : walk.filter(Files::isRegularFile).toList()) {
+                    putFileHash(inventory, "res", resourceFile.toAbsolutePath().normalize());
                 }
             }
         }
         StringBuilder builder = new StringBuilder();
         builder.append("model=").append(model.revisionDigest()).append('\n');
+        builder.append("resourceProviders=builtin-v1\n");
         for (Map.Entry<String, String> entry : inventory.entrySet()) {
-            builder.append("src ").append(entry.getKey()).append(' ').append(entry.getValue()).append('\n');
+            builder.append(entry.getKey()).append(' ').append(entry.getValue()).append('\n');
         }
         return sha256(builder.toString());
+    }
+
+    private static void putFileHash(Map<String, String> inventory, String prefix, Path normalized) throws IOException {
+        String key = prefix + " " + normalized;
+        if (!Files.isRegularFile(normalized)) {
+            inventory.put(key, "<missing>");
+            return;
+        }
+        try {
+            inventory.put(key, PlannerSupport.sha256(normalized));
+        } catch (IOException unreadable) {
+            // Resource-aware graph keys must remain computable even when a resource exists but cannot be read.
+            // Preserve a deterministic, revision-affecting marker instead of aborting read-only scans.
+            BasicFileAttributes attrs = Files.readAttributes(normalized, BasicFileAttributes.class);
+            inventory.put(key, "<unreadable:size=" + attrs.size()
+                    + ":mtime=" + attrs.lastModifiedTime().toMillis() + ">");
+        }
     }
 
     private static String sha256(String value) throws IOException {

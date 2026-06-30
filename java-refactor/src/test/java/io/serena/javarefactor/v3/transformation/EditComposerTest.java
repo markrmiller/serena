@@ -119,4 +119,79 @@ class EditComposerTest {
         assertTrue(composed.semanticTargetJson().contains("\"operation\":\"a\""), composed.semanticTargetJson());
         assertTrue(composed.semanticTargetJson().contains("\"operation\":\"b\""), composed.semanticTargetJson());
     }
+    @Test
+    void refusesRenameThenEditOldPath() {
+        TransformationStep rename = step(
+                "rename",
+                List.of(),
+                List.of(FileOperation.rename("old/A.java", "new/A.java", "sha-old")));
+        TransformationStep editOldPath = step(
+                "edit",
+                List.of(edit("old/A.java", 0, 1, "x")),
+                List.of());
+
+        assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(rename, editOldPath)));
+    }
+
+
+
+    @Test
+    void refusesDuplicateDeletes() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.delete("x/A.java", null)));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.delete("x/A.java", null)));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("deleted by more than one"), conflict.getMessage());
+    }
+
+    @Test
+    void refusesCreateDeleteSamePath() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.create("x/A.java", "a")));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.delete("x/A.java", null)));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("produced and deleted"), conflict.getMessage());
+    }
+
+    @Test
+    void refusesRenameDestinationDeleted() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.rename("x/A.java", "x/B.java", null)));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.delete("x/B.java", null)));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("produced and deleted"), conflict.getMessage());
+    }
+
+    @Test
+    void refusesCreateUnderDeletedDirectory() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.deleteDirectory("x")));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.create("x/A.java", "a")));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("deleted directory"), conflict.getMessage());
+    }
+
+    @Test
+    void refusesFileDeleteThenDirectoryDeleteSamePath() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.delete("x", null)));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.deleteDirectory("x")));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("file and as a directory"), conflict.getMessage());
+    }
+
+    @Test
+    void refusesDirectoryDeleteThenFileDeleteSamePath() {
+        TransformationStep a = step("a", List.of(), List.of(FileOperation.deleteDirectory("x")));
+        TransformationStep b = step("b", List.of(), List.of(FileOperation.delete("x", null)));
+
+        EditComposer.ComposeConflict conflict =
+                assertThrows(EditComposer.ComposeConflict.class, () -> composer.compose(List.of(a, b)));
+        assertTrue(conflict.getMessage().contains("file and as a directory"), conflict.getMessage());
+    }
 }

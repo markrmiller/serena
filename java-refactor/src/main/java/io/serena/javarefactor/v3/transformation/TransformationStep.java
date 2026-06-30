@@ -24,11 +24,22 @@ public record TransformationStep(
         List<PlannerSupport.TextEdit> edits,
         List<FileOperation> fileOperations,
         List<String> warnings,
-        String semanticTargetJson) {
+        String semanticTargetJson,
+        String riskFactsJson) {
+
+    public TransformationStep(
+            String operation,
+            List<PlannerSupport.TextEdit> edits,
+            List<FileOperation> fileOperations,
+            List<String> warnings,
+            String semanticTargetJson) {
+        this(operation, edits, fileOperations, warnings, semanticTargetJson, "{}");
+    }
 
     public TransformationStep {
         edits = List.copyOf(edits);
         fileOperations = List.copyOf(fileOperations);
         warnings = List.copyOf(warnings);
+        riskFactsJson = (riskFactsJson == null || riskFactsJson.isBlank()) ? "{}" : riskFactsJson;
     }
 }

@@ -40,6 +40,11 @@ def _rename_project(root: Path) -> None:
         "src/main/java/com/acme/client/Client.java",
         "package com.acme.client;\nimport com.acme.app.Service;\npublic class Client {\n    Service service;\n    String name = Service.NAME;\n}\n",
     )
+    _write(
+        root,
+        "src/main/java/com/acme/extra/Extra.java",
+        "package com.acme.extra;\npublic class Extra {}\n",
+    )
 
 
 @contextlib.contextmanager
@@ -116,7 +121,24 @@ def test_preview_returns_javac_validated_composed_edit(sidecar_jar: Path, tmp_pa
     assert any(path.endswith("Client.java") for path in changed_files), preview
 
 
-def test_apply_enforces_single_apply_guard(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
+def test_add_operation_preserves_nested_arguments(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
+    _rename_project(tmp_path)
+    with _transformation(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as tx:
+        created = tx.create_workspace("renamePackage", _rename_args())
+        assert created.get("accepted") is True, created
+        added = tx.add_operation(
+            created["workspaceId"],
+            "renamePackage",
+            {"oldPackage": "com.acme.extra", "newPackage": "com.acme.renamed"},
+        )
+
+    assert added.get("accepted") is True, added
+    edit = added["workspaceEdit"]
+    rename_targets = [op["newPath"] for op in edit["fileOperations"] if op["kind"] == "rename"]
+    assert any("com/acme/renamed/Extra.java" in target for target in rename_targets), added
+
+
+def test_apply_prepares_then_ack_terminalizes_workspace(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
     _rename_project(tmp_path)
     with _transformation(sidecar_jar, tmp_path, java_command=sidecar_java_cmd) as tx:
         created = tx.create_workspace("renamePackage", _rename_args())
@@ -125,7 +147,15 @@ def test_apply_enforces_single_apply_guard(sidecar_jar: Path, tmp_path: Path, si
 
         applied = tx.apply(workspace_id)
         assert applied.get("accepted") is True, applied
-        assert applied["workspaceStatus"] == "applied"
+        assert applied["workspaceStatus"] == "previewReady"
+
+        acked = tx.ack_apply(workspace_id)
+        assert acked.get("accepted") is True, acked
+        assert acked["status"] == "applied"
+
+        listed = tx.list()
+        listed_status = {entry["workspaceId"]: entry["status"] for entry in listed["workspaces"]}
+        assert listed_status[workspace_id] == "applied"
 
         again = tx.apply(workspace_id)
         assert again.get("accepted") is False, again
