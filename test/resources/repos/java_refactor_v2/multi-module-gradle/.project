@@ -1,0 +1,19 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<projectDescription>
+	<name>multi-module-gradle</name>
+	<comment>Project multi-module-gradle created by Serena for JDTLS.</comment>
+	<projects />
+	<buildSpec />
+	<natures />
+	<filteredResources>
+		<filter>
+			<id>1782780316019</id>
+			<name />
+			<type>30</type>
+			<matcher>
+				<id>org.eclipse.core.resources.regexFilterMatcher</id>
+				<arguments>node_modules|\.(?!settings$).*</arguments>
+			</matcher>
+		</filter>
+	</filteredResources>
+</projectDescription>

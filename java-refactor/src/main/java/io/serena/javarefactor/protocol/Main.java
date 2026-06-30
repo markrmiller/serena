@@ -1406,6 +1406,8 @@ public final class Main {
     // state the real, currently-implemented behaviour of each dispatched method.
     private static final List<CapabilitySpec> V3_DISPATCH_CAPABILITY_SPECS = List.of(
             new CapabilitySpec("transformation.createWorkspace", "experimental", "Open a revision-guarded V3 transformation workspace for a canonical refactor operation."),
+            new CapabilitySpec("transformation.addSession", "experimental", "Enroll an existing refactor session into a V3 transformation workspace under the pinned project revision."),
+            new CapabilitySpec("transformation.addOperation", "experimental", "Plan and enroll a V3 operation into a transformation workspace without applying it."),
             new CapabilitySpec("transformation.preview", "experimental", "Compute the preview workspace edit and impact report for a staged V3 transformation."),
             new CapabilitySpec("transformation.apply", "experimental", "Apply a previewed V3 transformation under full project-revision guarding."),
             new CapabilitySpec("transformation.cancel", "experimental", "Discard a staged V3 transformation workspace."),

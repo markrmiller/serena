@@ -11,6 +11,7 @@ import io.serena.javarefactor.v3.frameworks.FrameworkParticipationCoordinator;
 import io.serena.javarefactor.v3.frameworks.SymbolChange;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -214,6 +215,8 @@ public final class RenamePackagePlanner {
                                 + (includeSubpackages ? " or a subpackage of it." : "."));
             }
 
+            requireNoDestinationCollision(moved);
+
             // package_collision: a destination package already contains a type whose simple name matches a moved type.
             Set<String> movedNewPackages = new LinkedHashSet<>();
             for (MovedFile movedFile : moved) {
@@ -357,7 +360,25 @@ public final class RenamePackagePlanner {
         return includeSubpackages && declared.startsWith(oldPackage + ".");
     }
 
-    /** Builds the per-file rename op + package-declaration edit for a file moving from {@code declared} to {@code newDeclared}. */
+    /** Refuses before accepting a plan when a package move would collide with an existing or duplicate target file. */
+    private void requireNoDestinationCollision(List<MovedFile> moved) {
+        Set<String> destinations = new LinkedHashSet<>();
+        for (MovedFile movedFile : moved) {
+            Path destination = projectRoot.resolve(movedFile.relativeNew()).normalize();
+            Path source = movedFile.file().toAbsolutePath().normalize();
+            if (Files.exists(destination) && !destination.equals(source)) {
+                throw new Refusal(
+                        "package_collision",
+                        "Target file already exists for moved package source: " + movedFile.relativeNew());
+            }
+            if (!destinations.add(movedFile.relativeNew())) {
+                throw new Refusal(
+                        "package_collision",
+                        "Multiple moved package sources resolve to the same target file: " + movedFile.relativeNew());
+            }
+        }
+    }
+
     private MovedFile planMovedFile(Path file, String source, String declared, String newDeclared) throws IOException {
         String relativeOld = PlannerSupport.relative(projectRoot, file);
         // non_editable_target: a moved file under a generated source root (authoritative build-model signal) or matching

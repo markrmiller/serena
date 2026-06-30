@@ -16,6 +16,7 @@ from serena.java_refactor_v3.class_refactor_client import ClassRefactorClient
 from serena.java_refactor_v3.conversions_client import ConversionsClient
 from serena.java_refactor_v3.framework_spi_client import FrameworkSpiClient
 from serena.java_refactor_v3.graph_client import GraphClient, GraphRefused, parse_project_graph
+from serena.java_refactor_v3.impact_report import ImpactReportBuilder
 from serena.java_refactor_v3.inline_refactor_client import InlineRefactorClient
 from serena.java_refactor_v3.models import (
     V3_REFUSAL_REGISTRY,
@@ -29,8 +30,11 @@ from serena.java_refactor_v3.models import (
     register_refusal_code,
 )
 from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
+from serena.java_refactor_v3.recipe_models import MigrationOpportunity, RecipeDocument, RecipeOperation, RecipeResult
+from serena.java_refactor_v3.resource_preview import ResourcePreviewClient
 from serena.java_refactor_v3.resource_spi_client import ResourceSpiClient
 from serena.java_refactor_v3.transformation_client import TransformationClient
+from serena.java_refactor_v3.transformation_models import V3OperationPlan
 from serena.java_refactor_v3.workspace import (
     SessionDriver,
     TransformationSessionRef,
@@ -39,29 +43,56 @@ from serena.java_refactor_v3.workspace import (
     V3OperationPlan,
 )
 
-__all__ = [
-    "V3_REFUSAL_REGISTRY",
-    "ClassRefactorClient",
-    "ConversionsClient",
-    "FileChangeKind",
-    "FileEditStat",
-    "FrameworkSpiClient",
-    "GraphClient",
-    "GraphRefused",
-    "ImpactReport",
-    "InlineRefactorClient",
-    "RecipeEngineClient",
-    "ResourceSpiClient",
-    "RiskLevel",
-    "SessionDriver",
-    "TransformationClient",
-    "TransformationRefusal",
-    "TransformationSessionRef",
-    "TransformationWorkspace",
-    "TransformationWorkspaceManager",
-    "V3OperationPlan",
-    "WorkspaceStats",
-    "WorkspaceStatus",
-    "parse_project_graph",
-    "register_refusal_code",
-]
+
+# Planned V3 facade modules/classes.  These explicit re-exports keep the public
+# API and static analyzers aligned with the V3 plan while the implementation can
+# continue to delegate to consolidated internal clients.
+from . import impact_report as impact_report
+from . import recipe_models as recipe_models
+from . import resource_preview as resource_preview
+from . import transformation_models as transformation_models
+from .impact_report import ImpactReportBuilder
+from .recipe_models import (
+    MigrationOpportunity,
+    RecipeDocument,
+    RecipeOperation,
+    RecipeResult,
+)
+from .resource_preview import ResourcePreviewClient
+
+__all__ = (
+    'V3_REFUSAL_REGISTRY',
+    'ClassRefactorClient',
+    'ConversionsClient',
+    'FileChangeKind',
+    'FileEditStat',
+    'FrameworkSpiClient',
+    'GraphClient',
+    'GraphRefused',
+    'ImpactReport',
+    'ImpactReportBuilder',
+    'InlineRefactorClient',
+    'MigrationOpportunity',
+    'RecipeEngineClient',
+    'RecipeDocument',
+    'RecipeOperation',
+    'RecipeResult',
+    'ResourcePreviewClient',
+    'ResourceSpiClient',
+    'RiskLevel',
+    'SessionDriver',
+    'TransformationClient',
+    'V3OperationPlan',
+    'TransformationRefusal',
+    'TransformationSessionRef',
+    'TransformationWorkspace',
+    'TransformationWorkspaceManager',
+    'WorkspaceStats',
+    'WorkspaceStatus',
+    'parse_project_graph',
+    'register_refusal_code',
+    'impact_report',
+    'recipe_models',
+    'resource_preview',
+    'transformation_models',
+)

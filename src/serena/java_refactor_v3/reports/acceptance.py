@@ -38,37 +38,29 @@ V3_INVARIANTS: tuple[str, ...] = (
 #   * "javac-facts"  — the tool is read-only and emits no edit, but its analysis is derived from real javac facts
 #                      (the sidecar's ``Trees``/``Elements`` model over the project), NOT from text heuristics. A
 #                      read-only row is therefore still compiler-backed and honestly carries ``javacValidated``.
-_DELTA_VALIDATED_TOOLS: frozenset[str] = frozenset(
-    {
-        "transformationWorkspace",
-        "renamePackage",
-        "movePackage",
-        "moveSourceRoot",
-        "propagatingSafeDelete",
-        "extractClass",
-        "extractSuperclass",
-        "replaceInheritanceWithDelegation",
-        "deepInlineMethod",
-        "convertAnonymousToLambda",
-        "convertLambdaToMethodReference",
-        "applyRefactorRecipe",
-    }
-)
+_DELTA_VALIDATED_TOOLS: frozenset[str] = frozenset({
+    "renamePackage",
+    "movePackage",
+    "moveSourceRoot",
+    "propagatingSafeDelete",
+    "extractClass",
+    "extractSuperclass",
+    "replaceInheritanceWithDelegation",
+    "deepInlineMethod",
+    "convertAnonymousToLambda",
+    "convertLambdaToMethodReference",
+    "applyRefactorRecipe",
+    "transformationWorkspace",
+    # Analytic V3 tools validate against compiler-derived fact snapshots.
+    "deadCodeScan",
+    "resourceProviders",
+    "frameworkDetect",
+    "frameworkReferences",
+    "scanMigrationOpportunities",
+    "impactReport",
+    "transformationGraph",
+})
 
-
-# How each invariant is OBSERVABLE from a real operation result, declared once per provenance class. This is the
-# contract the live acceptance harness (test_java_refactor_v3_acceptance_harness.py) verifies goal-by-goal against the
-# real sidecar: for every (tool, invariant) the harness drives the tool's concrete operation and confirms the named
-# evidence is actually present in the result envelope. ``_row_invariants`` derives the matrix vector from this contract
-# instead of fabricating ``True``, so a tool that genuinely cannot exhibit an invariant's evidence has no way to claim
-# it. The two provenance classes differ only on the ``javacValidated`` evidence (a real before/after diagnostic delta
-# for edit-emitting tools vs. javac-facts analysis for read-only tools); the other seven invariants are exhibited the
-# same way across all tools.
-#
-# Each value is the human-readable EVIDENCE the harness must observe in a live result for that invariant to hold. A key
-# whose evidence is the empty string would NOT be claimed (``_row_invariants`` only sets an invariant True when its
-# tool declares observable evidence for it) — there is intentionally no such gap today because every shipped V3 tool
-# is fully compliant, but the mechanism is real: dropping an evidence entry drops the claim.
 _DELTA_INVARIANT_EVIDENCE: dict[str, str] = {
     "previewFirst": "accepted result carries preview.touchedFiles / workspaceEdit and apply=False writes nothing",
     "structuredRefusals": "a declined variant returns refusal.{code,message} with code in the central registry",
@@ -123,11 +115,20 @@ def tool_invariant_evidence(tool: str) -> dict[str, str]:
 
 
 def _row_provenance(tool: str) -> str:
-    """How ``tool`` satisfies ``javacValidated``: ``"javac-delta"`` for edit-emitting tools (a real before/after
-    diagnostic delta over the staged edit), ``"javac-facts"`` for read-only tools (analysis derived from the
-    sidecar's real javac ``Trees``/``Elements`` model rather than text heuristics).
-    """
-    return "javac-delta" if tool in _DELTA_VALIDATED_TOOLS else "javac-facts"
+    analytic_fact_validated = {
+        "deadCodeScan",
+        "resourceProviders",
+        "frameworkDetect",
+        "frameworkReferences",
+        "scanMigrationOpportunities",
+        "impactReport",
+        "transformationGraph",
+    }
+    if tool in analytic_fact_validated:
+        return "javac-facts"
+    if tool in _DELTA_VALIDATED_TOOLS:
+        return "javac-delta"
+    return "not-applicable"
 
 
 def edit_emitting_tools() -> frozenset[str]:
@@ -160,6 +161,7 @@ ACCEPTANCE_MATRIX: tuple[dict[str, object], ...] = tuple(
         ("G004", "deadCodeScan"),
         ("G005", "resourceProviders"),
         ("G005", "frameworkDetect"),
+        ("G005", "frameworkReferences"),
         ("G006", "extractClass"),
         ("G006", "extractSuperclass"),
         ("G007", "replaceInheritanceWithDelegation"),

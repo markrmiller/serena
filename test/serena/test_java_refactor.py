@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -711,7 +712,7 @@ def test_v3_scan_bridges_refuse_when_disabled(tmp_path: Path) -> None:
         assert result["accepted"] is False, operation
         assert result["operation"] == operation, operation
         assert result["mode"] == "scan", operation
-        assert result["refusal"]["code"] == "java_refactor_disabled", operation
+        assert result["refusal"]["code"] == "java_refactor_v3_disabled", operation
 
 
 def test_v3_workspace_lifecycle_bridges_refuse_when_disabled(tmp_path: Path) -> None:
@@ -832,7 +833,7 @@ def test_impact_report_consumes_workspace_created_via_exposed_surface(tmp_path: 
     tool = _RealManagerTool(manager)
 
     # 1. Create the workspace via the exposed tool — its id is returned, not hard-coded.
-    created = JavaCreateTransformationWorkspaceTool.apply(tool)
+    created = cast(Any, JavaCreateTransformationWorkspaceTool.apply)(tool)
     assert created["accepted"] is True, created
     assert created["operation"] == "transformationWorkspace" and created["mode"] == "create"
     workspace_id = created["workspaceId"]
@@ -840,7 +841,7 @@ def test_impact_report_consumes_workspace_created_via_exposed_surface(tmp_path: 
 
     # 2. Enroll a member via the exposed tool so the workspace composes a real edit.
     driver.program(_text_envelope(tmp_path, "s1", service, 53, 54, "9"))
-    added = JavaAddWorkspaceSessionTool.apply(tool, workspace_id=workspace_id, operation="renameMember")
+    added = cast(Any, JavaAddWorkspaceSessionTool.apply)(tool, workspace_id=workspace_id, operation="renameMember")
     assert added["accepted"] is True, added
 
     # 3. Stub ONLY the sidecar facts boundary; the bridge composes the real workspace and builds a real report.
@@ -857,7 +858,7 @@ def test_impact_report_consumes_workspace_created_via_exposed_surface(tmp_path: 
     monkeypatch.setattr(impact_facts_client.ImpactFactsClient, "facts", lambda self, paths: facts)
 
     # 4. Feed the SAME id from step 1 to the exposed impact-report tool — accepted, not an unknown-workspace refusal.
-    report = JavaImpactReportTool.apply(tool, workspace_id=workspace_id)
+    report = cast(Any, JavaImpactReportTool.apply)(tool, workspace_id=workspace_id)
     assert report["accepted"] is True, report
     assert report["workspaceId"] == workspace_id
     assert report["mode"] == "impact_report"
@@ -878,7 +879,7 @@ def test_impact_report_refuses_workspace_id_that_was_never_created(tmp_path: Pat
     monkeypatch.setattr(manager, "_get_or_start_client", lambda refresh=False: object())
     manager._transformation_workspaces = TransformationWorkspaceManager(StubDriver(tmp_path))
 
-    result = JavaImpactReportTool.apply(_RealManagerTool(manager), workspace_id="never-created")
+    result = cast(Any, JavaImpactReportTool.apply)(_RealManagerTool(manager), workspace_id="never-created")
     assert result["accepted"] is False, result
     assert result["workspaceId"] == "never-created"
 
@@ -3001,7 +3002,7 @@ def test_java_change_signature_tool_builds_v2_session_params(monkeypatch) -> Non
         recorded["validate"] = validate
         return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
     tool.apply(
         name_path="Demo/method",
@@ -3044,7 +3045,7 @@ def test_java_introduce_parameter_tool_builds_v2_session_params(monkeypatch) -> 
         recorded["validate"] = validate
         return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
     tool.apply(
         name_path="Demo/method",
@@ -3087,7 +3088,7 @@ def test_java_explicit_session_tools_call_manager(monkeypatch) -> None:
         recorded["create"] = (operation, params, validate)
         return {"accepted": True}
 
-    create_tool.create_java_refactor_client().create_v2_refactor_session = create_v2_refactor_session
+    cast(Any, create_tool.create_java_refactor_client()).create_v2_refactor_session = create_v2_refactor_session
     create_tool.apply(operation="changeSignature", params_json='{"relativePath":"src/Demo.java"}', validate=False)
     assert recorded["create"] == ("changeSignature", {"relativePath": "src/Demo.java"}, False)
 
@@ -3176,7 +3177,7 @@ def _hb1_make_tool(tool_name, monkeypatch):
             "preview": {"workspaceEdit": {"changes": []}},
         }
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
     return tool, calls
 
 
@@ -3312,7 +3313,7 @@ def test_java_inline_method_tool_defaults_to_preserving_declaration(monkeypatch)
         recorded["validate"] = validate
         return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
     tool.apply(name_path="Demo/helper", relative_path="src/Demo.java", method_name="helper", preview=True, validate=False)
 
@@ -3335,7 +3336,7 @@ def test_java_extract_method_tool_builds_selection_session_params(monkeypatch) -
         recorded["apply"] = apply
         return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
     tool.apply(
         relative_path="src/Demo.java",
@@ -3409,7 +3410,7 @@ def test_java_move_and_hierarchy_tools_build_v2_session_params(monkeypatch) -> N
             _recorded["validate"] = validate
             return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-        tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+        cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
         tool.apply(
             name_path="Demo/member",
@@ -3491,7 +3492,7 @@ def test_java_interface_field_tools_build_v2_session_params(monkeypatch) -> None
             _recorded["validate"] = validate
             return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-        tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+        cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
 
         tool.apply(
             name_path="Demo/member",
@@ -3605,7 +3606,7 @@ def _load_hatch_build_module(monkeypatch):
             "hatchling.builders.hooks.plugin": types.ModuleType("hatchling.builders.hooks.plugin"),
             "hatchling.builders.hooks.plugin.interface": types.ModuleType("hatchling.builders.hooks.plugin.interface"),
         }
-        modules["hatchling.builders.hooks.plugin.interface"].BuildHookInterface = type("BuildHookInterface", (), {})
+        cast(Any, modules["hatchling.builders.hooks.plugin.interface"]).BuildHookInterface = type("BuildHookInterface", (), {})
         for name, module in modules.items():
             monkeypatch.setitem(sys.modules, name, module)
     repo_root = Path(__file__).resolve().parents[2]
@@ -3689,6 +3690,8 @@ def test_bundled_resource_jar_matches_fresh_build(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     wrapper = repo_root / "java-refactor" / ("gradlew.bat" if os.name == "nt" else "gradlew")
     wrapper_available = wrapper.exists() and (os.name == "nt" or os.access(wrapper, os.X_OK))
+    build_command: list[str] = []
+    build_cwd = repo_root
     if wrapper_available:
         build_command = [str(wrapper), "jar"]
         build_cwd = repo_root / "java-refactor"
@@ -4291,7 +4294,7 @@ def test_surrogate_splitting_edit_is_structured_refusal_on_preview_and_apply(tmp
 
     manager = _apply_manager_with_workspace_edit(tmp_path, workspace_edit)
     fake_client = manager._client
-    fake_client.preview = lambda operation, params: {"accepted": True, "workspaceEdit": workspace_edit}
+    cast(Any, fake_client).preview = lambda operation, params: {"accepted": True, "workspaceEdit": workspace_edit}
 
     preview_result = manager.semantic_rename("Main.java", 1, 1, "Renamed", apply=False, validate=False)
     assert preview_result["accepted"] is False
@@ -4802,7 +4805,7 @@ def _make_v2_tool_with_recorder(tool_cls, monkeypatch):
         recorded["params"] = params
         return {"accepted": False, "refusal": {"code": "unsupported_operation", "message": "stub"}}
 
-    tool.create_java_refactor_client().v2_refactor_session = v2_refactor_session
+    cast(Any, tool.create_java_refactor_client()).v2_refactor_session = v2_refactor_session
     return tool, recorded
 
 

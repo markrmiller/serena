@@ -1062,6 +1062,25 @@ class JavaFrameworkDetectTool(_JavaRefactorToolBase):
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 
 
+class JavaFrameworkReferencesTool(_JavaRefactorToolBase):
+    """Finds framework-significant references to a Java type using framework SPI facts (V3 ``frameworkReferences``, READ-ONLY)."""
+
+    def apply(self, target: str, max_answer_chars: int = -1) -> str:
+        """
+        Find framework-significant references to ``target``. READ-ONLY.
+
+        Parameters
+        ----------
+        target:
+            Fully-qualified Java class name to resolve through framework reference providers.
+        max_answer_chars:
+            Maximum length of the returned JSON string after standard tool finalization/validation
+            (``-1`` uses the configured default).
+        """
+        result = self._get_manager().framework_find_references(target)
+        return self._limit_length(self._finalize_result(result), max_answer_chars)
+
+
 class JavaCreateTransformationWorkspaceTool(_JavaRefactorToolBase):
     """Opens a new V3 transformation workspace that groups multiple operations under one revision-guarded unit (V3 ``transformationWorkspace``)."""
 
@@ -1254,10 +1273,6 @@ class JavaListTransformationWorkspacesTool(_JavaRefactorToolBase):
 # The complete set of V3 transformation-engine Java refactoring tools. Tool visibility is gated on the active project's
 # ``java_refactor.enabled`` flag and the sidecar capability registry, exactly like the V2 operation tools.
 #
-# ``JavaPropagateSafeDeleteTool`` / ``JavaFindDeadCodeTool`` are Python-planned (not sidecar operations): the safe-delete
-# edit is computed in Python and routed through the manager's generic javac validation bridge, and the dead-code scan is
-# read-only. They are therefore NOT in JAVA_REFACTOR_V3_CAPABILITY_TOOLS below — they need no sidecar capability/Main.java
-# wiring — but they ARE first-class V3 tools, gated only on ``java_refactor.enabled``.
 JAVA_REFACTOR_V3_TOOL_CLASSES = (
     JavaRenamePackageTool,
     JavaMovePackageTool,
@@ -1277,6 +1292,7 @@ JAVA_REFACTOR_V3_TOOL_CLASSES = (
     JavaResourceReferencesTool,
     JavaPlanResourceEditsTool,
     JavaFrameworkDetectTool,
+    JavaFrameworkReferencesTool,
     JavaCreateTransformationWorkspaceTool,
     JavaAddWorkspaceSessionTool,
     JavaAddWorkspaceOperationTool,
@@ -1287,12 +1303,36 @@ JAVA_REFACTOR_V3_TOOL_CLASSES = (
 )
 
 
-# V3 operation tools whose registration is negotiated against the sidecar capability registry: each is enabled only
-# when the sidecar advertises its operation with status "supported".
+# V3 operation tools whose registration/status is negotiated against the sidecar capability registry.  The registry is
+# intentionally complete: edit-emitting tools, read-only analytic tools, framework/resource SPI tools, and workspace
+# lifecycle tools all carry a V3 capability operation so registration, status reporting, and dispatch refusals agree.
 JAVA_REFACTOR_V3_CAPABILITY_TOOLS: dict[type, str] = {
     JavaRenamePackageTool: "renamePackage",
     JavaMovePackageTool: "movePackage",
     JavaMoveSourceRootTool: "moveSourceRoot",
+    JavaPropagateSafeDeleteTool: "deletion.propagateSafeDelete",
+    JavaFindDeadCodeTool: "deletion.findDeadCode",
+    JavaExtractClassTool: "classRefactor.extractClass",
+    JavaExtractSuperclassTool: "classRefactor.extractSuperclass",
+    JavaReplaceInheritanceWithDelegationTool: "classRefactor.replaceInheritanceWithDelegation",
+    JavaConvertAnonymousToLambdaTool: "conversions.anonymousToLambda",
+    JavaConvertLambdaToMethodReferenceTool: "conversions.lambdaToMethodReference",
+    JavaDeepInlineMethodTool: "inlineRefactor.deepInlineMethod",
+    JavaScanMigrationOpportunitiesTool: "recipes.scanMigrationOpportunities",
+    JavaApplyRefactorRecipeTool: "recipes.applyRecipe",
+    JavaImpactReportTool: "impact.facts",
+    JavaPlanResourceEditsTool: "resources.planEdits",
+    JavaResourceReferencesTool: "resources.findReferences",
+    JavaFrameworkDetectTool: "frameworks.detect",
+    JavaFrameworkReferencesTool: "frameworks.findReferences",
+    JavaCreateTransformationWorkspaceTool: "transformation.createWorkspace",
+    JavaAddWorkspaceSessionTool: "transformation.addSession",
+    JavaAddWorkspaceOperationTool: "transformation.addOperation",
+    JavaPreviewTransformationWorkspaceTool: "transformation.preview",
+    JavaApplyTransformationWorkspaceTool: "transformation.apply",
+    JavaCancelTransformationWorkspaceTool: "transformation.cancel",
+    JavaListTransformationWorkspacesTool: "transformation.list",
+    JavaTransformationGraphTool: "graph.build",
 }
 
 
@@ -1324,6 +1364,7 @@ V3_MATRIX_TOOL_BINDINGS: dict[str, tuple[type, ...]] = {
     "deadCodeScan": (JavaFindDeadCodeTool,),
     "resourceProviders": (JavaResourceReferencesTool, JavaPlanResourceEditsTool),
     "frameworkDetect": (JavaFrameworkDetectTool,),
+    "frameworkReferences": (JavaFrameworkReferencesTool,),
     "extractClass": (JavaExtractClassTool,),
     "extractSuperclass": (JavaExtractSuperclassTool,),
     "replaceInheritanceWithDelegation": (JavaReplaceInheritanceWithDelegationTool,),
@@ -1337,12 +1378,10 @@ V3_MATRIX_TOOL_BINDINGS: dict[str, tuple[type, ...]] = {
 
 
 def java_refactor_v3_non_capability_tool_names() -> list[str]:
-    """Names of V3 tools that are NOT negotiated against the sidecar capability registry.
+    """Names of V3 tools that are NOT negotiated against the V3 capability registry.
 
-    These are the Python-planned transformations (their edit is computed in Python and validated through the manager's
-    generic javac bridge) and read-only scans: they are not sidecar operations, so they carry no capability entry and are
-    available whenever ``java_refactor.enabled`` is set, exactly like the V1 always-on tools. Derived generically by
-    subtracting the capability map from the full V3 tool set, so a new Python-planned tool needs no extra wiring here.
+    The V3 acceptance contract requires every public V3 capability/tool to participate in the same capability/status
+    path.  This function remains for backward-compatible callers and should normally return an empty list.
     """
     capability_classes = set(JAVA_REFACTOR_V3_CAPABILITY_TOOLS)
     return [cls.get_name_from_cls() for cls in JAVA_REFACTOR_V3_TOOL_CLASSES if cls not in capability_classes]
@@ -1365,6 +1404,7 @@ __all__ = [
     "JavaExtractSuperclassTool",
     "JavaFindDeadCodeTool",
     "JavaFrameworkDetectTool",
+    "JavaFrameworkReferencesTool",
     "JavaImpactReportTool",
     "JavaListTransformationWorkspacesTool",
     "JavaMovePackageTool",

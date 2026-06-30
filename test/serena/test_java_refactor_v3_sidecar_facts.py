@@ -15,7 +15,10 @@ proving the façade is a drop-in for the retired in-Python project graph.
 
 from __future__ import annotations
 
+from typing import cast
+
 from serena.java_refactor.workspace_edit import RefactorFileOperation, RefactorTextEdit, RefactorWorkspaceEdit
+from serena.java_refactor_v3.graph.models import ProjectGraph
 from serena.java_refactor_v3.reports import ImpactReportBuilder
 from serena.java_refactor_v3.reports.sidecar_facts import SidecarFactsGraph, facts_to_graph_input
 
@@ -171,9 +174,9 @@ def test_facts_to_graph_input_collects_touched_tests() -> None:
 
 def test_report_over_sidecar_facts_has_all_five_sections() -> None:
     graph = SidecarFactsGraph(facts_to_graph_input(_raw_facts()))
-    report = ImpactReportBuilder("/proj", graph).build(_edit(), operation="renameMember").to_dict()
+    report = ImpactReportBuilder("/proj", cast(ProjectGraph, graph)).build(_edit(), operation="renameMember").to_dict()
 
-    assert set(report) == {"java", "resources", "api", "tests", "risk"}
+    assert set(report) == {"summary", "semanticImpact", "resourceImpact", "tests", "warnings"}
     java_paths = {f["path"] for f in report["java"]["files"]}
     assert java_paths == {"src/main/java/com/acme/Svc.java", "src/main/java/com/acme/Helper.java"}
 
@@ -183,7 +186,7 @@ def test_api_boundary_uses_javac_public_api_gate() -> None:
     # must be excluded entirely, even though it is a touched main-source type (the legacy approximation would
     # have listed it). This is the fact-4 javac-visibility behaviour change.
     graph = SidecarFactsGraph(facts_to_graph_input(_raw_facts()))
-    api = ImpactReportBuilder("/proj", graph).build(_edit(), operation="renameMember").to_dict()["api"]
+    api = ImpactReportBuilder("/proj", cast(ProjectGraph, graph)).build(_edit(), operation="renameMember").to_dict()["api"]
 
     assert api["boundaryCrossed"] is True
     surfaced = {t["type"] for t in api["mainTypesTouched"]}
@@ -193,7 +196,7 @@ def test_api_boundary_uses_javac_public_api_gate() -> None:
 
 def test_tests_section_reports_collapsed_test_referrers() -> None:
     graph = SidecarFactsGraph(facts_to_graph_input(_raw_facts()))
-    tests = ImpactReportBuilder("/proj", graph).build(_edit(), operation="renameMember").to_dict()["tests"]
+    tests = ImpactReportBuilder("/proj", cast(ProjectGraph, graph)).build(_edit(), operation="renameMember").to_dict()["tests"]
 
     # the two member-level refs from SvcTest collapse to a single impacted test; Caller (main source) is not a test.
     assert tests["impacted"] == ["com.acme.SvcTest"]
@@ -202,7 +205,7 @@ def test_tests_section_reports_collapsed_test_referrers() -> None:
 
 def test_resources_section_reports_wired_provider() -> None:
     graph = SidecarFactsGraph(facts_to_graph_input(_raw_facts()))
-    resources = ImpactReportBuilder("/proj", graph).build(_edit(), operation="renameMember").to_dict()["resources"]
+    resources = ImpactReportBuilder("/proj", cast(ProjectGraph, graph)).build(_edit(), operation="renameMember").to_dict()["resources"]
 
     assert resources["wiredTypeReferences"] == [
         {"type": "com.acme.Svc", "resources": ["src/main/resources/META-INF/services/com.acme.Svc"]}

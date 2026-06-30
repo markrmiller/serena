@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Any, cast
 
 from serena.java_refactor.workspace_edit import RefactorFileOperation, RefactorTextEdit, RefactorWorkspaceEdit
 from serena.java_refactor_v3.models import RiskLevel
@@ -75,7 +76,7 @@ def _graph_from(raw: dict) -> SidecarFactsGraph:
 
 
 def _builder(raw: dict | None = None) -> ImpactReportBuilder:
-    return ImpactReportBuilder("/proj", _graph_from(raw if raw is not None else _service_facts()))
+    return ImpactReportBuilder("/proj", cast(Any, _graph_from(raw if raw is not None else _service_facts())))
 
 
 # -- impact report: java section -------------------------------------------------------------------
@@ -190,7 +191,7 @@ def test_impact_report_accepts_plain_risk_string() -> None:
 
 def test_acceptance_matrix_covers_every_goal_and_invariant() -> None:
     matrix = acceptance_matrix()
-    goals = {row["goal"] for row in matrix}
+    goals = {cast(str, row["goal"]) for row in matrix}
     # G002 (the transformation graph) is a real shipped row bound to an exposed graph tool — every goal in the
     # full G001..G011 range maps to at least one real tool, with NO gap.
     expected = {f"G{n:03d}" for n in range(1, 12)}
@@ -199,8 +200,8 @@ def test_acceptance_matrix_covers_every_goal_and_invariant() -> None:
     # every tool carries the full invariant vector and satisfies ALL eight invariants — there is no per-row
     # exception that blesses a missing guarantee.
     for row in matrix:
-        assert set(row["invariants"]) == set(V3_INVARIANTS)
-        assert all(row["invariants"].values()), f"{row['tool']} fails an invariant: {row['invariants']}"
+        assert set(cast(dict[str, bool], row["invariants"])) == set(V3_INVARIANTS)
+        assert all(cast(dict[str, bool], row["invariants"]).values()), f"{row['tool']} fails an invariant: {row['invariants']}"
 
 
 def test_acceptance_matrix_javac_validated_is_universal_with_honest_provenance() -> None:
@@ -209,7 +210,7 @@ def test_acceptance_matrix_javac_validated_is_universal_with_honest_provenance()
     # distinction is PROVENANCE — how the row is compiler-backed — never whether the invariant holds.
     matrix = acceptance_matrix()
     assert "javacValidated" in V3_INVARIANTS
-    assert all(row["invariants"]["javacValidated"] for row in matrix)
+    assert all(cast(dict[str, object], row["invariants"])["javacValidated"] for row in matrix)
 
     provenance = {row["tool"]: row["provenance"] for row in matrix}
     # edit-emitting tools validate via a real before/after javac diagnostic delta.
@@ -235,16 +236,19 @@ def test_acceptance_matrix_javac_validated_is_universal_with_honest_provenance()
         "deadCodeScan",
         "resourceProviders",
         "frameworkDetect",
+        "frameworkReferences",
         "scanMigrationOpportunities",
         "impactReport",
+        "transformationGraph",
     }
     # provenance is one of the two honest, compiler-backed kinds — never an "unvalidated" marker.
     assert set(provenance.values()) == {"javac-delta", "javac-facts"}
 
 
 def test_acceptance_matrix_is_defensively_copied() -> None:
-    acceptance_matrix()[0]["invariants"]["previewFirst"] = False
-    assert ACCEPTANCE_MATRIX[0]["invariants"]["previewFirst"] is True  # type: ignore[index]
+    cast(dict[str, object], acceptance_matrix()[0]["invariants"])["previewFirst"] = False
+    first_invariants = cast(dict[str, object], ACCEPTANCE_MATRIX[0]["invariants"])
+    assert first_invariants["previewFirst"] is True
 
 
 # -- refusal-code registry -------------------------------------------------------------------------
@@ -307,7 +311,7 @@ def test_impact_report_scales_to_a_large_synthetic_repo() -> None:
         "incomingRefs": [],
         "resourceRefs": [],
     }
-    builder = ImpactReportBuilder("/proj", _graph_from(raw))
+    builder = ImpactReportBuilder("/proj", cast(Any, _graph_from(raw)))
     edit = RefactorWorkspaceEdit(
         text_edits=[
             RefactorTextEdit(

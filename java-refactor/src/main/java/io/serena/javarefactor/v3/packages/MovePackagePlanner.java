@@ -2,6 +2,8 @@ package io.serena.javarefactor.v3.packages;
 
 import io.serena.javarefactor.edits.PlannerSupport;
 import io.serena.javarefactor.edits.ResponseBuilder;
+import io.serena.javarefactor.v3.frameworks.FrameworkParticipationCoordinator;
+import io.serena.javarefactor.v3.frameworks.SymbolChange;
 import io.serena.javarefactor.edits.ResponseBuilder.FileOperation;
 import io.serena.javarefactor.project.GeneratedSourcePolicy;
 import io.serena.javarefactor.project.JavaProjectModel;
@@ -9,6 +11,7 @@ import io.serena.javarefactor.project.SourceSet;
 import io.serena.javarefactor.shared.SourceText;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -53,6 +56,8 @@ public final class MovePackagePlanner {
     private final Path projectRoot;
     private final JavaProjectModel model;
     private final PackageRewritePolicy policy;
+    /** Framework SPI participant (refactor-feature-plan-V3.md §16): contributes resource-edit descriptions + warnings. */
+    private final FrameworkParticipationCoordinator frameworkParticipation = new FrameworkParticipationCoordinator();
 
     public MovePackagePlanner(Path projectRoot, JavaProjectModel model) {
         this(projectRoot, model, PackageRewritePolicy.defaults());
@@ -94,7 +99,7 @@ public final class MovePackagePlanner {
             // resourceScanIncomplete boolean so CanonicalEnvelope.classifyRisk escalates the op to needs_review and the
             // Python apply gate blocks SAFE auto-apply. Additive splice (mirroring CanonicalEnvelope.augment): a complete
             // scan leaves the result byte-identical to the prior shape.
-            return spliceRiskFields(json, planned.resourceScanIncomplete());
+            return spliceRiskFields(json, planned.resourceScanIncomplete(), planned.frameworkBoundaryChanges());
         } catch (Refusal refusal) {
             return PlannerSupport.refusalJson("movePackage", apply, refusal.code, refusal.getMessage());
         } catch (IOException error) {
@@ -108,7 +113,7 @@ public final class MovePackagePlanner {
      * so it folds an equivalent review escalation into step warnings instead.
      */
     private record Planned(io.serena.javarefactor.v3.transformation.TransformationStep step,
-            boolean resourceScanIncomplete) {
+            boolean resourceScanIncomplete, List<String> frameworkBoundaryChanges) {
     }
 
     /**
@@ -116,15 +121,24 @@ public final class MovePackagePlanner {
      * before its closing brace (B2; the same additive technique {@code CanonicalEnvelope.augment} uses). Returns the JSON
      * unchanged when the scan was complete.
      */
-    private static String spliceRiskFields(String json, boolean resourceScanIncomplete) {
-        if (!resourceScanIncomplete) {
+    private static String spliceRiskFields(String json, boolean resourceScanIncomplete,
+            List<String> frameworkBoundaryChanges) {
+        if (!resourceScanIncomplete && frameworkBoundaryChanges.isEmpty()) {
             return json;
         }
         String trimmed = json.strip();
         if (!trimmed.endsWith("}")) {
             return json;
         }
-        return trimmed.substring(0, trimmed.length() - 1) + ",\"resourceScanIncomplete\":true}";
+        StringBuilder out = new StringBuilder(trimmed.substring(0, trimmed.length() - 1));
+        if (resourceScanIncomplete) {
+            out.append(",\"resourceScanIncomplete\":true");
+        }
+        if (!frameworkBoundaryChanges.isEmpty()) {
+            out.append(",\"riskFacts\":{\"frameworkBoundaryChanges\":")
+                    .append(PlannerSupport.warningsJson(frameworkBoundaryChanges)).append('}');
+        }
+        return out.append('}').toString();
     }
 
     /**
@@ -140,10 +154,13 @@ public final class MovePackagePlanner {
         // escalation (the pattern ExtractClassPlanner.planStep uses for its riskFact).
         Planned planned = planInternal(fields);
         io.serena.javarefactor.v3.transformation.TransformationStep step = planned.step();
-        if (planned.resourceScanIncomplete()) {
+        if (!planned.frameworkBoundaryChanges().isEmpty() || planned.resourceScanIncomplete()) {
             List<String> warnings = new ArrayList<>(step.warnings());
-            warnings.add("movePackage resource scan was incomplete; resource-side changes were withheld and this step "
+            warnings.addAll(planned.frameworkBoundaryChanges());
+            if (planned.resourceScanIncomplete()) {
+                warnings.add("movePackage resource scan was incomplete; resource-side changes were withheld and this step "
                     + "requires review (resourceScanIncomplete).");
+            }
             return new io.serena.javarefactor.v3.transformation.TransformationStep(
                     step.operation(), step.edits(), step.fileOperations(), warnings, step.semanticTargetJson());
         }
@@ -192,6 +209,8 @@ public final class MovePackagePlanner {
                         "No source file declares package '" + sourcePackage + "'"
                                 + (includeSubpackages ? " or a subpackage of it." : "."));
             }
+
+            requireNoDestinationCollision(moved);
 
             // package_collision: a destination package already contains a type whose simple name matches a moved type.
             Set<String> movedNewPackages = new LinkedHashSet<>();
@@ -312,10 +331,16 @@ public final class MovePackagePlanner {
                     + (targetSourceRoot != null ? " under the requested source root" : " under the same source root")
                     + ", and updating imports and fully-qualified references.");
             warnings.add(PlannerSupport.reflectionResourceCaveat("package '" + sourcePackage + "'"));
+            // Framework participation mirrors renamePackage: framework-owned resource edits become typed risk facts;
+            // plugin review warnings remain warnings that classify the operation as needs_review.
+            FrameworkParticipationCoordinator.Result participation = frameworkParticipation
+                    .participate(model, SymbolChange.renamePackage(sourcePackage, targetPackage));
+            List<String> frameworkBoundaryChanges = participation.frameworkBoundaryChanges();
+            warnings.addAll(participation.warnings());
             io.serena.javarefactor.v3.transformation.TransformationStep step =
                     new io.serena.javarefactor.v3.transformation.TransformationStep(
                             "movePackage", edits, fileOperations, warnings, semanticTarget);
-            return new Planned(step, resourceScanIncomplete);
+            return new Planned(step, resourceScanIncomplete, frameworkBoundaryChanges);
         }
     }
 
@@ -327,7 +352,25 @@ public final class MovePackagePlanner {
         return includeSubpackages && declared.startsWith(sourcePackage + ".");
     }
 
-    /** Builds the per-file rename op + package-declaration edit for a file moving from {@code declared} to {@code newDeclared}. */
+    /** Refuses before accepting a plan when a package move would collide with an existing or duplicate target file. */
+    private void requireNoDestinationCollision(List<MovedFile> moved) {
+        Set<String> destinations = new LinkedHashSet<>();
+        for (MovedFile movedFile : moved) {
+            Path destination = projectRoot.resolve(movedFile.relativeNew()).normalize();
+            Path source = movedFile.file().toAbsolutePath().normalize();
+            if (Files.exists(destination) && !destination.equals(source)) {
+                throw new Refusal(
+                        "package_collision",
+                        "Target file already exists for moved package source: " + movedFile.relativeNew());
+            }
+            if (!destinations.add(movedFile.relativeNew())) {
+                throw new Refusal(
+                        "package_collision",
+                        "Multiple moved package sources resolve to the same target file: " + movedFile.relativeNew());
+            }
+        }
+    }
+
     private MovedFile planMovedFile(Path file, String source, String declared, String newDeclared, Path targetSourceRoot)
             throws IOException {
         String relativeOld = PlannerSupport.relative(projectRoot, file);

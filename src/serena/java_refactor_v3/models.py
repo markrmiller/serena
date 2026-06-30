@@ -221,23 +221,198 @@ class WorkspaceStats:
         }
 
 
-@dataclass
-class ImpactReport:
-    """Agent-facing impact summary for a transformation.
+class V3ImpactReportDict(dict):
+    """V3 five-section report with non-enumerated legacy aliases.
 
-    The five sections map to the dimensions a reviewer cares about: Java sources, non-Java resources,
-    the public-API boundary, tests, and an overall risk roll-up. Two producers fill it: the composed-edit
-    projection in :func:`serena.java_refactor_v3.workspace._build_impact_report` (every section computed from
-    the touched files alone — honest zero counts, never ``not_analyzed``) and the graph-backed
-    :class:`serena.java_refactor_v3.reports.impact.ImpactReportBuilder` (cross-reference picture: wired
-    resource providers, tests referencing a changed type, API boundary crossings). Both serialize identically.
+    The public serialized shape is exactly the V3 contract.  Legacy
+    in-process callers may still look up java/resources/api/risk aliases,
+    but those aliases do not appear in keys(), iteration, items(), or JSON
+    serialization because the underlying dict contains only V3 sections.
     """
 
-    java: dict[str, Any] = field(default_factory=dict)
-    resources: dict[str, Any] = field(default_factory=dict)
-    api: dict[str, Any] = field(default_factory=dict)
-    tests: dict[str, Any] = field(default_factory=dict)
-    risk: dict[str, Any] = field(default_factory=dict)
+    _V3_KEYS = ("summary", "semanticImpact", "resourceImpact", "tests", "warnings")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {"java": self.java, "resources": self.resources, "api": self.api, "tests": self.tests, "risk": self.risk}
+    def __init__(self, sections: dict[str, Any], aliases: dict[str, Any] | None = None) -> None:
+        super().__init__({key: sections[key] for key in self._V3_KEYS})
+        self._aliases = dict(aliases or {})
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._aliases:
+            return self._aliases[key]
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._aliases:
+            return self._aliases[key]
+        return super().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._aliases or super().__contains__(key)
+
+    def legacy_aliases(self) -> dict[str, Any]:
+        """Return a copy of non-serialized compatibility aliases."""
+        return dict(self._aliases)
+
+
+class ImpactReport:
+    """Public V3 impact report adapter.
+
+    The V3 public contract serializes exactly five sections:
+    summary, semanticImpact, resourceImpact, tests, and warnings.  The
+    pre-V3 Python builder still computes legacy java/resources/api/risk
+    sections; accept those sections and expose them as non-enumerated aliases
+    for in-process compatibility.
+    """
+
+    def __init__(
+        self,
+        summary: dict[str, Any] | None = None,
+        semanticImpact: dict[str, Any] | None = None,
+        resourceImpact: dict[str, Any] | None = None,
+        tests: dict[str, Any] | None = None,
+        warnings: list[Any] | None = None,
+        *,
+        java: dict[str, Any] | None = None,
+        resources: dict[str, Any] | None = None,
+        api: dict[str, Any] | None = None,
+        risk: dict[str, Any] | RiskLevel | str | None = None,
+    ) -> None:
+        self.summary = dict(summary or {})
+        self.semanticImpact = dict(semanticImpact or {})
+        self.resourceImpact = dict(resourceImpact or {})
+        self.tests = dict(tests or {})
+        self.warnings = list(warnings or [])
+        self.java = dict(java or {})
+        self.resources = dict(resources or {})
+        self.api = dict(api or {})
+        self.risk = risk
+
+    @staticmethod
+    def _risk_value(value: dict[str, Any] | RiskLevel | str | None) -> str:
+        if isinstance(value, RiskLevel):
+            return value.value
+        if isinstance(value, dict):
+            raw = value.get("level", value.get("risk", RiskLevel.SAFE.value))
+            return raw.value if isinstance(raw, RiskLevel) else str(raw)
+        if value is None:
+            return RiskLevel.SAFE.value
+        return value.value if isinstance(value, RiskLevel) else str(value)
+
+    @staticmethod
+    def _file_entry(value: Any) -> dict[str, Any]:
+        entry: dict[str, Any]
+        if isinstance(value, dict):
+            entry = dict(value)
+        else:
+            entry = {"path": str(value)}
+        if "path" not in entry:
+            entry["path"] = entry.get("relativePath") or entry.get("newRelativePath") or entry.get("newPath") or entry.get("file")
+        if "relativePath" not in entry and entry.get("path") is not None:
+            entry["relativePath"] = entry["path"]
+        if "referencedTypes" not in entry:
+            entry["referencedTypes"] = entry.get("touchedTypes", entry.get("types", []))
+        if entry.get("sourcePath") is None:
+            source = entry.get("oldPath") or entry.get("source") or entry.get("from")
+            if source is not None:
+                entry["sourcePath"] = source
+        return entry
+
+    @classmethod
+    def _file_entries(cls, section: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
+        for key in keys:
+            value = section.get(key)
+            if isinstance(value, list):
+                return [cls._file_entry(item) for item in value]
+        return []
+
+    def to_dict(self) -> V3ImpactReportDict:
+        legacy_java = dict(self.java)
+        legacy_resources = dict(self.resources)
+        legacy_api = dict(self.api)
+        risk_value = self._risk_value(self.risk)
+        risk_dict = dict(self.risk) if isinstance(self.risk, dict) else {}
+        risk_dict.setdefault("level", risk_value)
+        risk_dict.setdefault("risk", risk_value)
+
+        java_files = self._file_entries(
+            legacy_java,
+            "files",
+            "changedFiles",
+            "filesChanged",
+            "touchedFiles",
+            "javaFiles",
+        )
+        resource_files = self._file_entries(
+            legacy_resources,
+            "files",
+            "changedFiles",
+            "resources",
+            "resourceFiles",
+            "resourcesTouched",
+        )
+        test_files = self._file_entries(self.tests, "files", "touchedTestFiles", "tests", "testFiles")
+
+        legacy_java["files"] = java_files
+        legacy_java["fileCount"] = legacy_java.get("fileCount", legacy_java.get("filesChanged", len(java_files)))
+        legacy_resources["files"] = resource_files
+        legacy_resources["fileCount"] = legacy_resources.get(
+            "fileCount", legacy_resources.get("resourcesTouched", legacy_resources.get("filesChanged", len(resource_files)))
+        )
+        legacy_api.setdefault("publicApiChanged", bool(legacy_api.get("publicApiChanges") or legacy_api.get("changed")))
+
+        summary = dict(self.summary)
+        def _count(value: object) -> int:
+            if isinstance(value, int):
+                return value
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return len(value)
+            return 0
+
+        summary.setdefault(
+            "filesChanged",
+            [
+                *list(legacy_java.get("filesChanged") or legacy_java.get("changedFiles") or ()),
+                *list(legacy_resources.get("files") or legacy_resources.get("resourceFiles") or ()),
+            ],
+        )
+        summary.setdefault("changedFileCount", _count(legacy_java.get("fileCount")) + _count(legacy_resources.get("fileCount")))
+        summary.setdefault("javaFilesChanged", legacy_java.get("fileCount", 0))
+        summary.setdefault("resourceFilesChanged", legacy_resources.get("fileCount", 0))
+        summary.setdefault("testsTouched", self.tests.get("touchedTestCount", len(test_files)))
+        summary.setdefault("risk", risk_value)
+        if risk_dict.get("operation") is not None:
+            summary.setdefault("operation", risk_dict["operation"])
+
+        semantic = dict(self.semanticImpact)
+        semantic.setdefault("java", legacy_java)
+        semantic.setdefault("api", legacy_api)
+        semantic.setdefault("risk", risk_dict)
+        semantic.setdefault("files", java_files)
+        semantic.setdefault("publicApiChanged", legacy_api.get("publicApiChanged", False))
+
+        resource = dict(self.resourceImpact)
+        resource.setdefault("resources", legacy_resources)
+        resource.setdefault("files", resource_files)
+
+        tests = dict(self.tests)
+        tests.setdefault("files", test_files)
+
+        warnings = list(self.warnings)
+        warnings.extend(str(w) for w in legacy_java.get("warnings", []) if str(w) not in warnings)
+        warnings.extend(str(w) for w in legacy_resources.get("warnings", []) if str(w) not in warnings)
+        warnings.extend(str(w) for w in risk_dict.get("warnings", []) if str(w) not in warnings)
+
+        sections = {
+            "summary": summary,
+            "semanticImpact": semantic,
+            "resourceImpact": resource,
+            "tests": tests,
+            "warnings": warnings,
+        }
+        aliases = {
+            "java": legacy_java,
+            "resources": legacy_resources,
+            "api": legacy_api,
+            "risk": risk_dict,
+        }
+        return V3ImpactReportDict(sections, aliases)

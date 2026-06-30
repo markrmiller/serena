@@ -12,6 +12,8 @@ The module-level ``_parse_member_names`` parser runs for real. We then assert th
 the manager.
 """
 
+from typing import Any, cast
+
 import inspect
 from unittest.mock import MagicMock
 
@@ -212,7 +214,7 @@ def test_extract_superclass_forwards_relative_path_and_make_abstract() -> None:
     stub = _StubTool()
     # name_path resolution is an identity guard against the language server; stub it out so the forwarding contract test
     # does not need the LSP.
-    stub._resolve_target = lambda relative_path, name_path, line, column: (1, 1, {})
+    cast(Any, stub)._resolve_target = lambda relative_path, name_path, line, column: (1, 1, {})
     args, kwargs = _invoke(
         JavaExtractSuperclassTool,
         stub,
@@ -480,10 +482,10 @@ def test_find_dead_code_max_answer_chars_bounds_the_report() -> None:
         _limit_length = Tool._limit_length
         _notify_language_server_of_disk_edits = _JavaRefactorToolBase._notify_language_server_of_disk_edits
 
-    full = JavaFindDeadCodeTool.apply(_RealLimitStub(), max_answer_chars=10**9)
+    full = JavaFindDeadCodeTool.apply(cast(Any, _RealLimitStub()), max_answer_chars=10**9)
     assert "com.acme.Dead199" in full  # generous cap: full report returned intact
 
-    bounded = JavaFindDeadCodeTool.apply(_RealLimitStub(), max_answer_chars=64)
+    bounded = JavaFindDeadCodeTool.apply(cast(Any, _RealLimitStub()), max_answer_chars=64)
     assert "com.acme.Dead199" not in bounded  # too-small cap: body dropped
     assert "too long" in bounded.lower()  # replaced with the documented guidance
 
@@ -699,3 +701,69 @@ def test_workspace_lifecycle_tools_are_registered_and_bound() -> None:
     assert V3_MATRIX_TOOL_BINDINGS["transformationWorkspace"] == lifecycle
     for cls in lifecycle:
         assert cls in JAVA_REFACTOR_V3_TOOL_CLASSES
+
+
+def test_v3_planned_public_python_facade_imports() -> None:
+    from serena.java_refactor_v3 import (
+        ImpactReportBuilder,
+        MigrationOpportunity,
+        RecipeDocument,
+        RecipeOperation,
+        RecipeResult,
+        ResourcePreviewClient,
+        V3OperationPlan,
+    )
+    from serena.java_refactor_v3 import impact_report, recipe_models, resource_preview, transformation_models
+
+    assert transformation_models.V3OperationPlan is V3OperationPlan
+    assert recipe_models.RecipeDocument is RecipeDocument
+    assert recipe_models.RecipeOperation is RecipeOperation
+    assert recipe_models.RecipeResult is RecipeResult
+    assert recipe_models.MigrationOpportunity is MigrationOpportunity
+    assert impact_report.ImpactReportBuilder is ImpactReportBuilder
+    assert resource_preview.ResourcePreviewClient is ResourcePreviewClient
+
+
+def test_impact_report_public_model_uses_v3_plan_sections() -> None:
+    from serena.java_refactor_v3.models import ImpactReport
+
+    report = ImpactReport(java={"filesChanged": ["src/A.java"]}, resources={}, api={}, tests={}, risk={"level": "INFO"})
+    payload = report.to_dict()
+
+    assert list(payload) == ["summary", "semanticImpact", "resourceImpact", "tests", "warnings"]
+    assert payload["summary"]["filesChanged"] == ["src/A.java"]
+    assert isinstance(payload["semanticImpact"], dict)
+    assert isinstance(payload["resourceImpact"], dict)
+    assert isinstance(payload["tests"], dict)
+    assert isinstance(payload["warnings"], list)
+
+
+def test_v3_analysis_invariant_envelope_for_read_only_tools() -> None:
+    from serena.java_refactor.manager import JavaRefactorManager
+
+    manager = object.__new__(JavaRefactorManager)
+    payload = manager._with_v3_analysis_invariants({"accepted": True, "warnings": ["review resources"]}, "frameworkReferences")
+
+    assert payload["previewFirst"] is True
+    assert payload["transactional"] is True
+    assert payload["projectRevision"] == "current"
+    assert payload["factGraphRevision"] == "current"
+    assert payload["javacFactsValidated"] is True
+    assert payload["validation"] == {"kind": "javacFacts", "javacFactsValidated": True}
+    assert payload["provenance"]["operation"] == "frameworkReferences"
+    assert payload["riskClassification"] == "INFO"
+    assert list(payload["impact"]) == ["summary", "semanticImpact", "resourceImpact", "tests", "warnings"]
+
+
+def test_v3_disabled_scan_refusal_carries_analysis_invariants() -> None:
+    from serena.java_refactor.manager import JavaRefactorManager
+
+    manager = object.__new__(JavaRefactorManager)
+    payload = manager._v3_scan_disabled_refusal("transformationGraph")
+
+    assert payload["accepted"] is False
+    assert payload["refusal"]["code"] == "java_refactor_v3_disabled"
+    assert payload["riskClassification"] == "REFUSED"
+    assert payload["previewFirst"] is True
+    assert payload["javacFactsValidated"] is True
+    assert payload["impact"]["warnings"] == []

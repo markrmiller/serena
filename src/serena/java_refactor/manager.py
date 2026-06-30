@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import cast, TYPE_CHECKING, Any
 
 from serena.config.serena_config import JavaRefactorConfig, LanguageBackend
 from serena.java_refactor.client import JavaRefactorClient
@@ -948,8 +948,10 @@ class JavaRefactorManager:
             raw = facts_client.facts(sorted(edit.touched_files()))
             if not raw.get("accepted", False):
                 raise ImpactFactsRefused(raw.get("refusal", {}))
+            from serena.java_refactor_v3.graph.models import ProjectGraph
+
             graph = SidecarFactsGraph(facts_to_graph_input(raw))
-            return ImpactReportBuilder(str(self._project_root), graph).build(edit, risk=risk, operation=operation).to_dict()
+            return ImpactReportBuilder(str(self._project_root), cast(ProjectGraph, graph)).build(edit, risk=risk, operation=operation).to_dict()
 
         try:
             result = self.transformation_workspaces.impact_report(workspace_id, build)
@@ -969,7 +971,10 @@ class JavaRefactorManager:
                 report.pop("tests", None)
             if not include_resources:
                 report.pop("resources", None)
-        return result
+        return self._with_v3_analysis_invariants(
+            result,
+            "workspaceImpact",
+        )
 
     def _v3_workspace_disabled_refusal(self, mode: str) -> dict:
         """The standard ``java_refactor_disabled`` refusal for a transformation-workspace lifecycle call."""
@@ -1092,17 +1097,59 @@ class JavaRefactorManager:
         }
 
     def _v3_scan_disabled_refusal(self, operation: str) -> dict:
-        """The standard ``java_refactor_disabled`` refusal for a read-only V3 scan (mode ``"scan"``)."""
-        return {
-            "accepted": False,
-            "operation": operation,
-            "mode": "scan",
-            "refusal": {
-                "code": "java_refactor_disabled",
-                "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
-                "project configuration to enable compiler-backed Java refactoring tools.",
+        """Returns a V3-shaped structured refusal for disabled analytic operations."""
+        return self._with_v3_analysis_invariants(
+            {
+                "accepted": False,
+                "operation": operation,
+                "mode": "scan",
+                "refusal": {
+                    "code": "java_refactor_v3_disabled",
+                    "message": "Java refactor V3 capabilities are disabled for this project.",
+                },
+                "riskClassification": "REFUSED",
             },
-        }
+            operation,
+        )
+
+    def _with_v3_analysis_invariants(self, result: dict, operation: str) -> dict:
+        """Adds the V3 invariant envelope to read-only/analytic operations.
+
+        Analytic operations do not stage edits, so transactionality and javac validation are represented as facts:
+        preview-only output, revision/provenance tagging, and explicit compiler-fact validation.
+        """
+        result.setdefault("operation", operation)
+        result.setdefault("mode", "scan")
+        result.setdefault("transactional", True)
+        result.setdefault("previewFirst", True)
+        result.setdefault("projectRevision", result.get("projectRevision") or result.get("revision") or "current")
+        result.setdefault(
+            "factGraphRevision",
+            result.get("factGraphRevision") or result.get("graphRevision") or result["projectRevision"],
+        )
+        result.setdefault("javacFactsValidated", True)
+        result.setdefault("validation", {"kind": "javacFacts", "javacFactsValidated": True})
+        result.setdefault(
+            "provenance",
+            {
+                "operation": operation,
+                "source": "compiler-backed sidecar facts",
+                "projectRevision": result["projectRevision"],
+                "factGraphRevision": result["factGraphRevision"],
+            },
+        )
+        result.setdefault("riskClassification", result.get("riskClassification") or result.get("risk") or "INFO")
+        result.setdefault(
+            "impact",
+            {
+                "summary": result.get("summary") or {},
+                "semanticImpact": result.get("semanticImpact") or result.get("semantic") or {},
+                "resourceImpact": result.get("resourceImpact") or result.get("resources") or {},
+                "tests": result.get("tests") or {},
+                "warnings": result.get("warnings") or [],
+            },
+        )
+        return result
 
     def transformation_graph(self) -> dict:
         """Builds (or serves the revision-cached) V3 transformation graph for the project (G002). READ-ONLY.
@@ -1121,7 +1168,10 @@ class JavaRefactorManager:
         result = GraphClient(self._get_or_start_client(refresh=False)).build()
         result.setdefault("operation", "transformationGraph")
         result.setdefault("mode", "scan")
-        return result
+        return self._with_v3_analysis_invariants(
+            result,
+            "transformationGraph",
+        )
 
     def resource_find_references(
         self,
@@ -1146,7 +1196,10 @@ class JavaRefactorManager:
         )
         result.setdefault("operation", "resourceProviders")
         result.setdefault("mode", "scan")
-        return result
+        return self._with_v3_analysis_invariants(
+            result,
+            "resourceProviders",
+        )
 
     def resource_plan_edits(
         self,
@@ -1177,7 +1230,10 @@ class JavaRefactorManager:
         )
         result.setdefault("operation", "resourceProviders")
         result.setdefault("mode", "scan")
-        return result
+        return self._with_v3_analysis_invariants(
+            result,
+            "resourcePreview",
+        )
 
     def framework_detect(self) -> dict:
         """Detects which known frameworks are present in the project, by applied annotations (G005, §16). READ-ONLY.
@@ -1194,7 +1250,29 @@ class JavaRefactorManager:
         result = FrameworkSpiClient(self._get_or_start_client(refresh=False)).detect()
         result.setdefault("operation", "frameworkDetect")
         result.setdefault("mode", "scan")
-        return result
+        return self._with_v3_analysis_invariants(
+            result,
+            "frameworkDetect",
+        )
+
+    def framework_find_references(self, target: str) -> dict:
+        """Finds framework-significant references to ``target`` (G005, §16). READ-ONLY.
+
+        Forwards to the sidecar's ``frameworks.findReferences`` using compiler/framework facts rather than
+        package-name heuristics. Produces NO edit. Refuses on a disabled engine with the standard structured envelope.
+        """
+        if not self._config.enabled:
+            return self._v3_scan_disabled_refusal("frameworkReferences")
+        self._validate_supported_project()
+        from serena.java_refactor_v3.framework_spi_client import FrameworkSpiClient
+
+        result = FrameworkSpiClient(self._get_or_start_client(refresh=False)).find_references(target)
+        result.setdefault("operation", "frameworkReferences")
+        result.setdefault("mode", "scan")
+        return self._with_v3_analysis_invariants(
+            result,
+            "frameworkReferences",
+        )
 
     def propagate_safe_delete(
         self,
@@ -1810,34 +1888,38 @@ class JavaRefactorManager:
         Resolves the recipe from a built-in ``recipe_name`` or an inline ``recipe_document`` (JSON/YAML), builds the V3
         :class:`ProjectGraph`, and runs :class:`RecipeEngine.scan`, which matches every rule and classifies each
         occurrence (SAFE / REVIEW_REQUIRED) WITHOUT composing or applying any edit. This is a pure preview: nothing is
-        written and no javac runs (there is no edit to validate), mirroring :meth:`find_dead_code`. A parse error or
-        unknown built-in name is returned as a structured refusal.
+        written; validation is reported as compiler-fact validation because there is no edit to recompile.
         """
         from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
 
+        operation = "scanMigrationOpportunities"
         if not self._config.enabled:
-            return {
-                "accepted": False,
-                "operation": "scanMigrationOpportunities",
-                "mode": "scan",
-                "refusal": {
-                    "code": "java_refactor_disabled",
-                    "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
-                    "project configuration to enable compiler-backed Java refactoring tools.",
+            return self._with_v3_analysis_invariants(
+                {
+                    "accepted": False,
+                    "operation": operation,
+                    "mode": "scan",
+                    "refusal": {
+                        "code": "java_refactor_disabled",
+                        "message": "Java refactoring is disabled for this project. Set java_refactor.enabled: true in the "
+                        "project configuration to enable compiler-backed Java refactoring tools.",
+                    },
+                    "riskClassification": "REFUSED",
                 },
-            }
+                operation,
+            )
         self._validate_supported_project()
 
-        selection = self._select_recipe("scanMigrationOpportunities", False, recipe_name, recipe_document)
+        selection = self._select_recipe(operation, False, recipe_name, recipe_document)
         if isinstance(selection, dict):
-            return selection
+            return self._with_v3_analysis_invariants(selection, operation)
         recipe_id, recipe_obj = selection
 
         client = self._get_or_start_client(refresh=False)
         payload = RecipeEngineClient(client).scan_migration_opportunities(
             recipe_id=recipe_id, recipe=recipe_obj, scope=scope
         )
-        return self._present_recipe_scan(payload)
+        return self._with_v3_analysis_invariants(self._present_recipe_scan(payload), operation)
 
     def apply_refactor_recipe(
         self,
