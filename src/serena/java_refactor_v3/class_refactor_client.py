@@ -38,6 +38,7 @@ class ClassRefactorClient:
         target_package: str | None = None,
         leave_delegate_methods: bool = True,
         update_usages: bool = False,
+        confirm_public_api_change: bool = False,
         validate: bool = True,
     ) -> dict[str, Any]:
         """Plans an extract-class (§8): pull ``members`` out of the class in ``relative_path`` into ``new_class_name``.
@@ -54,6 +55,7 @@ class ClassRefactorClient:
             "members": members,
             "leaveDelegateMethods": leave_delegate_methods,
             "updateUsages": update_usages,
+            "confirmPublicApiChange": confirm_public_api_change,
             "validate": validate,
         }
         if target_package is not None:
@@ -67,7 +69,7 @@ class ClassRefactorClient:
         members: list[str],
         *,
         target_package: str | None = None,
-        make_abstract: bool = False,
+        make_abstract: bool = True,
         validate: bool = True,
     ) -> dict[str, Any]:
         """Plans an extract-superclass (§9): hoist ``members`` common to ``classes`` into ``superclass_name``.

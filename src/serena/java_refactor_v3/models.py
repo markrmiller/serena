@@ -146,6 +146,10 @@ WORKSPACE_UNSAFE_EDIT = register_refusal_code(
 WORKSPACE_APPLY_FAILED = register_refusal_code(
     "workspace_apply_failed", "The composed workspace edit failed to commit and was rolled back; no files were changed."
 )
+WORKSPACE_REVIEW_REQUIRED = register_refusal_code(
+    "workspace_review_required",
+    "The composed workspace edit is REVIEW_REQUIRED and needs explicit approval before apply.",
+)
 
 
 @dataclass

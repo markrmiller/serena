@@ -219,30 +219,25 @@ def test_sidecar_package_operations_report_supported(sidecar_jar: Path, tmp_path
 
 
 def test_manager_negotiates_v3_package_operations(tmp_path: Path, monkeypatch) -> None:
-    # F1 (Python half): the manager's capability negotiation must let the three V3 package operations flow through so
-    # their tools can register in production, while a dedicated V3 method op that has no Python tool yet must NOT leak
-    # into the negotiated set. Driven with a fake client so this stays a pure unit test (no live sidecar / JDK).
+    # F1 (Python half): the manager's capability negotiation must let every public V3 tool operation flow through so
+    # registration, capability status, and dispatch refusal agree. Driven with a fake client so this stays a pure unit
+    # test (no live sidecar / JDK).
     from serena.config.serena_config import JavaRefactorConfig, LanguageBackend
     from serena.java_refactor.manager import _V3_CAPABILITY_OPERATIONS, JavaRefactorManager
     from solidlsp.ls_config import Language
 
     class _FakeClient:
         def capabilities(self) -> dict[str, Any]:
+            v3_capabilities = {
+                operation: ("beta" if operation in {"renamePackage", "movePackage", "moveSourceRoot"} else "experimental")
+                for operation in _V3_CAPABILITY_OPERATIONS
+            }
+            capabilities = {"changeSignature": "beta", **v3_capabilities}
             return {
-                "capabilities": {
-                    "changeSignature": "beta",
-                    "renamePackage": "beta",
-                    "movePackage": "beta",
-                    "moveSourceRoot": "beta",
-                    # a dedicated V3 method op with NO corresponding Python tool — must be filtered out of negotiation.
-                    "deletion.propagateSafeDelete": "experimental",
-                },
+                "capabilities": capabilities,
                 "capabilityDetails": {
-                    "changeSignature": {"level": "beta", "status": "supported"},
-                    "renamePackage": {"level": "beta", "status": "supported"},
-                    "movePackage": {"level": "beta", "status": "supported"},
-                    "moveSourceRoot": {"level": "beta", "status": "supported"},
-                    "deletion.propagateSafeDelete": {"level": "experimental", "status": "preview"},
+                    operation: {"level": level, "status": "supported"}
+                    for operation, level in capabilities.items()
                 },
             }
 
@@ -258,8 +253,6 @@ def test_manager_negotiates_v3_package_operations(tmp_path: Path, monkeypatch) -
     supported = manager.supported_v2_operations()
 
     assert supported is not None
-    # All three V3 package ops now negotiate through (defect: they were filtered out and could never register).
+    # Every public V3 capability operation now negotiates through (defect: only package ops were represented).
     assert supported >= _V3_CAPABILITY_OPERATIONS, supported
     assert "changeSignature" in supported
-    # A dedicated V3 method op without a Python tool must not be advertised through the V2/V3 tool negotiation.
-    assert "deletion.propagateSafeDelete" not in supported

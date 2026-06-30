@@ -1,3 +1,4 @@
+from serena.tools.java_refactor_v3_tools import JavaPropagateSafeDeleteTool
 """Tool-layer forwarding contract tests for the V3 Java refactoring tools.
 
 These are deliberately lightweight: they prove that each ``Java*Tool.apply()`` forwards to the matching
@@ -148,6 +149,7 @@ def test_extract_class_forwards_members_and_options() -> None:
         "target_package": "com.acme.core",
         "leave_delegate_methods": False,
         "update_usages": False,
+        "confirm_public_api_change": False,
         "allow_review_required": False,
         "apply": False,
         "validate": True,
@@ -177,6 +179,7 @@ def test_extract_class_forwards_name_path_guard_and_update_usages() -> None:
         "target_package": None,
         "leave_delegate_methods": False,
         "update_usages": True,
+        "confirm_public_api_change": False,
         "allow_review_required": False,
         "apply": False,
         "validate": True,
@@ -202,7 +205,7 @@ def test_extract_superclass_forwards_class_list() -> None:
         "BaseAccount",
         ["field:balance", "method:deposit(int)"],
     )
-    assert kwargs == {"target_package": None, "make_abstract": False, "allow_review_required": False, "apply": True, "validate": True}
+    assert kwargs == {"target_package": None, "make_abstract": True, "allow_review_required": False, "apply": True, "validate": True}
 
 
 # --- extract superclass: planned name_path + relative_path + make_abstract contract ------------------------------------
@@ -662,7 +665,7 @@ def test_apply_transformation_workspace_tool_forwards_validate_and_revision_guar
         expected_project_revision="rev-7",
     )
     assert args == ("ws-4",)
-    assert kwargs == {"validate": True, "expected_project_revision": "rev-7"}
+    assert kwargs == {"validate": True, "expected_project_revision": "rev-7", "allow_review_required": False}
 
 
 def test_cancel_transformation_workspace_tool_forwards_id() -> None:
@@ -767,3 +770,90 @@ def test_v3_disabled_scan_refusal_carries_analysis_invariants() -> None:
     assert payload["previewFirst"] is True
     assert payload["javacFactsValidated"] is True
     assert payload["impact"]["warnings"] == []
+
+
+def test_extract_class_public_api_review_knobs_are_forwarded() -> None:
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaExtractClassTool,
+        stub,
+        "extract_class",
+        relative_path="src/main/java/com/acme/app/Cart.java",
+        new_class_name="Totals",
+        members='["addToTotal"]',
+        leave_delegate_methods=False,
+        update_usages=True,
+        confirm_public_api_change=True,
+        allow_review_required=True,
+        preview=False,
+    )
+    assert args == ("src/main/java/com/acme/app/Cart.java", "Totals", ["addToTotal"])
+    assert kwargs["leave_delegate_methods"] is False
+    assert kwargs["update_usages"] is True
+    assert kwargs["confirm_public_api_change"] is True
+    assert kwargs["allow_review_required"] is True
+    assert kwargs["apply"] is True
+
+
+def test_extract_superclass_relative_path_alias_keeps_public_api_defaults() -> None:
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaExtractSuperclassTool,
+        stub,
+        "extract_superclass",
+        relative_path="src/main/java/com/acme/app/Account.java",
+        superclass_name="AbstractAccount",
+        members='["method:save()"]',
+    )
+    assert args == (["src/main/java/com/acme/app/Account.java"], "AbstractAccount", ["method:save()"])
+    assert kwargs["make_abstract"] is True
+    assert kwargs["allow_review_required"] is False
+    assert kwargs["apply"] is False
+
+
+def test_extract_superclass_classes_alias_accepts_json_list() -> None:
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaExtractSuperclassTool,
+        stub,
+        "extract_superclass",
+        classes='["src/main/java/com/acme/A.java", "src/main/java/com/acme/B.java"]',
+        superclass_name="Base",
+        members='["method:save()"]',
+        preview=True,
+    )
+    assert args == (
+        ["src/main/java/com/acme/A.java", "src/main/java/com/acme/B.java"],
+        "Base",
+        ["method:save()"],
+    )
+    assert kwargs["make_abstract"] is True
+    assert kwargs["allow_review_required"] is False
+
+
+def test_propagate_safe_delete_accepts_planned_roots_alias() -> None:
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaPropagateSafeDeleteTool,
+        stub,
+        "propagate_safe_delete",
+        roots='["com.acme.Legacy", {"relativePath": "src/main/java/com/acme/Old.java", "line": 4, "column": 8}]',
+    )
+    assert args[0] == [
+        "com.acme.Legacy",
+        {"relativePath": "src/main/java/com/acme/Old.java", "line": 4, "column": 8},
+    ]
+
+
+def test_deep_inline_accepts_name_path_alias_for_method_name() -> None:
+    stub = _StubTool()
+    args, kwargs = _invoke(
+        JavaDeepInlineMethodTool,
+        stub,
+        "deep_inline_method",
+        relative_path="src/main/java/com/acme/Worker.java",
+        line=12,
+        name_path="Worker/helper[0]",
+    )
+    assert args == ("src/main/java/com/acme/Worker.java", 12)
+    assert kwargs["method_name"] == "helper"

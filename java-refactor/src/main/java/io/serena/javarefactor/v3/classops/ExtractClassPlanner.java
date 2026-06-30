@@ -142,6 +142,7 @@ public final class ExtractClassPlanner {
             throw new ClassOpsRefusal("no_members", "Extract class requires at least one member selector.");
         }
         boolean leaveDelegateMethods = bool(fields, "leaveDelegateMethods", true);
+        boolean confirmPublicApiChange = bool(fields, "confirmPublicApiChange", false);
         boolean updateUsages = bool(fields, "updateUsages", false);
 
         Path sourceFile = ProjectPathResolver.resolveProjectRelative(
@@ -201,7 +202,7 @@ public final class ExtractClassPlanner {
                     movedFields.add(field);
                 } else {
                     SemanticMethod method = ClassOpsSupport.resolveMethod(index, source, selector);
-                    guardMethodMovable(index, method, leaveDelegateMethods);
+                    guardMethodMovable(index, method, leaveDelegateMethods, confirmPublicApiChange);
                     movedMethods.add(method);
                 }
             }
@@ -369,7 +370,7 @@ public final class ExtractClassPlanner {
     }
 
     /** Enforces the §8.4 method refusal list using javac-derived move facts. */
-    private void guardMethodMovable(SemanticIndex index, SemanticMethod method, boolean leaveDelegateMethods) {
+    private void guardMethodMovable(SemanticIndex index, SemanticMethod method, boolean leaveDelegateMethods, boolean confirmPublicApiChange) {
         if (method.isStatic()) {
             throw new ClassOpsRefusal("extract_class_static_method",
                     "Static method '" + method.name() + "' is not an instance collaborator member.");
@@ -378,9 +379,10 @@ public final class ExtractClassPlanner {
             throw new ClassOpsRefusal("extract_class_native_method",
                     "Native method '" + method.name() + "' cannot be relocated.");
         }
-        if (method.modifiers().contains(Modifier.PUBLIC) && !leaveDelegateMethods) {
+        if (method.modifiers().contains(Modifier.PUBLIC) && !leaveDelegateMethods && !confirmPublicApiChange) {
             throw new ClassOpsRefusal("extract_class_public_api_without_delegates",
-                    "Public method '" + method.name() + "' cannot be removed; set leaveDelegateMethods=true.");
+                    "Public method '" + method.name()
+                            + "' cannot be removed without explicit public API confirmation; set leaveDelegateMethods=true or confirmPublicApiChange=true.");
         }
         SemanticIndex.InstanceMoveFacts facts = index.instanceMoveFacts(method);
         if (!facts.resolved()) {

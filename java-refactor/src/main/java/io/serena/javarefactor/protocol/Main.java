@@ -611,6 +611,8 @@ public final class Main {
 
     private static final Map<String, V3Gate> V3_DISPATCH_GATES = Map.ofEntries(
             Map.entry("transformation.createWorkspace", new V3Gate("transformations", null)),
+            Map.entry("transformation.addSession", new V3Gate("transformations", null)),
+            Map.entry("transformation.addOperation", new V3Gate("transformations", null)),
             Map.entry("transformation.preview", new V3Gate("transformations", null)),
             Map.entry("transformation.apply", new V3Gate("transformations", null)),
             Map.entry("transformation.cancel", new V3Gate("transformations", null)),

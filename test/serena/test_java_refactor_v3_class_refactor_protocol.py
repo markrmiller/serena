@@ -408,7 +408,7 @@ def test_extract_superclass_refuses_existing_super(sidecar_jar: Path, tmp_path: 
 # ── §9 (F11) extract superclass: a single source class is a legal target (no two-sibling minimum) ────────────────
 
 
-def test_extract_superclass_hoists_from_single_class(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
+def test_extract_superclass_refuses_single_class(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:
     _write(
         tmp_path,
         "src/main/java/com/acme/Robot.java",
@@ -424,13 +424,8 @@ def test_extract_superclass_hoists_from_single_class(sidecar_jar: Path, tmp_path
             ["method:describe()"],
         )
 
-    assert result.get("accepted") is True, result
-    assert result.get("diagnosticDeltaValidated") is True, result
-    assert any(path.endswith("com/acme/Machine.java") for path in _created_paths(result)), result
-    assert "extends Machine" in _new_texts(result), result
-
-
-# ── §9 (F11) extract superclass: interpose a new base beneath a shared existing superclass ───────────────────────
+    assert result.get("accepted") is False, result
+    assert "refusal" in result, result
 
 
 def test_extract_superclass_interposes_shared_superclass(sidecar_jar: Path, tmp_path: Path, sidecar_java_cmd: str) -> None:

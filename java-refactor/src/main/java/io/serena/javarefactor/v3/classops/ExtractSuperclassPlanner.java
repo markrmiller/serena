@@ -93,6 +93,7 @@ public final class ExtractSuperclassPlanner {
                 + "\"fileOperations\":[" + PlannerSupport.createFileOp(plan.superclassRelative(), plan.superclassSource()) + "]"
                 + "},"
                 + "\"warnings\":" + PlannerSupport.warningsJson(plan.warnings()) + ","
+                + "\"riskFacts\":{\"publicApiChanges\":" + PlannerSupport.warningsJson(plan.warnings()) + "},"
                 + "\"stats\":" + statsJson
                 + "}";
     }
@@ -115,9 +116,9 @@ public final class ExtractSuperclassPlanner {
             throws IOException, ProjectPathResolver.Violation {
         String superclassName = requireString(fields, "superclassName");
         List<String> classPaths = stringList(fields.get("classes"));
-        if (classPaths.isEmpty()) {
+        if (classPaths.size() < 2) {
             throw new ClassOpsRefusal("insufficient_classes",
-                    "Extract superclass requires at least one source class.");
+                    "Extract superclass requires at least two source classes.");
         }
         List<String> memberSelectors = stringList(fields.get("members"));
         if (memberSelectors.isEmpty()) {
@@ -194,7 +195,7 @@ public final class ExtractSuperclassPlanner {
             // §9.2: when make_abstract is requested, hoisted methods become ABSTRACT declarations in the new superclass
             // while each subclass KEEPS its concrete override (annotated @Override). Fields ignore the flag — they are
             // always pulled up wholesale.
-            boolean makeAbstract = boolField(fields, "makeAbstract", false);
+            boolean makeAbstract = boolField(fields, "makeAbstract", true);
 
             // Hoist member text from the anchor; verify every member exists in every selected class. Collect any hoisted
             // field with no initializer — it must be supplied through a constructor, driving constructor propagation.
@@ -322,6 +323,8 @@ public final class ExtractSuperclassPlanner {
             // method declarations) is better expressed as an interface. Surface this as a suggestion — extraction still
             // proceeds — so the caller can reconsider when no fields, no concrete methods, and no constructor are hoisted.
             List<String> warnings = new ArrayList<>();
+        warnings.add("public_api_hierarchy_change: extracting superclass '" + superclassFqn
+                + "' changes the published type/member hierarchy and requires review before apply.");
             if (!anyFieldHoisted && !anyConcreteMemberHoisted && generatedConstructor == null && !hasCommonSuper) {
                 warnings.add("interface_alternative_suggested: the extracted superclass '" + superclassName
                         + "' declares only abstract methods and holds no state; consider extracting an interface instead.");

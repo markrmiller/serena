@@ -245,6 +245,7 @@ class JavaPropagateSafeDeleteTool(_JavaRefactorToolBase):
     def apply(
         self,
         seeds: str = "",
+        roots: str | None = None,
         cascade_depth: int | None = None,
         delete_private_only: bool = True,
         include_tests: bool = False,
@@ -291,7 +292,7 @@ class JavaPropagateSafeDeleteTool(_JavaRefactorToolBase):
             human should confirm) is blocked on apply and writes nothing; set ``True`` to apply it after review. SAFE
             edits always apply and REFUSED results never apply, regardless of this flag.
         """
-        seed_list = self._parse_seeds(seeds)
+        seed_list = JavaPropagateSafeDeleteTool._parse_seeds(roots if roots is not None else seeds)
         result = self._get_manager().propagate_safe_delete(
             seed_list,
             cascade_depth=cascade_depth,
@@ -424,6 +425,7 @@ class JavaExtractClassTool(_JavaRefactorToolBase):
         target_package: str | None = None,
         leave_delegate_methods: bool = True,
         update_usages: bool = False,
+        confirm_public_api_change: bool = False,
         preview: bool | None = None,
         validate: bool = True,
         allow_review_required: bool = False,
@@ -486,6 +488,7 @@ class JavaExtractClassTool(_JavaRefactorToolBase):
             target_package=target_package,
             leave_delegate_methods=leave_delegate_methods,
             update_usages=update_usages,
+            confirm_public_api_change=confirm_public_api_change,  # pyright: ignore[reportCallIssue]
             apply=not self._resolve_preview(preview),
             validate=validate,
             allow_review_required=allow_review_required,
@@ -504,7 +507,7 @@ class JavaExtractSuperclassTool(_JavaRefactorToolBase):
         members: str = "",
         classes: str = "",
         target_package: str | None = None,
-        make_abstract: bool = False,
+        make_abstract: bool = True,
         preview: bool | None = None,
         validate: bool = True,
         allow_review_required: bool = False,
@@ -645,6 +648,7 @@ class JavaDeepInlineMethodTool(_JavaRefactorToolBase):
         line: int = 0,
         column: int | None = None,
         method_name: str | None = None,
+        name_path: str | None = None,
         delete_method: bool = False,
         max_call_sites: int | None = None,
         preview: bool | None = None,
@@ -688,6 +692,9 @@ class JavaDeepInlineMethodTool(_JavaRefactorToolBase):
             validation with rollback ALWAYS runs on apply, and staged pre-commit javac validation runs unless the project
             disables ``java_refactor.validate_before_apply``.
         """
+        if method_name is None and name_path:
+            method_name = str(name_path).split("/")[-1].split("[")[0] or None
+
         result = self._get_manager().deep_inline_method(
             relative_path,
             line,
@@ -888,10 +895,9 @@ class JavaApplyRefactorRecipeTool(_JavaRefactorToolBase):
             template and not refused).
         :param recipe_json: Backward-compatible alias for ``recipe_document`` (an inline JSON/YAML recipe definition).
             Supply at most one of ``recipe_document``/``recipe_json``; both forms feed the same inline-recipe selector.
-        :param allow_review_required: When false (the default) only matches the engine classifies SAFE are applied;
-            matches classified REVIEW_REQUIRED (``needs_review``) that carry a concrete replacement are SKIPPED (and
-            counted in the result's warnings). Set true to ALSO apply those REVIEW_REQUIRED matches — report-only
-            findings with no replacement are never applied regardless. Forwarded to the sidecar as ``apply_needs_review``.
+        :param allow_review_required: When false (the default), any in-scope REVIEW_REQUIRED match refuses the
+            entire apply before writing. Set true only after reviewing those matches; REFUSED matches always refuse
+            the whole apply. Forwarded to the sidecar as ``apply_needs_review`` for approved review-required edits.
         :param preview: When true only the planned (javac-validated) edit is returned; when false it is applied. When
             omitted, the project's ``java_refactor.preview_default`` decides (preview mode if that config is absent).
         :param validate: Preview-time reporting only. When true (default) a preview also runs and reports staged in-memory
@@ -914,7 +920,7 @@ class JavaApplyRefactorRecipeTool(_JavaRefactorToolBase):
 
 
 class JavaImpactReportTool(_JavaRefactorToolBase):
-    """Whole-repo impact report (Java/resources/API/tests/risk) for a composed transformation workspace (V3 ``impactReport``, READ-ONLY)."""
+    """Whole-repo V3 impact report (summary/semanticImpact/resourceImpact/tests/warnings) for a composed transformation workspace (V3 ``impactReport``, READ-ONLY)."""
 
     def apply(
         self,
@@ -926,12 +932,12 @@ class JavaImpactReportTool(_JavaRefactorToolBase):
         """
         Produce a whole-repo impact report for a composed transformation workspace. READ-ONLY.
 
-        Composes the workspace's enrolled sessions into one plan (without staging or writing) and projects a five-section
-        report over it: the Java files/types touched, the resource files and resource-wired types, the public-API
-        boundary crossings, the impacted tests to re-run, and the overall risk with its reasons. This is a pure analysis:
-        it produces NO edit, writes nothing, and runs no javac (there is nothing to validate). Use it to review the blast
-        radius of a transformation workspace before applying it. Refuses on an unknown/terminal/empty/conflicting
-        workspace with a structured refusal.
+        Composes the workspace's enrolled sessions into one plan (without staging or writing) and projects the V3 five-section schema over it: ``summary``, ``semanticImpact``, ``resourceImpact``,
+        ``tests``, and ``warnings``. The report covers Java files/types touched, resource files and
+        resource-wired types, public-API boundary crossings, impacted tests to re-run, and risk reasons.
+        This is a pure analysis: it produces NO edit and writes nothing. It is backed by sidecar javac facts
+        rather than a file-name-only projection, matching the report embedded in workspace preview/apply results.
+        Refuses on an unknown/terminal/empty/conflicting workspace with a structured refusal.
 
         :param workspace_id: Id of an open transformation workspace (from the transformation-workspace tools) to report on.
         :param include_tests: When False, omit the ``tests`` section from the returned report. This is a presentation
@@ -1205,6 +1211,7 @@ class JavaApplyTransformationWorkspaceTool(_JavaRefactorToolBase):
         workspace_id: str,
         validate: bool | None = None,
         expected_project_revision: str | None = None,
+        allow_review_required: bool = False,
         max_answer_chars: int = -1,
     ) -> str:
         """
@@ -1219,6 +1226,7 @@ class JavaApplyTransformationWorkspaceTool(_JavaRefactorToolBase):
         :param workspace_id: Id of an open workspace (from ``java_create_transformation_workspace``) to commit.
         :param validate: Optional preview-time validation toggle; omit to use the project default. This cannot weaken the
             apply safety gate — post-apply validation with rollback always runs.
+        :param allow_review_required: Explicit approval for applying a composed REVIEW_REQUIRED workspace edit. Defaults false.
         :param expected_project_revision: Optional optimistic-concurrency guard. When supplied it must equal the revision
             the workspace pins (copy it verbatim from a workspace status's ``projectRevision``) or the apply is refused
             before any write; omit to skip the guard.
@@ -1229,6 +1237,7 @@ class JavaApplyTransformationWorkspaceTool(_JavaRefactorToolBase):
             workspace_id,
             validate=validate,
             expected_project_revision=expected_project_revision,
+            allow_review_required=allow_review_required,
         )
         return self._limit_length(self._finalize_result(result), max_answer_chars)
 

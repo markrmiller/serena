@@ -20,7 +20,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from serena.java_refactor.workspace_edit import (
     RefactorTextEdit,
@@ -37,6 +37,7 @@ from serena.java_refactor_v3.models import (
     WORKSPACE_SESSION_NOT_ACCEPTED,
     WORKSPACE_TERMINAL,
     WORKSPACE_UNSAFE_EDIT,
+    WORKSPACE_REVIEW_REQUIRED,
     FileChangeKind,
     FileEditStat,
     ImpactReport,
@@ -362,9 +363,9 @@ def _build_impact_report(stats: WorkspaceStats, risk: RiskLevel, warnings: Itera
     Every section is genuinely computed from the touched files the composition actually carries; there are no
     ``not_analyzed`` placeholders. A change that touches no resources/tests/main-source Java yields honest ZERO
     counts (``fileCount: 0`` / ``touchedTestFiles: []``), never an "uncomputed" marker. This is the lightweight
-    projection embedded in ``preview``/``apply`` envelopes; the full graph-backed cross-reference report (wired
-    resource providers, tests that *reference* a changed type, API boundary crossings) is computed separately by
-    :class:`~serena.java_refactor_v3.reports.impact.ImpactReportBuilder` via the manager's ``impact_report`` route,
+    workspace-local projection used while composing edits; the public manager preview/apply routes replace it with
+    the full graph-backed cross-reference report (wired resource providers, tests that *reference* a changed type,
+    API boundary crossings) computed by :class:`~serena.java_refactor_v3.reports.impact.ImpactReportBuilder`,
     which has the project graph this projection deliberately does not.
     """
     java = {
@@ -622,9 +623,10 @@ class TransformationWorkspace:
     def preview(self) -> dict[str, Any]:
         """Composes and validates the member plan without writing anything.
 
-        Returns the aggregated stats and the computed impact report (a file-level projection of the composed
-        edit). Staging the merged edit in memory (no write) revalidates every file's hash precondition, so a
-        drifted/unsafe composition is refused here rather than at apply time.
+        Returns the aggregated stats and a workspace-local impact projection of the composed edit. The public manager
+        attaches the graph-backed V3 impact report before returning preview/apply results. Staging the merged edit
+        in memory (no write) revalidates every file's hash precondition, so a drifted/unsafe composition is refused
+        here rather than at apply time.
         """
         if self._status.is_terminal():
             return self._terminal_refusal("preview")
@@ -643,9 +645,30 @@ class TransformationWorkspace:
                 mode="preview",
             )
 
+        validation = self._validate_composed_edit(
+            composition,
+            mode="preview",
+            apply=False,
+            validate=True,
+            allow_review_required=True,
+        )
+        if validation is not None and not validation.get("accepted", False):
+            return self._refuse(
+                validation.get("refusal", {}).get("code") or WORKSPACE_UNSAFE_EDIT,
+                validation.get("refusal", {}).get("message") or "The composed workspace edit failed V3 validation.",
+                mode="preview",
+                validation=validation,
+                impactReport=_build_impact_report(
+                    composition.stats,
+                    composition.risk,
+                    composition.merged_edit.warnings,
+                ).to_dict(),
+                warnings=list(composition.merged_edit.warnings),
+            )
+
         self._status = WorkspaceStatus.PREVIEWED
         self._touch()
-        return self._success_envelope(composition, mode="preview", applied=False)
+        return self._success_envelope(composition, mode="preview", applied=False, validation=validation)
 
     def composed_impact_inputs(self) -> dict[str, Any]:
         """Composes the member plan for a READ-ONLY impact report, without staging or writing anything.
@@ -671,7 +694,12 @@ class TransformationWorkspace:
             "operation": operation,
         }
 
-    def apply(self, validate: bool | None = None, expected_project_revision: Any = None) -> dict[str, Any]:
+    def apply(
+        self,
+        validate: bool | None = None,
+        expected_project_revision: Any = None,
+        allow_review_required: bool = False,
+    ) -> dict[str, Any]:
         """Composes the member plan and commits it transactionally (all-or-nothing).
 
         ``expected_project_revision`` optionally pins an optimistic-concurrency guard: when supplied it must
@@ -699,6 +727,51 @@ class TransformationWorkspace:
         if not composition.ok:
             return self._composition_refusal(composition, mode="apply")
         assert composition.merged_edit is not None and composition.stats is not None
+
+        if composition.risk == RiskLevel.REVIEW_REQUIRED and not allow_review_required:
+            return self._refuse(
+                WORKSPACE_REVIEW_REQUIRED,
+                "The composed workspace edit is REVIEW_REQUIRED; preview it or pass allow_review_required=true before applying.",
+                mode="apply",
+                impactReport=_build_impact_report(
+                    composition.stats,
+                    composition.risk,
+                    composition.merged_edit.warnings,
+                ).to_dict(),
+                warnings=list(composition.merged_edit.warnings),
+            )
+
+        validation = self._validate_composed_edit(
+            composition,
+            mode="apply",
+            apply=True,
+            validate=validate,
+            allow_review_required=allow_review_required,
+        )
+        if validation is not None:
+            if not validation.get("accepted", False):
+                self._status = WorkspaceStatus.FAILED if validation.get("applied") else self._status
+                self._touch()
+                return self._refuse(
+                    validation.get("refusal", {}).get("code") or WORKSPACE_UNSAFE_EDIT,
+                    validation.get("refusal", {}).get("message") or "The composed workspace edit failed V3 validation.",
+                    mode="apply",
+                    validation=validation,
+                    impactReport=_build_impact_report(
+                        composition.stats,
+                        composition.risk,
+                        composition.merged_edit.warnings,
+                    ).to_dict(),
+                    warnings=list(composition.merged_edit.warnings),
+                )
+            for ref in self._sessions:
+                ref.applied = True
+                self._release(ref)
+            self._status = WorkspaceStatus.APPLIED
+            self._touch()
+            result = self._success_envelope(composition, mode="apply", applied=True, validation=validation)
+            result["touchedFiles"] = composition.merged_edit.touched_files()
+            return result
 
         # stage in memory (validates), then commit transactionally with automatic rollback on failure
         applier = self._driver.new_workspace_edit_applier()
@@ -767,10 +840,45 @@ class TransformationWorkspace:
             "sessions": [ref.summary() for ref in self._sessions],
         }
 
-    def _success_envelope(self, composition: _Composition, *, mode: str, applied: bool) -> dict[str, Any]:
+    def _validate_composed_edit(
+        self,
+        composition: _Composition,
+        *,
+        mode: str,
+        apply: bool,
+        validate: bool | None,
+        allow_review_required: bool,
+    ) -> dict[str, Any] | None:
+        """Delegates composed V3 workspace validation/application to the manager bridge when available."""
+        assert composition.stats is not None and composition.merged_edit is not None
+        validator = getattr(self._driver, "validate_v3_workspace_edit", None)
+        if not callable(validator):
+            return None
+        return cast(
+            dict[str, Any] | None,
+            validator(
+                operation="transformationWorkspace",
+                workspace_edit=composition.merged_edit,
+                apply=apply,
+                validate=validate,
+                risk=composition.risk,
+                allow_review_required=allow_review_required,
+                warnings=list(composition.merged_edit.warnings),
+                summary=f"Transformation workspace {self._id} {mode}",
+            ),
+        )
+
+    def _success_envelope(
+        self,
+        composition: _Composition,
+        *,
+        mode: str,
+        applied: bool,
+        validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         assert composition.stats is not None and composition.merged_edit is not None
         impact = _build_impact_report(composition.stats, composition.risk, composition.merged_edit.warnings)
-        return {
+        result = {
             "accepted": True,
             "applied": applied,
             "mode": mode,
@@ -783,22 +891,37 @@ class TransformationWorkspace:
             "impactReport": impact.to_dict(),
             "warnings": list(composition.merged_edit.warnings),
         }
+        result["validation"] = validation or {
+            "accepted": True,
+            "applied": False,
+            "validated": False,
+            "validationMode": "not_available",
+            "message": "No V3 javac validation bridge was available for this workspace driver.",
+        }
+        return result
 
     def _composition_refusal(self, composition: _Composition, *, mode: str) -> dict[str, Any]:
         assert composition.refusal is not None
         return self._refuse(composition.refusal.code, composition.refusal.message, mode=mode)
 
-    def _operation_refusal(self, plan_refusal: dict[str, Any], operation: str) -> dict[str, Any]:
-        """Re-envelopes a driver V3-plan refusal into the workspace refusal contract (nothing was enrolled).
-
-        The driver returns the sidecar/extractor refusal verbatim (``{"accepted": False, "refusal": {code, message}}``).
-        We surface its code/message through :meth:`_refuse` so the ``add_operation`` envelope matches every other
-        workspace refusal, and attach the raw driver payload under ``planRefusal`` for diagnostics.
-        """
-        refusal = plan_refusal.get("refusal") if isinstance(plan_refusal.get("refusal"), dict) else {}
-        code = refusal.get("code") or WORKSPACE_SESSION_NOT_ACCEPTED
-        message = refusal.get("message") or f"The driver refused to plan the {operation!r} op, so it was not added to the workspace."
-        return self._refuse(code, message, mode="add_operation", planRefusal=plan_refusal)
+    def _operation_refusal(self, plan_refusal: dict[str, Any] | None, operation: str) -> dict[str, Any]:
+        """Builds a structured refusal for an operation that failed V3-plan enrollment."""
+        refusal = plan_refusal if isinstance(plan_refusal, dict) else {}
+        nested_value = refusal.get("refusal")
+        nested_refusal = nested_value if isinstance(nested_value, dict) else {}
+        code_value = refusal.get("code") or nested_refusal.get("code") or WORKSPACE_SESSION_NOT_ACCEPTED
+        message_value = (
+            refusal.get("message")
+            or nested_refusal.get("message")
+            or "Operation did not produce an accepted V3 plan"
+        )
+        return self._refuse(
+            str(code_value),
+            str(message_value),
+            mode="add_operation",
+            operation=operation,
+            planRefusal=refusal,
+        )
 
     def _refuse(self, code: str, message: str, *, mode: str, **extra: Any) -> dict[str, Any]:
         result = {
@@ -928,12 +1051,22 @@ class TransformationWorkspaceManager:
         self._mark_recent(workspace_id)
         return result
 
-    def apply(self, workspace_id: str, validate: bool | None = None, expected_project_revision: Any = None) -> dict[str, Any]:
+    def apply(
+        self,
+        workspace_id: str,
+        validate: bool | None = None,
+        expected_project_revision: Any = None,
+        allow_review_required: bool = False,
+    ) -> dict[str, Any]:
         """Routes :meth:`TransformationWorkspace.apply` by workspace id."""
         workspace = self.get_workspace(workspace_id)
         if workspace is None:
             return self._not_found(workspace_id, "apply")
-        result = workspace.apply(validate=validate, expected_project_revision=expected_project_revision)
+        result = workspace.apply(
+            validate=validate,
+            expected_project_revision=expected_project_revision,
+            allow_review_required=allow_review_required,
+        )
         self._mark_recent(workspace_id)
         return result
 

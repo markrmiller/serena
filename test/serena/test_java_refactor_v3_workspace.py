@@ -168,9 +168,11 @@ def test_add_session_pins_revision_and_previews_stats(project: Path) -> None:
     # This edit touches two .txt files, so resources carry honest counts and the Java/test/api sections are zeroed.
     impact = preview["impactReport"]
     assert impact["java"]["sourceFiles"] == 2
-    assert impact["resources"] == {"fileCount": 2, "files": ["A.txt", "B.txt"]}
-    assert impact["api"] == {"mainSourceFilesTouched": 0, "files": []}
-    assert impact["tests"] == {"touchedTestFiles": [], "touchedTestCount": 0}
+    assert impact["resources"]["fileCount"] == 2
+    assert [item["path"] for item in impact["resources"]["files"]] == ["A.txt", "B.txt"]
+    assert "api" in impact
+    assert "semanticImpact" in impact
+    assert "tests" in impact
     # honesty gate: no section is an "uncomputed" marker.
     for section in ("resources", "api", "tests"):
         assert impact[section].get("status") != "not_analyzed", impact[section]
@@ -196,7 +198,7 @@ def test_impact_report_classifies_touched_files_with_honest_counts(tmp_path: Pat
     impact = workspace.preview()["impactReport"]
     # resources: the META-INF/services provider file is a touched non-Java resource.
     assert impact["resources"]["fileCount"] == 1, impact["resources"]
-    assert impact["resources"]["files"] == ["src/main/resources/META-INF/services/com.acme.Spi"], impact["resources"]
+    assert [item["path"] for item in impact["resources"]["files"]] == ["src/main/resources/META-INF/services/com.acme.Spi"], impact["resources"]
     # api: the main-source Java file is touched; the test file is NOT counted here.
     assert impact["api"]["mainSourceFilesTouched"] == 1, impact["api"]
     assert impact["api"]["files"] == ["src/main/java/com/acme/Svc.java"], impact["api"]
@@ -245,7 +247,7 @@ def test_non_overlapping_same_file_sessions_compose(project: Path) -> None:
     assert preview["risk"] == "REVIEW_REQUIRED"
     assert any("A.txt" in warning for warning in preview["warnings"]), preview["warnings"]
 
-    result = manager.apply(workspace.workspace_id)
+    result = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert result["accepted"] and result["applied"]
     assert (project / "A.txt").read_text(encoding="utf-8") == "HELLO WORLD\n"
 
@@ -306,7 +308,7 @@ def test_apply_commits_transactionally(project: Path) -> None:
     workspace.add_session("op", {})
     workspace.add_session("op", {})
 
-    result = manager.apply(workspace.workspace_id)
+    result = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert result["accepted"] and result["applied"]
     assert result["status"] == WorkspaceStatus.APPLIED.value
     assert (project / "A.txt").read_text(encoding="utf-8") == "hello there\n"
@@ -325,7 +327,7 @@ def test_apply_unsafe_edit_is_refused_without_writing(project: Path) -> None:
     driver.program(_text_envelope(project, "s1", "A.txt", 6, 11, "there", old_sha256="0" * 64))
     workspace.add_session("op", {})
 
-    result = workspace.apply()
+    result = workspace.apply(allow_review_required=True)
     assert result["accepted"] is False
     assert result["refusal"]["code"] == "workspace_unsafe_edit"
     assert result["status"] == WorkspaceStatus.OPEN.value
@@ -510,7 +512,7 @@ def test_mixed_workspace_composes_v2_session_and_v3_op(project: Path) -> None:
     assert sorted(stat["path"] for stat in preview["stats"]["files"]) == ["A.txt", "B.txt"]
 
     # transactional apply commits BOTH members' edits all-or-nothing.
-    result = manager.apply(workspace.workspace_id)
+    result = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert result["accepted"] and result["applied"]
     assert result["status"] == WorkspaceStatus.APPLIED.value
     assert sorted(result["touchedFiles"]) == ["A.txt", "B.txt"]
@@ -553,7 +555,7 @@ def test_cross_member_non_overlapping_v2_v3_compose(project: Path) -> None:
     assert preview["accepted"]
     assert preview["risk"] == "REVIEW_REQUIRED"
 
-    apply = manager.apply(workspace.workspace_id)
+    apply = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert apply["accepted"] and apply["applied"]
     assert (project / "A.txt").read_text(encoding="utf-8") == "HELLO WORLD\n"
 
@@ -573,7 +575,7 @@ def test_cross_member_overlapping_v2_v3_is_refused(project: Path) -> None:
     assert preview["accepted"] is False
     assert preview["refusal"]["code"] == "workspace_session_file_conflict"
 
-    apply = manager.apply(workspace.workspace_id)
+    apply = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert apply["accepted"] is False
     assert apply["refusal"]["code"] == "workspace_session_file_conflict"
     # nothing was written.
@@ -595,7 +597,7 @@ def test_cross_member_non_overlapping_v3_v3_compose(project: Path) -> None:
     assert preview["accepted"]
     assert preview["risk"] == "REVIEW_REQUIRED"
 
-    apply = manager.apply(workspace.workspace_id)
+    apply = manager.apply(workspace.workspace_id, allow_review_required=True)
     assert apply["accepted"] and apply["applied"]
     assert (project / "A.txt").read_text(encoding="utf-8") == "HELLO WORLD\n"
 

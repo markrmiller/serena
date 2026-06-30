@@ -280,3 +280,11 @@ register_refusal_code(
     "framework_target_unresolved",
     "The framework reference-scan target could not be resolved (e.g. the project has no Java sources to scan).",
 )
+register_refusal_code(
+    "recipe_review_required",
+    "A recipe apply matched REVIEW_REQUIRED findings and needs explicit approval before any write.",
+)
+register_refusal_code(
+    "recipe_refused_match",
+    "A recipe apply matched at least one REFUSED finding and cannot be partially applied.",
+)

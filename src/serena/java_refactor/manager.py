@@ -58,19 +58,36 @@ _V2_CAPABILITY_OPERATIONS = {
     "inlineMethod",
 }
 
-# V3 whole-repo package operations that ship with dedicated capability tools (v3_tools.JAVA_REFACTOR_V3_CAPABILITY_TOOLS).
-# They are advertised and gated by the sidecar exactly like V2 ops (status supported/preview/disabled), so they must flow
-# through ``_capabilities`` / ``supported_v2_operations`` for their tools to register. They are kept separate from
-# ``_V2_CAPABILITY_OPERATIONS`` (which a guard test pins to the eleven V2 ops) but share the same negotiation path.
-#
-# The dedicated V3 dispatch ops (deletion.*/classRefactor.*/conversions.*/inlineRefactor.*/recipes.*) are deliberately
-# NOT capability-gated at tool registration: they ship as experimental/preview, register on ``java_refactor.enabled``,
-# and refuse at DISPATCH time when the project's ``java_refactor.v3`` config disables them. A guard test
-# (``test_manager_negotiates_v3_package_operations``) pins that a preview dispatch op does not negotiate through this set.
+# V3 operations are part of the public sidecar capability contract introduced by the V3 plan.  The public tool registry,
+# manager status/capability model, and dispatch refusal path must agree so a tool cannot appear first-class while the
+# manager has no capability entry for it.  Keep this set in sync with JAVA_REFACTOR_V3_CAPABILITY_TOOLS.
 _V3_CAPABILITY_OPERATIONS = {
     "renamePackage",
     "movePackage",
     "moveSourceRoot",
+    "deletion.propagateSafeDelete",
+    "deletion.findDeadCode",
+    "classRefactor.extractClass",
+    "classRefactor.extractSuperclass",
+    "classRefactor.replaceInheritanceWithDelegation",
+    "conversions.anonymousToLambda",
+    "conversions.lambdaToMethodReference",
+    "inlineRefactor.deepInlineMethod",
+    "recipes.scanMigrationOpportunities",
+    "recipes.applyRecipe",
+    "impact.facts",
+    "resources.planEdits",
+    "resources.findReferences",
+    "frameworks.detect",
+    "frameworks.findReferences",
+    "transformation.createWorkspace",
+    "transformation.addSession",
+    "transformation.addOperation",
+    "transformation.preview",
+    "transformation.apply",
+    "transformation.cancel",
+    "transformation.list",
+    "graph.build",
 }
 
 _CAPABILITY_OPERATIONS = _V2_CAPABILITY_OPERATIONS | _V3_CAPABILITY_OPERATIONS
@@ -1036,38 +1053,79 @@ class JavaRefactorManager:
         self._validate_supported_project()
         return self.transformation_workspaces.add_operation(workspace_id, operation, params)
 
-    def transformation_workspace_preview(self, workspace_id: str) -> dict:
-        """Composes and validates the member plan of ``workspace_id`` without writing anything (G001). READ-ONLY.
+    def _workspace_primary_impact_report_or_refusal(self, workspace_id: str, mode: str) -> dict:
+        """Returns the graph-backed V3 impact report for primary workspace results, or a refusal.
 
-        Stages the merged edit in memory (revalidating every file-hash precondition) and returns the aggregated stats,
-        risk, and impact projection. A drifted/overlapping/unsafe composition is refused here rather than at apply time.
-        Refuses on a disabled engine or an unknown/terminal workspace with a structured envelope.
+        Preview/apply must carry the same javac-fact-backed impact contract as the dedicated impact-report route.
+        Apply calls this before writing so a sidecar facts refusal remains a no-write structured refusal.
         """
+        impact = self.transformation_workspace_impact_report(workspace_id)
+        if not impact.get("accepted", False):
+            refusal = dict(impact)
+            refusal["mode"] = mode
+            refusal.setdefault("workspaceId", workspace_id)
+            return refusal
+        report = impact.get("report")
+        if not isinstance(report, dict):
+            return {
+                "accepted": False,
+                "applied": False,
+                "operation": "transformationWorkspace",
+                "mode": mode,
+                "workspaceId": workspace_id,
+                "refusal": {
+                    "code": "impact_report_missing",
+                    "message": "The workspace impact-report route did not return a V3 report.",
+                },
+            }
+        return report
+
+    @staticmethod
+    def _attach_primary_workspace_impact(result: dict, report: dict) -> dict:
+        result["impactReport"] = report
+        result["impactReportSource"] = "sidecar_facts"
+        return result
+
+    def transformation_workspace_preview(self, workspace_id: str) -> dict:
+        """Previews the composed edit for ``workspace_id`` and attaches the graph-backed V3 impact report."""
         if not self._config.enabled:
             return self._v3_workspace_disabled_refusal("preview")
-        self._validate_supported_project()
-        return self.transformation_workspaces.preview(workspace_id)
+        result = self.transformation_workspaces.preview(workspace_id)
+        if not result.get("accepted", False):
+            return result
+        impact_or_refusal = self._workspace_primary_impact_report_or_refusal(workspace_id, "preview")
+        if impact_or_refusal.get("accepted") is False:
+            return impact_or_refusal
+        return self._attach_primary_workspace_impact(result, impact_or_refusal)
 
     def transformation_workspace_apply(
         self,
         workspace_id: str,
         validate: bool | None = None,
-        expected_project_revision: object = None,
+        expected_project_revision: object | None = None,
+        allow_review_required: bool = False,
     ) -> dict:
-        """Composes and transactionally commits the member plan of ``workspace_id`` (all-or-nothing) (G001).
+        """Applies the composed edit after precomputing the required graph-backed V3 impact report.
 
-        On success the merged edit is staged (validated) then committed atomically and the member sessions released; on
-        any staging/commit failure the applier rolls back and nothing is written. ``expected_project_revision``, when
-        supplied, is an optimistic-concurrency guard that must match the workspace's pinned revision or the apply is
-        refused before any write. Refuses on a disabled engine, an unknown/terminal workspace, a revision mismatch, or a
-        composition/commit failure, each with a structured envelope.
+        The impact report preflight runs before any write so preview/apply share the same full V3 impact contract and
+        a sidecar facts refusal cannot become a post-write validation gap. The workspace still owns revision guards,
+        REVIEW_REQUIRED gating, javac validation, transactionality, and rollback.
         """
         if not self._config.enabled:
             return self._v3_workspace_disabled_refusal("apply")
         self._validate_supported_project()
-        return self.transformation_workspaces.apply(
-            workspace_id, validate=validate, expected_project_revision=expected_project_revision
+        impact_or_refusal = self._workspace_primary_impact_report_or_refusal(workspace_id, "apply")
+        if impact_or_refusal.get("accepted") is False:
+            return impact_or_refusal
+        result = self.transformation_workspaces.apply(
+            workspace_id,
+            validate=validate,
+            expected_project_revision=expected_project_revision,
+            allow_review_required=allow_review_required,
         )
+        if not result.get("accepted", False):
+            return result
+        return self._attach_primary_workspace_impact(result, impact_or_refusal)
 
     def transformation_workspace_cancel(self, workspace_id: str) -> dict:
         """Cancels every member of ``workspace_id`` and drops it from the registry (G001).
@@ -1360,6 +1418,7 @@ class JavaRefactorManager:
         target_package: str | None = None,
         leave_delegate_methods: bool = True,
         update_usages: bool = False,
+        confirm_public_api_change: bool = False,
         apply: bool = False,
         validate: bool | None = None,
         allow_review_required: bool = False,
@@ -1416,6 +1475,7 @@ class JavaRefactorManager:
             target_package=target_package,
             leave_delegate_methods=leave_delegate_methods,
             update_usages=update_usages,
+            confirm_public_api_change=confirm_public_api_change,
         )
         return self._route_sidecar_v3_edit(
             "extractClass", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
@@ -1428,7 +1488,7 @@ class JavaRefactorManager:
         members: list[str],
         *,
         target_package: str | None = None,
-        make_abstract: bool = False,
+        make_abstract: bool = True,
         apply: bool = False,
         validate: bool | None = None,
         allow_review_required: bool = False,
@@ -1877,6 +1937,50 @@ class JavaRefactorManager:
         result["matches"] = matches
         return result
 
+    @staticmethod
+    def _recipe_apply_policy_refusal(
+        payload: dict[str, Any], *, apply: bool, allow_review_required: bool
+    ) -> dict[str, Any] | None:
+        """Refuses unsafe recipe applies before any bridge/staging write occurs."""
+        if not apply or not payload.get("accepted", False):
+            return None
+
+        matches_value = payload.get("matches")
+        matches = matches_value if isinstance(matches_value, list) else []
+        refused_matches = [match for match in matches if isinstance(match, dict) and match.get("risk") == "REFUSED"]
+        review_matches = [
+            match
+            for match in matches
+            if isinstance(match, dict)
+            and (match.get("risk") == "REVIEW_REQUIRED" or match.get("skipped") is True)
+        ]
+
+        if refused_matches:
+            return {
+                "accepted": False,
+                "applied": False,
+                "stats": dict(payload.get("stats", {})),
+                "refusal": {
+                    "code": "recipe_refused_match",
+                    "message": "Recipe apply refused because at least one in-scope match is refused.",
+                    "matches": refused_matches,
+                },
+                "risk": "REFUSED",
+            }
+        if review_matches and not allow_review_required:
+            return {
+                "accepted": False,
+                "applied": False,
+                "stats": dict(payload.get("stats", {})),
+                "refusal": {
+                    "code": "recipe_review_required",
+                    "message": "Recipe apply requires explicit approval for review-required matches.",
+                    "matches": review_matches,
+                },
+                "risk": "REVIEW_REQUIRED",
+            }
+        return None
+
     def scan_migration_opportunities(
         self,
         recipe_name: str | None = None,
@@ -1940,10 +2044,10 @@ class JavaRefactorManager:
         committed transactionally with post-validation rollback. The grouped ``matches`` and impact ``summary`` are
         surfaced on the result alongside the validated delta.
 
-        ``allow_review_required`` (forwarded to the sidecar as ``apply_needs_review``) controls the risk policy: when
-        ``False`` (the default) only matches the engine classifies SAFE are applied and REVIEW_REQUIRED matches that
-        carry a concrete replacement are SKIPPED; when ``True`` those REVIEW_REQUIRED matches are also applied. Report-only
-        findings (no replacement) are never applied regardless.
+        ``allow_review_required`` (forwarded to the sidecar as ``apply_needs_review``) controls the risk policy. Preview
+        may report SAFE, REVIEW_REQUIRED, and REFUSED matches. Apply is all-or-nothing: any REFUSED match refuses the
+        whole recipe, and any REVIEW_REQUIRED/skipped match refuses the whole recipe unless the caller explicitly passes
+        ``allow_review_required=True``. This avoids silent partial migrations.
         """
         from serena.java_refactor_v3.recipe_engine_client import RecipeEngineClient
 
@@ -1969,6 +2073,11 @@ class JavaRefactorManager:
             validate=False,
             scope=scope,
         )
+        policy_refusal = self._recipe_apply_policy_refusal(
+            payload, apply=apply, allow_review_required=allow_review_required
+        )
+        if policy_refusal is not None:
+            return self._surface_recipe_apply_presentation(policy_refusal, payload)
         result = self._route_sidecar_v3_edit(
             "applyRefactorRecipe", payload, apply=apply, validate=validate, allow_review_required=allow_review_required
         )
@@ -2993,6 +3102,33 @@ class JavaRefactorManager:
         """
         return TransactionalWorkspaceEditApplier(
             self._project_root, encoding=self._source_encoding(), line_ending=self._project_line_ending
+        )
+
+    def validate_v3_workspace_edit(
+        self,
+        *,
+        operation: str,
+        workspace_edit: RefactorWorkspaceEdit,
+        apply: bool,
+        validate: bool | None,
+        risk: Any,
+        allow_review_required: bool = False,
+        warnings: list[str] | None = None,
+        summary: str | None = None,
+    ) -> dict[str, Any]:
+        """Runs a composed transformation-workspace edit through the canonical V3 javac bridge."""
+        from serena.java_refactor_v3.models import RiskLevel
+
+        normalized_risk = risk if isinstance(risk, RiskLevel) else RiskLevel.from_sidecar_wire(risk)
+        return self._bridge_v3_edit(
+            operation=operation,
+            workspace_edit=workspace_edit,
+            apply=apply,
+            validate=validate,
+            risk=normalized_risk,
+            allow_review_required=allow_review_required,
+            warnings=warnings or [],
+            summary={"description": summary or operation},
         )
 
     # Compute-only sidecar dispatch for every V3 op whose edit is enrollable in a transformation workspace. Each entry

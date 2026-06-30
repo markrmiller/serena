@@ -405,3 +405,160 @@ def test_sidecar_scan_migration_opportunities_refuses_bad_document(
     assert ambiguous["refusal"]["code"] == "recipe_selection_ambiguous", ambiguous
     assert bad_kind.get("accepted") is False, bad_kind
     assert bad_kind["refusal"]["code"] == "recipe_unknown_rule_kind", bad_kind
+
+
+def test_recipe_apply_refuses_review_required_matches_before_writing(monkeypatch) -> None:
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    payload = {
+        "accepted": True,
+        "recipeId": "demo",
+        "stats": {"matches": 2, "applied": 1, "skipped": 1, "refused": 0},
+        "matches": [{"risk": "SAFE"}, {"risk": "REVIEW_REQUIRED"}],
+        "summary": {"filesChanged": 1},
+        "edit": {"format": "serena-workspace-edit-v1", "changes": []},
+    }
+
+    manager._v3_disabled_refusal = lambda operation, apply: None  # type: ignore[attr-defined]
+    manager._validate_supported_project = lambda: None  # type: ignore[attr-defined]
+    manager._select_recipe = lambda operation, apply, recipe_name, recipe_document: ("demo", {})  # type: ignore[attr-defined]
+    manager._get_or_start_client = lambda refresh=False: object()  # type: ignore[attr-defined]
+
+    def _must_not_route(*args, **kwargs):
+        raise AssertionError("review-required recipe apply must be refused before routing edits")
+
+    manager._route_sidecar_v3_edit = _must_not_route  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "serena.java_refactor_v3.recipe_engine_client.RecipeEngineClient.apply_recipe",
+        lambda self, **kwargs: payload,
+    )
+
+    result = manager.apply_refactor_recipe(recipe_document='{"rules": []}', apply=True)
+
+    assert result["accepted"] is False
+    assert result["applied"] is False
+    assert result["refusal"]["code"] == "recipe_review_required"
+    assert result["stats"]["skipped"] == 1
+
+
+def test_recipe_apply_allows_review_required_matches_only_with_explicit_approval(monkeypatch) -> None:
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    payload = {
+        "accepted": True,
+        "recipeId": "demo",
+        "stats": {"matches": 1, "applied": 1, "skipped": 0, "refused": 0},
+        "matches": [{"risk": "REVIEW_REQUIRED"}],
+        "summary": {"filesChanged": 1},
+        "edit": {"format": "serena-workspace-edit-v1", "changes": []},
+    }
+    routed = {}
+
+    manager._v3_disabled_refusal = lambda operation, apply: None  # type: ignore[attr-defined]
+    manager._validate_supported_project = lambda: None  # type: ignore[attr-defined]
+    manager._select_recipe = lambda operation, apply, recipe_name, recipe_document: ("demo", {})  # type: ignore[attr-defined]
+    manager._get_or_start_client = lambda refresh=False: object()  # type: ignore[attr-defined]
+
+    def _route(operation, sidecar_payload, *, apply, validate, allow_review_required):
+        routed["allow_review_required"] = allow_review_required
+        return {"accepted": True, "applied": True, "operation": operation}
+
+    manager._route_sidecar_v3_edit = _route  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "serena.java_refactor_v3.recipe_engine_client.RecipeEngineClient.apply_recipe",
+        lambda self, **kwargs: payload,
+    )
+
+    result = manager.apply_refactor_recipe(
+        recipe_document='{"rules": []}', apply=True, allow_review_required=True
+    )
+
+    assert result["accepted"] is True
+    assert result["applied"] is True
+    assert routed["allow_review_required"] is True
+
+
+def test_recipe_apply_refuses_refused_matches_before_writing(monkeypatch) -> None:
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    payload = {
+        "accepted": True,
+        "recipeId": "demo",
+        "stats": {"matches": 1, "applied": 0, "skipped": 0, "refused": 1},
+        "matches": [{"risk": "REFUSED"}],
+        "summary": {"filesChanged": 0},
+        "edit": {"format": "serena-workspace-edit-v1", "changes": []},
+    }
+
+    manager._v3_disabled_refusal = lambda operation, apply: None  # type: ignore[attr-defined]
+    manager._validate_supported_project = lambda: None  # type: ignore[attr-defined]
+    manager._select_recipe = lambda operation, apply, recipe_name, recipe_document: ("demo", {})  # type: ignore[attr-defined]
+    manager._get_or_start_client = lambda refresh=False: object()  # type: ignore[attr-defined]
+    manager._route_sidecar_v3_edit = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[attr-defined]
+        AssertionError("refused recipe apply must be refused before routing edits")
+    )
+    monkeypatch.setattr(
+        "serena.java_refactor_v3.recipe_engine_client.RecipeEngineClient.apply_recipe",
+        lambda self, **kwargs: payload,
+    )
+
+    result = manager.apply_refactor_recipe(
+        recipe_document='{"rules": []}', apply=True, allow_review_required=True
+    )
+
+    assert result["accepted"] is False
+    assert result["applied"] is False
+    assert result["refusal"]["code"] == "recipe_refused_match"
+
+
+def test_recipe_apply_refuses_review_required_match_even_when_sidecar_marks_applied(monkeypatch):
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    payload = {
+        "accepted": True,
+        "recipeId": "demo",
+        "stats": {"matches": 1, "applied": 1, "skipped": 0, "refused": 0},
+        "matches": [{"risk": "REVIEW_REQUIRED"}],
+        "workspaceEdit": {"format": "serena-workspace-edit-v1", "changes": []},
+    }
+    routed = []
+    manager._v3_disabled_refusal = lambda operation, apply: None
+    manager._validate_supported_project = lambda: None
+    manager._select_recipe = lambda operation, apply, recipe_name, recipe_document: ("demo", {})
+    manager._get_or_start_client = lambda refresh=False: object()
+    manager._route_sidecar_v3_edit = lambda *args, **kwargs: routed.append((args, kwargs)) or {"accepted": True}
+    monkeypatch.setattr(
+        "serena.java_refactor_v3.recipe_engine_client.RecipeEngineClient.apply_recipe",
+        lambda self, **kwargs: payload,
+    )
+
+    result = manager.apply_refactor_recipe(recipe_document='{"id":"demo","rules":[]}', apply=True)
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "recipe_review_required"
+    assert routed == []
+
+
+def test_recipe_apply_refuses_refused_match_even_with_review_approval(monkeypatch):
+    manager = JavaRefactorManager.__new__(JavaRefactorManager)
+    payload = {
+        "accepted": True,
+        "recipeId": "demo",
+        "stats": {"matches": 1, "applied": 1, "skipped": 0, "refused": 0},
+        "matches": [{"risk": "REFUSED"}],
+        "workspaceEdit": {"format": "serena-workspace-edit-v1", "changes": []},
+    }
+    routed = []
+    manager._v3_disabled_refusal = lambda operation, apply: None
+    manager._validate_supported_project = lambda: None
+    manager._select_recipe = lambda operation, apply, recipe_name, recipe_document: ("demo", {})
+    manager._get_or_start_client = lambda refresh=False: object()
+    manager._route_sidecar_v3_edit = lambda *args, **kwargs: routed.append((args, kwargs)) or {"accepted": True}
+    monkeypatch.setattr(
+        "serena.java_refactor_v3.recipe_engine_client.RecipeEngineClient.apply_recipe",
+        lambda self, **kwargs: payload,
+    )
+
+    result = manager.apply_refactor_recipe(
+        recipe_document='{"id":"demo","rules":[]}', apply=True, allow_review_required=True
+    )
+
+    assert result["accepted"] is False
+    assert result["refusal"]["code"] == "recipe_refused_match"
+    assert routed == []
