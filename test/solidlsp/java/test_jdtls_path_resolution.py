@@ -647,6 +647,7 @@ class TestInitializeParams:
                 "import_exclusions": ["**/.claude/**", "**/.omx/**"],
                 "resource_filters": ["\\.claude", "\\.omx"],
                 "autobuild_enabled": False,
+                "generates_metadata_files_at_project_root": True,
             },
         )
 
@@ -655,11 +656,39 @@ class TestInitializeParams:
         java_settings = params["initializationOptions"]["settings"]["java"]  # type: ignore[index]
         assert java_settings["import"]["maven"]["enabled"] is False
         assert java_settings["import"]["gradle"]["enabled"] is False
+        assert java_settings["import"]["generatesMetadataFilesAtProjectRoot"] is True
         assert "**/.claude/**" in java_settings["import"]["exclusions"]
         assert "**/.omx/**" in java_settings["import"]["exclusions"]
         assert "\\.claude" in java_settings["project"]["resourceFilters"]
         assert "\\.omx" in java_settings["project"]["resourceFilters"]
         assert java_settings["autobuild"]["enabled"] is False
+
+    def test_root_eclipse_project_filters_are_preseeded_when_metadata_at_root_is_enabled(self, tmp_path: Path) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subproject = repo / "subproject-with-existing-eclipse-metadata"
+        subproject.mkdir()
+        (subproject / ".project").write_text(
+            "<projectDescription><name>sub</name><projects/><buildSpec/><natures/></projectDescription>",
+            encoding="UTF-8",
+        )
+        ls = _make_jdtls_for_initialize_params(
+            tmp_path,
+            {
+                "generates_metadata_files_at_project_root": True,
+                "resource_filters": ["node_modules", "\\..*", "build"],
+            },
+        )
+        ls.repository_root_path = str(repo)
+
+        ls._ensure_eclipse_project_filters()
+
+        project_xml = (repo / ".project").read_text(encoding="UTF-8")
+        assert "org.eclipse.core.resources.regexFilterMatcher" in project_xml
+        assert "node_modules|\\.(?!settings$).*|build" in project_xml
+        assert "__CREATED_BY_JAVA_LANGUAGE_SERVER__" not in project_xml
+        subproject_xml = (subproject / ".project").read_text(encoding="UTF-8")
+        assert "node_modules|\\.(?!settings$).*|build" in subproject_xml
 
 
 def _git(cwd: Path, *args: str) -> None:

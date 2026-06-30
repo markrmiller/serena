@@ -12,6 +12,8 @@ import re
 import shutil
 import subprocess
 import threading
+import time
+import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from contextlib import contextmanager
@@ -276,6 +278,12 @@ class EclipseJDTLS(SolidLanguageServer):
               generated, nested worktree, or agent state directories out of JDTLS project import.
         - resource_filters: Additional resource filter names for java.project.resourceFilters.
         - autobuild_enabled: Whether JDTLS/Eclipse autobuild is enabled (default: true)
+        - generates_metadata_files_at_project_root: Whether JDTLS/Buildship may use Eclipse
+              metadata files such as .project at the project root (default: false). When true,
+              Serena pre-seeds the .project resource filters before JDTLS starts so Buildship's
+              initial root refresh avoids filtered local-state directories.
+        - intellicode_enabled: Whether to synchronously enable vscode-java IntelliCode integration
+              during startup (default: false). Enabling can block on JDT indexes in large workspaces.
         - intellicode_xmx: Maximum heap size for the IntelliCode embedded JVM (default: "1G")
         - intellicode_xms: Initial heap size for the IntelliCode embedded JVM (default: "100m")
         - lombok_show_generated: Show Lombok-generated methods (getX/setX/builder()/...) in document
@@ -318,6 +326,8 @@ class EclipseJDTLS(SolidLanguageServer):
         import_exclusions: []  # additional java.import.exclusions globs
         resource_filters: []  # additional java.project.resourceFilters names
         autobuild_enabled: true
+        generates_metadata_files_at_project_root: false
+        intellicode_enabled: false
         intellicode_xmx: "1G"  # maximum heap size for the IntelliCode embedded JVM
         intellicode_xms: "100m"  # initial heap size for the IntelliCode embedded JVM
         lombok_show_generated: true  # show Lombok-generated methods in document symbols (default true)
@@ -924,6 +934,8 @@ class EclipseJDTLS(SolidLanguageServer):
                         "import_exclusions",
                         "resource_filters",
                         "autobuild_enabled",
+                        "generates_metadata_files_at_project_root",
+                        "intellicode_enabled",
                     )
                     if custom_settings.get(key) is not None
                 )
@@ -983,6 +995,8 @@ class EclipseJDTLS(SolidLanguageServer):
             ]:
                 assert os.path.exists(static_path), static_path
 
+            generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", False)
+
             cmd = [
                 jre_path,
                 "--add-modules=ALL-SYSTEM",
@@ -995,7 +1009,7 @@ class EclipseJDTLS(SolidLanguageServer):
                 "-Declipse.application=org.eclipse.jdt.ls.core.id1",
                 "-Dosgi.bundles.defaultStartLevel=4",
                 "-Declipse.product=org.eclipse.jdt.ls.core.product",
-                "-Djava.import.generatesMetadataFilesAtProjectRoot=false",
+                f"-Djava.import.generatesMetadataFilesAtProjectRoot={str(generates_metadata_files_at_project_root).lower()}",
                 "-Dfile.encoding=utf8",
                 "-noverify",
                 "-XX:+UseParallelGC",
@@ -1089,6 +1103,7 @@ class EclipseJDTLS(SolidLanguageServer):
         autobuild_enabled = self._custom_settings.get("autobuild_enabled", True)
         maven_import_enabled = self._custom_settings.get("maven_import_enabled", True)
         gradle_import_enabled = self._custom_settings.get("gradle_import_enabled", True)
+        generates_metadata_files_at_project_root = self._custom_settings.get("generates_metadata_files_at_project_root", False)
 
         # Lombok-generated symbols (getX/setX/builder()/equals/hashCode/toString/...): JDTLS filters
         # these out of documentSymbol results by default. Without them, find_symbol/get_symbols_overview
@@ -1352,7 +1367,7 @@ class EclipseJDTLS(SolidLanguageServer):
                                 "**/META-INF/maven/**",
                                 *additional_import_exclusions,
                             ],
-                            "generatesMetadataFilesAtProjectRoot": False,
+                            "generatesMetadataFilesAtProjectRoot": generates_metadata_files_at_project_root,
                         },
                         # Set updateSnapshots to False to improve performance and avoid unnecessary network calls
                         # Snapshots will only be updated when explicitly requested by the user
@@ -1639,8 +1654,102 @@ class EclipseJDTLS(SolidLanguageServer):
                 truncated,
             )
 
+    def _ensure_eclipse_project_filters(self) -> None:
+        """
+        Pre-seed Eclipse resource filters in .project files when metadata-at-root is enabled.
+
+        JDTLS normally applies java.project.resourceFilters after initialization, but Buildship can
+        open and refresh Gradle root/subprojects before that happens. For large checkouts with local
+        agent/build state, that initial refresh may hang or OOM. When the project explicitly allows
+        Eclipse metadata at project roots, write the same regex filter JDTLS would later create into
+        each detected build project directory before JDTLS starts.
+        """
+        if not self._custom_settings.get("generates_metadata_files_at_project_root", False):
+            return
+
+        root = Path(self.repository_root_path)
+        # Preseed filters run before Buildship has created its own .settings resources. Keep
+        # .settings visible, otherwise Buildship can fail while writing org.eclipse.buildship prefs.
+        # JDTLS still receives the normal java.project.resourceFilters later.
+        filters = ["node_modules", r"\.(?!settings$).*"]
+        for custom_filter in self._custom_settings.get("resource_filters", []):
+            if custom_filter in filters or custom_filter == r"\..*":
+                continue
+            filters.append(custom_filter)
+        # Do not include JDTLS's private __CREATED_BY_JAVA_LANGUAGE_SERVER__ marker here.
+        # JDTLS's configureFilters() deletes marker-bearing filters during initialization and can
+        # hit not-yet-open Buildship projects; Serena-managed pre-seed filters must be independent.
+        filter_regex = "|".join(filters)
+
+        def should_prune_dir(name: str) -> bool:
+            return name.startswith(".") or name in {"build", "node_modules"} or name.startswith("triage-results")
+
+        project_dirs: list[Path] = []
+        for current_root, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not should_prune_dir(d)]
+            current = Path(current_root)
+            if ".project" in filenames or any(
+                name in filenames
+                for name in ("build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "pom.xml")
+            ):
+                project_dirs.append(current)
+            if len(project_dirs) >= 500:
+                log.warning("Stopping Eclipse .project pre-seed scan after 500 build project directories under %s", root)
+                break
+
+        if root not in project_dirs:
+            project_dirs.insert(0, root)
+
+        for project_dir in project_dirs:
+            self._write_eclipse_project_filter(project_dir, filter_regex)
+
+    @staticmethod
+    def _write_eclipse_project_filter(project_dir: Path, filter_regex: str) -> None:
+        project_file = project_dir / ".project"
+        project_name = project_dir.name
+        if project_file.exists():
+            try:
+                tree = ET.parse(project_file)
+                root_el = tree.getroot()
+            except ET.ParseError as e:
+                log.warning("Cannot pre-seed Eclipse filters in malformed .project %s: %s", project_file, e)
+                return
+        else:
+            root_el = ET.Element("projectDescription")
+            ET.SubElement(root_el, "name").text = project_name
+            ET.SubElement(root_el, "comment").text = f"Project {project_name} created by Serena for JDTLS."
+            ET.SubElement(root_el, "projects")
+            ET.SubElement(root_el, "buildSpec")
+            ET.SubElement(root_el, "natures")
+            tree = ET.ElementTree(root_el)
+
+        filtered_resources = root_el.find("filteredResources")
+        if filtered_resources is None:
+            filtered_resources = ET.SubElement(root_el, "filteredResources")
+        for filt in list(filtered_resources.findall("filter")):
+            matcher = filt.find("matcher")
+            matcher_id = matcher.findtext("id") if matcher is not None else None
+            args = matcher.findtext("arguments") if matcher is not None else None
+            if matcher_id == "org.eclipse.core.resources.regexFilterMatcher" and (
+                args == filter_regex or (args is not None and "__CREATED_BY_JAVA_LANGUAGE_SERVER__" in args)
+            ):
+                filtered_resources.remove(filt)
+
+        filt = ET.SubElement(filtered_resources, "filter")
+        ET.SubElement(filt, "id").text = str(int(time.time() * 1000))
+        ET.SubElement(filt, "name")
+        ET.SubElement(filt, "type").text = "30"
+        matcher = ET.SubElement(filt, "matcher")
+        ET.SubElement(matcher, "id").text = "org.eclipse.core.resources.regexFilterMatcher"
+        ET.SubElement(matcher, "arguments").text = filter_regex
+
+        ET.indent(tree, space="\t")
+        tree.write(project_file, encoding="UTF-8", xml_declaration=True)
+        log.info("Pre-seeded Eclipse .project resource filter at %s: %s", project_file, filter_regex)
+
     def _start_server_with_gradle_import_lock(self) -> None:
         self._log_project_refresh_hotspots()
+        self._ensure_eclipse_project_filters()
         log.info("Starting EclipseJDTLS server process")
         self.server.start()
         initialize_params = self._get_initialize_params(self.repository_root_path)
@@ -1659,18 +1768,21 @@ class EclipseJDTLS(SolidLanguageServer):
         # IntelliCode bundle is shipped. In upstream-jdtls mode it's absent and the
         # 'java.intellicode.enable' command will never be registered, so we skip the wait/call.
         if self.runtime_dependency_paths.intellicode_jar_path is not None:
-            self._intellicode_enable_command_available.wait()
+            if self._custom_settings.get("intellicode_enabled", False):
+                self._intellicode_enable_command_available.wait()
 
-            java_intellisense_members_path = self.runtime_dependency_paths.intellisense_members_path
-            assert java_intellisense_members_path is not None
-            assert os.path.exists(java_intellisense_members_path)
-            intellicode_enable_result = self.server.send.execute_command(
-                {
-                    "command": "java.intellicode.enable",
-                    "arguments": [True, java_intellisense_members_path],
-                }
-            )
-            assert intellicode_enable_result
+                java_intellisense_members_path = self.runtime_dependency_paths.intellisense_members_path
+                assert java_intellisense_members_path is not None
+                assert os.path.exists(java_intellisense_members_path)
+                intellicode_enable_result = self.server.send.execute_command(
+                    {
+                        "command": "java.intellicode.enable",
+                        "arguments": [True, java_intellisense_members_path],
+                    }
+                )
+                assert intellicode_enable_result
+            else:
+                log.info("Skipping synchronous IntelliCode enablement (set intellicode_enabled=true to enable)")
 
         if not self._service_ready_event.is_set():
             log.info("Waiting for service to be ready ...")
