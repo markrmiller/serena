@@ -942,27 +942,34 @@ class ProjectCommands(AutoRegisteringGroup):
         """
         from serena.project import Project
 
+        logging.configure(level=logging.INFO, stream=sys.stderr)
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project), serena_config=serena_config)
-        if os.path.isabs(file):
-            file = os.path.relpath(file, start=proj.project_root)
-        if proj.is_ignored_path(file, ignore_non_source_files=True):
-            click.echo(f"'{file}' is ignored or declared as non-code file by the project configuration, won't index.")
-            exit(1)
-        ls_mgr = proj.create_language_server_manager()
-        try:
-            for ls in ls_mgr.iter_language_servers():
-                click.echo(f"Indexing for language {ls.language.value} …")
-                document_symbols = ls.request_document_symbols(file)
-                symbols, _ = document_symbols.get_all_symbols_and_roots()
-                if verbose:
-                    click.echo(f"Symbols in file '{file}':")
-                    for symbol in symbols:
-                        click.echo(f"  - {symbol['name']} at line {symbol['selectionRange']['start']['line']} of kind {symbol['kind']}")
-                ls.save_cache()
-                click.echo(f"Successfully indexed file '{file}', {len(symbols)} symbols saved to cache in {ls.cache_dir}.")
-        finally:
-            ls_mgr.stop_all()
+        log_dir = os.path.join(proj.project_root, ".serena", "logs", "index-file")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"index_file_{datetime_tag()}.log")
+        click.echo(f"Writing index-file diagnostic log to {log_file}", err=True)
+        with FileLoggerContext(log_file, append=False, enabled=True):
+            log.info("Starting index-file for project=%s file=%s", proj.project_root, file)
+            if os.path.isabs(file):
+                file = os.path.relpath(file, start=proj.project_root)
+            if proj.is_ignored_path(file, ignore_non_source_files=True):
+                click.echo(f"'{file}' is ignored or declared as non-code file by the project configuration, won't index.")
+                exit(1)
+            ls_mgr = proj.create_language_server_manager()
+            try:
+                for ls in ls_mgr.iter_language_servers():
+                    click.echo(f"Indexing for language {ls.language.value} …")
+                    document_symbols = ls.request_document_symbols(file)
+                    symbols, _ = document_symbols.get_all_symbols_and_roots()
+                    if verbose:
+                        click.echo(f"Symbols in file '{file}':")
+                        for symbol in symbols:
+                            click.echo(f"  - {symbol['name']} at line {symbol['selectionRange']['start']['line']} of kind {symbol['kind']}")
+                    ls.save_cache()
+                    click.echo(f"Successfully indexed file '{file}', {len(symbols)} symbols saved to cache in {ls.cache_dir}.")
+            finally:
+                ls_mgr.stop_all()
 
     @staticmethod
     @click.command(
