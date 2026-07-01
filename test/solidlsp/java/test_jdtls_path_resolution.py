@@ -9,8 +9,10 @@ mocked.
 
 from __future__ import annotations
 
+import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +25,7 @@ from solidlsp.language_servers.eclipse_jdtls import (
     JDTLS_MIN_JDK_VERSION,
     EclipseJDTLS,
     RuntimeDependencyPaths,
+    _exclusive_file_lock,
 )
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.settings import SolidLSPSettings
@@ -54,6 +57,53 @@ def _make_fake_jdtls_install(
         for config_name in set(JDTLS_CONFIG_DIR_BY_PLATFORM.values()):
             (root / config_name).mkdir(exist_ok=True)
     return root
+
+
+class TestExclusiveFileLock:
+    def test_writes_owner_metadata(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "jdtls-workspace-test.lock"
+
+        with _exclusive_file_lock(lock_path, blocking=False, owner_info={"project": "demo", "language": "java"}):
+            content = lock_path.read_text(encoding="utf-8")
+
+        assert f"pid={os.getpid()}" in content
+        assert "project=demo" in content
+        assert "language=java" in content
+
+    @pytest.mark.skipif(os.name == "nt", reason="uses POSIX fcntl in the helper subprocess")
+    def test_nonblocking_contention_reports_owner_pid(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "jdtls-workspace-test.lock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, os, pathlib, sys, time; "
+                    "p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); "
+                    "f=p.open('a+b'); fcntl.flock(f.fileno(), fcntl.LOCK_EX); "
+                    "f.seek(0); f.truncate(); "
+                    "f.write(f'pid={os.getpid()}\\nproject=holder\\n'.encode()); f.flush(); "
+                    "print('ready', flush=True); time.sleep(30)"
+                ),
+                str(lock_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            with pytest.raises(SolidLSPException, match=rf"owner: .*pid={holder.pid}"):
+                with _exclusive_file_lock(lock_path, blocking=False, busy_message="workspace busy"):
+                    pass
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=5)
 
 
 def _make_jdtls_for_initialize_params(tmp_path: Path, custom_settings: dict[str, object] | None = None) -> EclipseJDTLS:

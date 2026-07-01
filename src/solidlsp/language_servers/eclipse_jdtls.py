@@ -3,6 +3,7 @@ Provides Java specific instantiation of the LanguageServer class. Contains vario
 """
 
 import dataclasses
+import errno
 import hashlib
 import logging
 import os
@@ -165,8 +166,68 @@ def _serena_locks_dir() -> Path:
     return Path.home() / ".serena" / "locks"
 
 
+def _process_command_line(pid: int) -> str | None:
+    try:
+        raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    cmdline = raw_cmdline.rstrip(b"\0").replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+    return cmdline or None
+
+
+def _file_lock_holder_pids(lock_path: Path) -> list[int]:
+    """Best-effort Linux /proc/locks lookup for the process holding ``lock_path``."""
+    proc_locks = Path("/proc/locks")
+    if not proc_locks.exists():
+        return []
+    try:
+        stat = lock_path.stat()
+        lock_key = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+        lines = proc_locks.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    pids: list[int] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 6 or parts[5] != lock_key:
+            continue
+        try:
+            pids.append(int(parts[4]))
+        except ValueError:
+            continue
+    return pids
+
+
+def _describe_file_lock_owner(lock_path: Path) -> str:
+    descriptions: list[str] = []
+    for pid in _file_lock_holder_pids(lock_path):
+        cmdline = _process_command_line(pid)
+        if cmdline:
+            descriptions.append(f"pid={pid}, command={cmdline}")
+        else:
+            descriptions.append(f"pid={pid}")
+
+    if descriptions:
+        return "; ".join(descriptions)
+
+    try:
+        content = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        content = ""
+    if content:
+        return content.replace("\n", "; ")
+    return "unknown owner (lock file has no owner metadata)"
+
+
 @contextmanager
-def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+def _exclusive_file_lock(
+    lock_path: Path,
+    *,
+    blocking: bool = True,
+    busy_message: str | None = None,
+    owner_info: dict[str, object] | None = None,
+) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock_file:
         if os.name == "nt":
@@ -178,11 +239,20 @@ def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
                 lock_file.flush()
             locking = getattr(msvcrt, "locking")
             lk_lock = getattr(msvcrt, "LK_LOCK")
+            lk_nblk = getattr(msvcrt, "LK_NBLCK")
             lk_unlck = getattr(msvcrt, "LK_UNLCK")
 
             lock_file.seek(0)
-            locking(lock_file.fileno(), lk_lock, 1)
             try:
+                locking(lock_file.fileno(), lk_lock if blocking else lk_nblk, 1)
+            except OSError as exc:
+                if not blocking:
+                    owner = _describe_file_lock_owner(lock_path)
+                    message = busy_message or f"File lock is already held: {lock_path}"
+                    raise SolidLSPException(f"{message}; owner: {owner}") from exc
+                raise
+            try:
+                _write_file_lock_owner_metadata(lock_file, owner_info)
                 yield
             finally:
                 lock_file.seek(0)
@@ -190,11 +260,34 @@ def _exclusive_file_lock(lock_path: Path) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
             try:
+                fcntl.flock(lock_file.fileno(), flags)
+            except OSError as exc:
+                if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+                    owner = _describe_file_lock_owner(lock_path)
+                    message = busy_message or f"File lock is already held: {lock_path}"
+                    raise SolidLSPException(f"{message}; owner: {owner}") from exc
+                raise
+            try:
+                _write_file_lock_owner_metadata(lock_file, owner_info)
                 yield
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_file_lock_owner_metadata(lock_file, owner_info: dict[str, object] | None) -> None:
+    metadata = {
+        "pid": os.getpid(),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if owner_info:
+        metadata.update(owner_info)
+    content = "".join(f"{key}={value}\n" for key, value in metadata.items())
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(content.encode("utf-8"))
+    lock_file.flush()
 
 
 # Mapping from Serena's platform identifiers to upstream JDTLS config_<platform> directory names
@@ -1554,8 +1647,16 @@ class EclipseJDTLS(SolidLanguageServer):
         self.server.on_notification("language/actionableNotification", do_nothing)
 
         workspace_lock_path = self._jdtls_workspace_lifetime_lock_path()
-        log.info("Waiting for EclipseJDTLS workspace lifetime lock: %s", workspace_lock_path)
-        self._workspace_lifetime_lock_cm = _exclusive_file_lock(workspace_lock_path)
+        log.info("Acquiring EclipseJDTLS workspace lifetime lock: %s", workspace_lock_path)
+        self._workspace_lifetime_lock_cm = _exclusive_file_lock(
+            workspace_lock_path,
+            blocking=False,
+            busy_message=(
+                f"EclipseJDTLS workspace is already in use for project {self.repository_root_path}. "
+                "Stop the older Serena/Codex/Claude session that owns the workspace lock, then retry"
+            ),
+            owner_info={"project": self.repository_root_path, "language": "java", "kind": "jdtls-workspace-lifetime"},
+        )
         self._workspace_lifetime_lock_cm.__enter__()
         self._workspace_lifetime_lock_path = workspace_lock_path
         log.info("Acquired EclipseJDTLS workspace lifetime lock: %s", workspace_lock_path)
